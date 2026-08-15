@@ -1,0 +1,104 @@
+# =============================================================================
+# Python & Bytecode
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# =============================================================================
+# Virtual Environments
+# =============================================================================
+venv/
+.venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# =============================================================================
+# Sensitive Credentials & Session Data (Critical for IG Downloader)
+# =============================================================================
+cookies.txt
+*.cookie
+*.session
+*.credentials
+
+# =============================================================================
+# Downloaded Media & Local Test Outputs
+# =============================================================================
+InstagramDownloads/
+*.mp4
+*.m4a
+*.mp3
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.part
+*.ytdl
+
+# =============================================================================
+# External Binaries & Packaging Artifacts (PyInstaller / Inno Setup / FFmpeg)
+# =============================================================================
+# Local FFmpeg folder/binaries (don't commit heavy binaries to Git)
+ffmpeg/
+ffmpeg.exe
+ffprobe.exe
+
+# PyInstaller build artifacts
+*.manifest
+*.spec.bak
+
+# Inno Setup output folder
+Output/
+_MEI*/
+
+# =============================================================================
+# Logs & Database
+# =============================================================================
+*.log
+*.sqlite
+*.sqlite3
+
+# =============================================================================
+# IDEs & Editor Configuration
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# =============================================================================
+# Operating System Files
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/

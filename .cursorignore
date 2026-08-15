@@ -1,0 +1,71 @@
+# Dependencies & Package Managers
+node_modules/
+.pnpm-store/
+vendor/
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+
+# Build Outputs & Bundles
+dist/
+build/
+out/
+.next/
+.nuxt/
+.output/
+target/
+bin/
+obj/
+
+# Large Lock Files (ลดภาระการประมวลผลข้อความหลายหมื่นบรรทัด)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+poetry.lock
+Pipfile.lock
+composer.lock
+
+# Version Control & IDE Metadata
+.git/
+.svn/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs, Cache & Temporary Files
+*.log
+logs/
+tmp/
+temp/
+.cache/
+*.tmp
+coverage/
+.nyc_output/
+
+# Media & Binary Assets
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.ico
+*.mp4
+*.mp3
+*.wav
+*.pdf
+*.zip
+*.tar.gz
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Secrets & Environment Files
+.env
+.env.*
+*.pem
+*.key
