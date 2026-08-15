@@ -102,3 +102,19 @@ ehthumbs.db
 Thumbs.db
 desktop.ini
 $RECYCLE.BIN/
+
+# Executables & Binaries
+*.exe
+ffmpeg.exe
+ffprobe.exe
+yt-dlp.exe
+
+# Downloads & Temp Folders
+downloads/
+temp/
+*.tmp
+
+# Python artifacts
+__pycache__/
+*.pyc
+.env
