@@ -51,7 +51,6 @@ class GridDownloadWorker(QThread):
     def _download_stream_direct(
         self, url: str, target_path: str, opener: urllib.request.OpenerDirector
     ) -> bool:
-        """Download file with chunked streaming and progress reporting."""
         try:
             req = urllib.request.Request(
                 url,
@@ -108,7 +107,6 @@ class GridDownloadWorker(QThread):
             return False
 
     def _convert_to_mp3(self, input_file: str) -> str | None:
-        """Convert downloaded video/audio file to MP3 via local FFmpeg."""
         output_file = os.path.splitext(input_file)[0] + ".mp3"
         ffmpeg_dir = get_ffmpeg_dir()
         ffmpeg_bin = os.path.join(
@@ -158,7 +156,6 @@ class GridDownloadWorker(QThread):
             if self._is_cancelled:
                 break
 
-            # Handle either MediaCardWidget objects or raw dict payloads
             if hasattr(card, "data"):
                 data = card.data
                 selected_format = (
@@ -180,7 +177,7 @@ class GridDownloadWorker(QThread):
             item_success = False
             first_saved_path = ""
 
-            # Strategy 1: Direct CDN Download (Fastest)
+            # Strategy 1: Direct CDN Streaming
             if raw_media:
                 all_slides_ok = True
                 for s_idx, m in enumerate(raw_media, 1):
@@ -206,7 +203,7 @@ class GridDownloadWorker(QThread):
                 if all_slides_ok and first_saved_path:
                     item_success = True
 
-            # Strategy 2: Fallback to yt-dlp Engine
+            # Strategy 2: yt-dlp Engine Fallback
             if not item_success and not self._is_cancelled and web_url:
                 try:
                     out_tmpl = os.path.join(self.save_dir, f"{uploader}_%(id)s.%(ext)s")

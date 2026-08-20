@@ -34,27 +34,21 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from config.constants import (
-    APPLICATION_NAME,
-    INSTAGRAM_URL_REGEX,
-    ORGANIZATION_NAME,
-)
+from config.constants import APPLICATION_NAME, ORGANIZATION_NAME
 from config.translations import TRANSLATIONS
 from core.cookie_manager import sanitize_and_save_instagram_cookies
 from core.download_worker import GridDownloadWorker
 from core.inspect_worker import InspectionWorker
-from core.parser import parse_instagram_url
 from gui.icons import get_icon
 from gui.styles import DARK_THEME_QSS
 from gui.widgets.media_card import MediaCardWidget
 from gui.widgets.modern_progress_bar import ModernProgressBar
 from gui.widgets.url_chip_input import UrlBlockContainer
-from utils.file_utils import get_ffmpeg_dir, get_icon_path
+from utils.file_utils import get_icon_path
 
 
 class MainWindow(QMainWindow):
@@ -105,9 +99,7 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(16, 12, 16, 12)
         main_layout.setSpacing(8)
 
-        # =====================================================================
-        # 1. TOP HEADER & URL INPUT DECK (Compact)
-        # =====================================================================
+        # 1. TOP HEADER & URL INPUT DECK
         self.input_group = QGroupBox()
         input_layout = QVBoxLayout(self.input_group)
         input_layout.setContentsMargins(10, 8, 10, 8)
@@ -159,9 +151,7 @@ class MainWindow(QMainWindow):
         input_layout.addLayout(input_action_row)
         main_layout.addWidget(self.input_group)
 
-        # =====================================================================
-        # 2. MAIN MEDIA GRID INSPECTOR (Spacious Canvas - Stretch 1)
-        # =====================================================================
+        # 2. MAIN MEDIA GRID INSPECTOR
         self.grid_group = QGroupBox()
         grid_layout = QVBoxLayout(self.grid_group)
         grid_layout.setContentsMargins(10, 8, 10, 8)
@@ -218,16 +208,13 @@ class MainWindow(QMainWindow):
         self.cards_layout = QVBoxLayout(self.cards_container)
         self.cards_layout.setContentsMargins(8, 8, 8, 8)
         self.cards_layout.setSpacing(8)
-        # Use AlignTop so cards stack from top to bottom without top-spacer distortion
         self.cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self.scroll_area.setWidget(self.cards_container)
         grid_layout.addWidget(self.scroll_area)
         main_layout.addWidget(self.grid_group, stretch=1)
 
-        # =====================================================================
-        # 3. BOTTOM COMMAND & SETTINGS DECK (Unified & Compact)
-        # =====================================================================
+        # 3. BOTTOM COMMAND & SETTINGS DECK
         self.bottom_deck = QFrame()
         self.bottom_deck.setStyleSheet(
             """
@@ -243,11 +230,9 @@ class MainWindow(QMainWindow):
         bottom_deck_layout.setContentsMargins(10, 8, 10, 8)
         bottom_deck_layout.setSpacing(6)
 
-        # Row 1: Split Controls (Left: Settings & Cookies | Right: Download Actions)
         deck_row = QHBoxLayout()
         deck_row.setSpacing(12)
 
-        # Left Column: Save Path & Cookie Status
         left_settings_col = QVBoxLayout()
         left_settings_col.setSpacing(4)
 
@@ -301,7 +286,6 @@ class MainWindow(QMainWindow):
 
         deck_row.addLayout(left_settings_col, stretch=3)
 
-        # Right Column: Big Download & Cancel Action Buttons
         right_action_col = QHBoxLayout()
         right_action_col.setSpacing(6)
 
@@ -347,7 +331,6 @@ class MainWindow(QMainWindow):
         deck_row.addLayout(right_action_col, stretch=2)
         bottom_deck_layout.addLayout(deck_row)
 
-        # Row 2: Status Text, Modern Progress Bar & Clipboard Notice
         status_bar_row = QHBoxLayout()
         self.lbl_status = QLabel()
         self.lbl_status.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
@@ -442,6 +425,8 @@ class MainWindow(QMainWindow):
                 selected=selected_count, total=total_count
             )
         )
+        # Disable Download button if the grid is completely empty
+        self.btn_download_all.setEnabled(total_count > 0)
 
     def update_cookie_status_ui(self) -> None:
         has_cookie = os.path.exists(self.cookie_path)
@@ -579,7 +564,6 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setEnabled(True)
         self.lbl_status.setText(self.t("status_inspecting"))
 
-        # Collect existing shortcodes to skip reloading
         existing_shortcodes = {
             card.data.get("shortcode")
             for card in self.cards
@@ -599,12 +583,10 @@ class MainWindow(QMainWindow):
     def add_card(self, data: dict) -> None:
         shortcode = data.get("shortcode")
 
-        # 1. Skip if the card is already in the grid (completed or queued)
         for existing_card in self.cards:
             if existing_card.data.get("shortcode") == shortcode:
-                return  # Do not reload or overwrite existing card
+                return
 
-        # 2. Create and append the new card
         card = MediaCardWidget(data, self.current_lang)
         card.clicked.connect(self.on_card_clicked)
         card.removed.connect(self.remove_card)
@@ -617,7 +599,6 @@ class MainWindow(QMainWindow):
         self.scroll_grid_to_bottom()
 
     def scroll_grid_to_bottom(self) -> None:
-        """Smooth Auto-Scroll ไปยังการ์ดมีเดียใบใหม่ล่าสุดใน Grid"""
         QTimer.singleShot(30, self._do_scroll_grid_to_bottom)
 
     def _do_scroll_grid_to_bottom(self) -> None:
@@ -654,15 +635,22 @@ class MainWindow(QMainWindow):
         self.update_selection_ui()
 
     def start_download_all(self) -> None:
-        # Determine target cards (selected cards or all cards)
+        # 1. Check if the grid has any items at all
+        if not self.cards:
+            QMessageBox.warning(self, "Warning", "No media items in queue to download.")
+            return
+
+        # 2. Determine target cards (selected cards or all cards in queue)
         selected_cards = [c for c in self.cards if c.is_selected]
         targets = selected_cards if selected_cards else self.cards
 
-        # Download only items that are not completed yet
+        # 3. Filter only cards that are NOT completed yet
         target_cards = [c for c in targets if not c.is_completed]
 
         if not target_cards:
-            QMessageBox.information(self, "Info", "All items are already downloaded.")
+            QMessageBox.information(
+                self, "Info", "All items in the queue are already downloaded."
+            )
             return
 
         self.btn_download_all.setEnabled(False)
