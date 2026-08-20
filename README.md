@@ -47,20 +47,19 @@ yt-dlp-instagram/
 │   └── logger.py            # Silent worker logger
 ├── main.py                  # Application entry point
 └── requirements.txt         # Project dependencies
+```
 
 ---
 
 ## Installation & Setup
-- **Prerequisites**
-  -  Python 3.10 or higher
-  -  FFmpeg (placed in system PATH or root folder)
 
----
+### 1. Prerequisites
+- Python 3.10 or higher
+- [FFmpeg](https://ffmpeg.org/download.html) (placed in system PATH or root folder)
 
-## Setup Environment
-
-```powershell
-git clone [https://github.com/xxdadixx/yt-dlp-instagram.git](https://github.com/xxdadixx/yt-dlp-instagram.git)
+### 2. Setup Environment
+```bash
+git clone https://github.com/xxdadixx/yt-dlp-instagram.git
 cd yt-dlp-instagram
 
 # Create and activate virtual environment
@@ -72,37 +71,23 @@ source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+```
 
----
-
-## Run Application
-
-```powershell
+### 3. Run Application
+```bash
 python main.py
+```
 
 ---
 
-## Authentication (**cookies.txt**)
+## Authentication (`cookies.txt`)
 
-To inspect private accounts you follow, view active 24-hour Stories, or bypass Instagram scraping limits
-
-- Export cookies from your logged-in Instagram browser session using an extension (e.g., Get cookies.txt LOCALLY).
-- Click Import Cookie in the application's bottom deck to load your **cookies.txt**
+To inspect private accounts you follow, view active 24-hour Stories, or bypass Instagram scraping limits:
+1. Export cookies from your logged-in Instagram browser session using an extension (e.g., *Get cookies.txt LOCALLY*).
+2. Click **Import Cookie** in the application's bottom deck to load your `cookies.txt`.
 
 ---
 
 ## License & Disclaimer
 
 This software is developed for educational and personal archival purposes only. Please adhere to Instagram's Terms of Service when downloading media.
-
----
-
-### How to Apply and Push the Update
-
-1. Replace the entire content of your local `README.md` file with the block above.
-2. In your terminal, run:
-
-```powershell
-git add README.md
-git commit -m "docs: complete readme with setup and repository urls"
-git push origin main
