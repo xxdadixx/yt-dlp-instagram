@@ -22,13 +22,34 @@ venv/
 ENV/
 env/
 
-# Sensitive Credentials & Session Data (Critical)
+# Testing, Linting & Type Checking
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Sensitive Credentials & Session Data
 cookies.txt
 *.cookie
 *.session
 *.credentials
 .env
 .env.*
+!.env.example
+!.env.template
+
+# Local Databases & Persistent State
+*.sqlite3
+*.sqlite
+*.db
+
+# Browser Automation & Scraper Profiles
+chrome_data/
+user_data/
+playwright-report/
+.playwright/
 
 # Output Media & Downloads
 downloads/
@@ -37,6 +58,9 @@ temp/
 tmp/
 *.part
 *.ytdl
+*.mp4
+*.mkv
+*.webm
 
 # Heavy Binaries & Local Dependencies
 ffmpeg/
@@ -44,14 +68,16 @@ ffmpeg.exe
 ffprobe.exe
 yt-dlp.exe
 *.exe
+*.dll
+*.dylib
 
-# Packaging & Installer Artifacts
+# Packaging & PyInstaller Artifacts
 Output/
 _MEI*/
 *.manifest
 *.spec.bak
 
-# IDE & OS Metadata
+# IDE, Editor & OS Metadata
 .vscode/
 .idea/
 *.swp
@@ -60,3 +86,5 @@ _MEI*/
 Thumbs.db
 desktop.ini
 *.log
+*:Zone.Identifier
+.ipynb_checkpoints/
