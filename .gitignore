@@ -1,120 +1,62 @@
-# =============================================================================
-# Python & Bytecode
-# =============================================================================
+# Bytecode & Python Caches
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
+develop-eggs/
 eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
 var/
 wheels/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
 
-# =============================================================================
 # Virtual Environments
-# =============================================================================
 venv/
 .venv/
 ENV/
 env/
-env.bak/
-venv.bak/
 
-# =============================================================================
-# Sensitive Credentials & Session Data (Critical for IG Downloader)
-# =============================================================================
+# Sensitive Credentials & Session Data (Critical)
 cookies.txt
 *.cookie
 *.session
 *.credentials
+.env
+.env.*
 
-# =============================================================================
-# Downloaded Media & Local Test Outputs
-# =============================================================================
+# Output Media & Downloads
+downloads/
 InstagramDownloads/
-*.mp4
-*.m4a
-*.mp3
-*.jpg
-*.jpeg
-*.png
-*.webp
+temp/
+tmp/
 *.part
 *.ytdl
 
-# =============================================================================
-# External Binaries & Packaging Artifacts (PyInstaller / Inno Setup / FFmpeg)
-# =============================================================================
-# Local FFmpeg folder/binaries (don't commit heavy binaries to Git)
+# Heavy Binaries & Local Dependencies
 ffmpeg/
 ffmpeg.exe
 ffprobe.exe
+yt-dlp.exe
+*.exe
 
-# PyInstaller build artifacts
+# Packaging & Installer Artifacts
+Output/
+_MEI*/
 *.manifest
 *.spec.bak
 
-# Inno Setup output folder
-Output/
-_MEI*/
-
-# =============================================================================
-# Logs & Database
-# =============================================================================
-*.log
-*.sqlite
-*.sqlite3
-
-# =============================================================================
-# IDEs & Editor Configuration
-# =============================================================================
+# IDE & OS Metadata
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-*.sublime-workspace
-*.sublime-project
-
-# =============================================================================
-# Operating System Files
-# =============================================================================
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 desktop.ini
-$RECYCLE.BIN/
-
-# Executables & Binaries
-*.exe
-ffmpeg.exe
-ffprobe.exe
-yt-dlp.exe
-
-# Downloads & Temp Folders
-downloads/
-temp/
-*.tmp
-
-# Python artifacts
-__pycache__/
-*.pyc
-.env
+*.log
