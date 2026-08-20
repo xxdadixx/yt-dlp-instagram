@@ -10,7 +10,7 @@ from config.constants import DESKTOP_UA
 
 
 class ThumbnailLoader(QThread):
-    loaded = pyqtSignal(QPixmap)
+    loaded = pyqtSignal(QImage)  # ส่ง QImage แทน QPixmap เพื่อความปลอดภัยของ Thread
 
     def __init__(self, url: str):
         super().__init__()
@@ -31,12 +31,6 @@ class ThumbnailLoader(QThread):
                 raw_data = resp.read()
                 image = QImage.fromData(raw_data)
                 if not image.isNull() and self._is_running:
-                    pixmap = QPixmap.fromImage(image).scaled(
-                        70,
-                        70,
-                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                    self.loaded.emit(pixmap)
+                    self.loaded.emit(image)
         except Exception:
             pass

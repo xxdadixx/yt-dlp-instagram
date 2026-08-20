@@ -1,14 +1,15 @@
 """
-gui/widgets/media_card.py - Interactive Media Card Widget with Selection & Quality Dropdown.
+gui/widgets/media_card.py - Interactive Media Card Widget with Dynamic i18n & Quality Dropdown.
 """
 
 import os
 import subprocess
 import sys
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QMouseEvent, QPixmap
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, pyqtSignal
+from PyQt6.QtGui import QFont, QImage, QMouseEvent, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -16,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from config.translations import TRANSLATIONS
+from gui.icons import get_icon
 from gui.styles import CARD_DEFAULT_QSS, CARD_SELECTED_QSS
 from gui.widgets.no_scroll_combo import NoScrollComboBox
 from gui.widgets.thumbnail_loader import ThumbnailLoader
@@ -60,6 +62,77 @@ class MediaCardWidget(QFrame):
         self.lbl_uploader.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         top_row.addWidget(self.lbl_uploader)
 
+        # Type Badge
+        self.lbl_badge = QLabel()
+        self.update_badge()
+        top_row.addWidget(self.lbl_badge)
+        top_row.addStretch()
+        info_layout.addLayout(top_row)
+
+        self.lbl_sub = QLabel(
+            f"ID: {self.data.get('shortcode')} | {self.data.get('url')[:45]}..."
+        )
+        self.lbl_sub.setStyleSheet("color: #888888; font-size: 10px;")
+        info_layout.addWidget(self.lbl_sub)
+
+        bottom_row = QHBoxLayout()
+        self.lbl_quality = QLabel(TRANSLATIONS[self.lang]["lbl_quality"])
+        self.lbl_quality.setStyleSheet("font-size: 11px; color: #cccccc;")
+        bottom_row.addWidget(self.lbl_quality)
+
+        self.cmb_quality = NoScrollComboBox()
+        self.cmb_quality.setFixedHeight(26)
+        for opt in self.data.get("format_options", []):
+            self.cmb_quality.addItem(opt["label"], opt["key"])
+
+        if self.cmb_quality.count() > 0:
+            self.cmb_quality.setCurrentIndex(0)
+
+        bottom_row.addWidget(self.cmb_quality, stretch=1)
+
+        self.lbl_status = QLabel("Ready")
+        self.lbl_status.setStyleSheet(
+            "color: #28a745; font-size: 11px; font-weight: bold;"
+        )
+        bottom_row.addWidget(self.lbl_status)
+
+        self.btn_open_file = QPushButton()
+        self.btn_open_file.setFixedHeight(26)
+        self.btn_open_file.setIcon(get_icon("open-external", "#ffffff", 13))
+        self.btn_open_file.setStyleSheet(
+            "background-color: #28a745; font-size: 11px; padding: 2px 10px;"
+        )
+        self.btn_open_file.setVisible(False)
+        self.btn_open_file.clicked.connect(self.open_downloaded_file)
+        bottom_row.addWidget(self.btn_open_file)
+
+        self.btn_delete = QPushButton()
+        self.btn_delete.setFixedSize(26, 26)
+        self.btn_delete.setIcon(get_icon("trash", "#ff6b81", 14))
+        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete.setToolTip(TRANSLATIONS[self.lang]["tooltip_delete_card"])
+        self.btn_delete.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #261e27;
+                border: 1px solid #4a2d39;
+                border-radius: 5px;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: #e84118;
+                border: 1px solid #e84118;
+            }
+        """
+        )
+        self.btn_delete.clicked.connect(self.cleanup_and_delete)
+        bottom_row.addWidget(self.btn_delete)
+
+        info_layout.addLayout(bottom_row)
+        layout.addLayout(info_layout, stretch=1)
+
+    def update_badge(self) -> None:
+        """อัปเดตข้อความและสีของ Type Badge ตามภาษาปัจจุบัน"""
         m_type = self.data.get("media_type")
         if m_type in ("story", "highlight"):
             badge_text = TRANSLATIONS[self.lang]["badge_story"]
@@ -76,55 +149,17 @@ class MediaCardWidget(QFrame):
             badge_text = TRANSLATIONS[self.lang]["badge_photo"]
             badge_color = "#4a90e2"
 
-        self.lbl_badge = QLabel(f" {badge_text} ")
+        self.lbl_badge.setText(f" {badge_text} ")
         self.lbl_badge.setStyleSheet(
             f"background-color: {badge_color}; color: white; border-radius: 3px; font-size: 10px; font-weight: bold; padding: 2px 6px;"
         )
-        top_row.addWidget(self.lbl_badge)
-        top_row.addStretch()
-        info_layout.addLayout(top_row)
 
-        self.lbl_sub = QLabel(f"ID: {self.data.get('shortcode')} | {self.data.get('url')[:45]}...")
-        self.lbl_sub.setStyleSheet("color: #888888; font-size: 10px;")
-        info_layout.addWidget(self.lbl_sub)
-
-        bottom_row = QHBoxLayout()
-        lbl_q = QLabel(TRANSLATIONS[self.lang]["lbl_quality"])
-        lbl_q.setStyleSheet("font-size: 11px; color: #cccccc;")
-        bottom_row.addWidget(lbl_q)
-
-        self.cmb_quality = NoScrollComboBox()
-        self.cmb_quality.setFixedHeight(26)
-        for opt in self.data.get("format_options", []):
-            self.cmb_quality.addItem(opt["label"], opt["key"])
-
-        if self.cmb_quality.count() > 0:
-            self.cmb_quality.setCurrentIndex(0)
-
-        bottom_row.addWidget(self.cmb_quality, stretch=1)
-
-        self.lbl_status = QLabel("Ready")
-        self.lbl_status.setStyleSheet("color: #28a745; font-size: 11px; font-weight: bold;")
-        bottom_row.addWidget(self.lbl_status)
-
-        self.btn_open_file = QPushButton("📁 Open")
-        self.btn_open_file.setFixedHeight(24)
-        self.btn_open_file.setStyleSheet("background-color: #28a745; font-size: 10px; padding: 2px 8px;")
-        self.btn_open_file.setVisible(False)
-        self.btn_open_file.clicked.connect(self.open_downloaded_file)
-        bottom_row.addWidget(self.btn_open_file)
-
-        self.btn_delete = QPushButton("✕")
-        self.btn_delete.setFixedSize(24, 24)
-        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_delete.setStyleSheet(
-            "background-color: #3d1c24; color: #ff4d6d; border-radius: 12px; font-weight: bold;"
-        )
-        self.btn_delete.clicked.connect(self.cleanup_and_delete)
-        bottom_row.addWidget(self.btn_delete)
-
-        info_layout.addLayout(bottom_row)
-        layout.addLayout(info_layout, stretch=1)
+    def retranslate_ui(self, lang: str) -> None:
+        """เปลี่ยนภาษาของวิดเจ็ตภายในการ์ดแบบ Real-time"""
+        self.lang = lang
+        self.update_badge()
+        self.lbl_quality.setText(TRANSLATIONS[self.lang]["lbl_quality"])
+        self.btn_delete.setToolTip(TRANSLATIONS[self.lang]["tooltip_delete_card"])
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         self.clicked.emit(self, event)
@@ -144,7 +179,9 @@ class MediaCardWidget(QFrame):
         self.is_completed = True
         self.saved_file_path = file_path
         self.lbl_status.setText("✔ Done")
-        self.lbl_status.setStyleSheet("color: #28a745; font-size: 11px; font-weight: bold;")
+        self.lbl_status.setStyleSheet(
+            "color: #28a745; font-size: 11px; font-weight: bold;"
+        )
         self.btn_open_file.setVisible(True)
 
     def open_downloaded_file(self) -> None:
@@ -164,8 +201,14 @@ class MediaCardWidget(QFrame):
         self.thumb_loader.loaded.connect(self._on_thumbnail_loaded)
         self.thumb_loader.start()
 
-    def _on_thumbnail_loaded(self, pixmap: QPixmap) -> None:
+    def _on_thumbnail_loaded(self, image: QImage) -> None:
         try:
+            pixmap = QPixmap.fromImage(image).scaled(
+                70,
+                70,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
             self.lbl_thumb.setPixmap(pixmap)
         except Exception:
             pass
@@ -178,3 +221,15 @@ class MediaCardWidget(QFrame):
 
     def get_selected_format(self) -> str:
         return self.cmb_quality.currentData()
+
+    def animate_entry(self, duration: int = 280) -> None:
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.opacity_effect)
+
+        self.anim = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.anim.setDuration(duration)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.anim.finished.connect(lambda: self.setGraphicsEffect(None))
+        self.anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)

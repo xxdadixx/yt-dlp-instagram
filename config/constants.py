@@ -4,12 +4,13 @@ config/constants.py - Global constants and configuration values.
 
 INSTAGRAM_URL_REGEX = (
     r"https?://(?:www\.)?instagram\.com/"
-    r"(?:stories/[A-Za-z0-9_\-\.]+/[0-9]+|"
-    r"stories/highlights/[0-9]+|"
+    r"(?:stories/highlights/[0-9]+|"
+    r"stories/[A-Za-z0-9_\-\.]+(?:/[0-9]+)?|"
     r"reel/[A-Za-z0-9_\-\.]+|"
     r"reels/[A-Za-z0-9_\-\.]+|"
     r"p/[A-Za-z0-9_\-\.]+|"
-    r"tv/[A-Za-z0-9_\-\.]+)/?"
+    r"tv/[A-Za-z0-9_\-\.]+|"
+    r"(?!explore|accounts|direct|api)[A-Za-z0-9_\-\.]+(?:/(?:reels|tagged))?)/?"
 )
 
 MOBILE_UA = (

@@ -1,36 +1,57 @@
 """
-core/download_worker.py - Background QThread executing Direct CDN streaming & yt-dlp video pipelines.
+core/download_worker.py - Multi-threaded Media Download Worker with Direct CDN Streaming,
+FFmpeg Post-processing, and fallback to yt-dlp.
 """
 
 import os
+import re
+import subprocess
 import time
 import urllib.request
 from PyQt6.QtCore import QThread, pyqtSignal
 import yt_dlp
 
 from config.constants import DESKTOP_UA, IG_APP_ID
-from utils.file_utils import get_ffmpeg_dir, sanitize_filename
+from core.cookie_manager import get_cookie_opener
+from utils.file_utils import get_ffmpeg_dir
 from utils.logger import SilentLogger
 
 
+def sanitize_filename(name: str) -> str:
+    """Sanitize string for safe cross-platform filenames."""
+    clean = re.sub(r'[\\/*?:"<>|]', "", str(name))
+    return clean.strip().replace(" ", "_") or "media"
+
+
 class GridDownloadWorker(QThread):
-    progress_signal = pyqtSignal(dict)
     item_started = pyqtSignal(int, int, str)
     item_finished = pyqtSignal(int, bool, str, str)
+    progress_signal = pyqtSignal(dict)
     all_finished = pyqtSignal(int, int, bool)
 
-    def __init__(self, card_data_list: list[dict], save_path: str, cookie_path: str | None):
+    def __init__(self, target_cards: list, save_dir: str, cookie_path: str | None):
         super().__init__()
-        self.items = card_data_list
-        self.save_path = save_path
+        self.target_cards = target_cards
+        self.save_dir = save_dir
         self.cookie_path = cookie_path
         self._is_cancelled = False
 
     def cancel(self) -> None:
         self._is_cancelled = True
 
-    def _download_file(self, url: str, dest_path: str) -> bool:
-        """ดาวน์โหลดไฟล์แบบ Chunked พร้อมส่ง Progress Bar Signal อย่างต่อเนื่อง"""
+    def _get_unique_filepath(self, folder: str, filename: str) -> str:
+        base, ext = os.path.splitext(filename)
+        candidate = os.path.join(folder, filename)
+        counter = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(folder, f"{base}_{counter}{ext}")
+            counter += 1
+        return candidate
+
+    def _download_stream_direct(
+        self, url: str, target_path: str, opener: urllib.request.OpenerDirector
+    ) -> bool:
+        """Download file with chunked streaming and progress reporting."""
         try:
             req = urllib.request.Request(
                 url,
@@ -39,163 +60,193 @@ class GridDownloadWorker(QThread):
                     "Referer": "https://www.instagram.com/",
                 },
             )
-            with urllib.request.urlopen(req, timeout=25) as resp, open(dest_path, "wb") as f:
-                total_bytes = int(resp.info().get("Content-Length", 0))
-                downloaded_bytes = 0
-                block_size = 64 * 1024
+            with opener.open(req, timeout=20) as resp:
+                total_size = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
                 start_time = time.time()
+                last_update = 0.0
 
-                while True:
-                    if self._is_cancelled:
-                        return False
-                    chunk = resp.read(block_size)
-                    if not chunk:
-                        break
-                    downloaded_bytes += len(chunk)
-                    f.write(chunk)
+                with open(target_path, "wb") as f:
+                    while not self._is_cancelled:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
 
-                    elapsed = time.time() - start_time
-                    speed = (downloaded_bytes / elapsed) if elapsed > 0 else 0
-                    pct = (downloaded_bytes / total_bytes * 100) if total_bytes > 0 else 100.0
+                        now = time.time()
+                        if now - last_update > 0.1:
+                            last_update = now
+                            elapsed = now - start_time or 0.001
+                            speed = downloaded / elapsed
+                            percent = (
+                                (downloaded / total_size * 100)
+                                if total_size > 0
+                                else 0.0
+                            )
+                            self.progress_signal.emit(
+                                {
+                                    "downloaded": downloaded,
+                                    "total": total_size,
+                                    "speed": speed,
+                                    "percent": percent,
+                                }
+                            )
 
-                    self.progress_signal.emit({
-                        "percent": pct,
-                        "downloaded": downloaded_bytes,
-                        "total": total_bytes,
-                        "speed": speed,
-                        "eta": (((total_bytes - downloaded_bytes) / speed) if speed > 0 and total_bytes > downloaded_bytes else 0),
-                    })
-            return True
-        except Exception:
+                if self._is_cancelled:
+                    if os.path.exists(target_path):
+                        os.remove(target_path)
+                    return False
+                return True
+        except Exception as e:
+            print(f"[DEBUG] Direct download error: {e}")
+            if os.path.exists(target_path):
+                try:
+                    os.remove(target_path)
+                except Exception:
+                    pass
             return False
 
-    def run(self) -> None:
-        os.makedirs(self.save_path, exist_ok=True)
+    def _convert_to_mp3(self, input_file: str) -> str | None:
+        """Convert downloaded video/audio file to MP3 via local FFmpeg."""
+        output_file = os.path.splitext(input_file)[0] + ".mp3"
         ffmpeg_dir = get_ffmpeg_dir()
-        total = len(self.items)
+        ffmpeg_bin = os.path.join(
+            ffmpeg_dir, "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        )
+
+        cmd = [
+            ffmpeg_bin if os.path.exists(ffmpeg_bin) else "ffmpeg",
+            "-y",
+            "-i",
+            input_file,
+            "-vn",
+            "-acodec",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            output_file,
+        ]
+
+        try:
+            startupinfo = None
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                startupinfo=startupinfo,
+            )
+            if os.path.exists(input_file) and input_file != output_file:
+                os.remove(input_file)
+            return output_file
+        except Exception as e:
+            print(f"[DEBUG] FFmpeg conversion failed: {e}")
+            return input_file
+
+    def run(self) -> None:
+        os.makedirs(self.save_dir, exist_ok=True)
+        opener = get_cookie_opener(self.cookie_path)
+        total_items = len(self.target_cards)
         success_count = 0
         fail_count = 0
 
-        def progress_hook(d: dict) -> None:
-            if self._is_cancelled:
-                raise Exception("Cancelled")
-            if d.get("status") == "downloading":
-                total_b = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                down_b = d.get("downloaded_bytes", 0)
-                speed = d.get("speed") or 0
-                eta = d.get("eta") or 0
-                pct = (down_b / total_b * 100) if total_b else 0.0
-                self.progress_signal.emit({
-                    "percent": pct,
-                    "downloaded": down_b,
-                    "total": total_b,
-                    "speed": speed,
-                    "eta": eta,
-                })
-
-        for idx, item in enumerate(self.items, 1):
+        for idx, card in enumerate(self.target_cards):
             if self._is_cancelled:
                 break
 
-            shortcode = sanitize_filename(item["shortcode"])
-            uploader = sanitize_filename(item.get("uploader", "Instagram"))
-            url = item["url"]
-            chosen_format = item["selected_format"]
-            self.item_started.emit(idx - 1, total, shortcode)
+            # Handle either MediaCardWidget objects or raw dict payloads
+            if hasattr(card, "data"):
+                data = card.data
+                selected_format = (
+                    card.get_selected_format()
+                    if hasattr(card, "get_selected_format")
+                    else "best_all"
+                )
+            else:
+                data = card
+                selected_format = data.get("selected_format", "best_all")
 
-            ok = False
-            current_date = time.strftime("%Y%m%d")
-            final_saved_path = self.save_path
+            shortcode = sanitize_filename(data.get("shortcode", f"media_{idx}"))
+            uploader = sanitize_filename(data.get("uploader", "instagram"))
+            raw_media = data.get("raw_media_items", [])
+            web_url = data.get("url", "")
 
-            # 1. Direct Media Items (Carousels, Photos, Stories)
-            direct_format_keys = (
-                "best_all",
-                "photos_only",
-                "best_single",
-                "720p_single",
-                "story_video",
-                "story_photo",
-                "1080p_all",
-                "auto_best",
-            )
+            self.item_started.emit(idx, total_items, shortcode)
 
-            if item.get("raw_media_items") and chosen_format in direct_format_keys:
-                img_list = item["raw_media_items"]
-                if chosen_format == "photos_only":
-                    img_list = [m for m in img_list if not m.get("is_video")]
+            item_success = False
+            first_saved_path = ""
 
-                success_slides = 0
-                for s_idx, raw_media in enumerate(img_list, 1):
+            # Strategy 1: Direct CDN Download (Fastest)
+            if raw_media:
+                all_slides_ok = True
+                for s_idx, m in enumerate(raw_media, 1):
                     if self._is_cancelled:
+                        all_slides_ok = False
                         break
 
-                    ext = raw_media.get("ext", "jpg")
-                    if len(img_list) > 1:
-                        fn = f"{uploader}_{current_date}_{shortcode}_{s_idx:02d}.{ext}"
+                    ext = m.get("ext", "mp4" if m.get("is_video") else "jpg")
+                    suffix = f"_{s_idx}" if len(raw_media) > 1 else ""
+                    filename = f"{uploader}_{shortcode}{suffix}.{ext}"
+                    filepath = self._get_unique_filepath(self.save_dir, filename)
+
+                    ok = self._download_stream_direct(m["url"], filepath, opener)
+                    if ok:
+                        if selected_format == "audio_mp3" and ext == "mp4":
+                            filepath = self._convert_to_mp3(filepath) or filepath
+                        if not first_saved_path:
+                            first_saved_path = filepath
                     else:
-                        fn = f"{uploader}_{current_date}_{shortcode}.{ext}"
+                        all_slides_ok = False
+                        break
 
-                    fp = os.path.join(self.save_path, fn)
-                    if self._download_file(raw_media["url"], fp):
-                        success_slides += 1
-                        final_saved_path = fp
+                if all_slides_ok and first_saved_path:
+                    item_success = True
 
-                ok = success_slides > 0
-
-            # 2. yt-dlp Engine (Videos / Reels / Audio MP3 / Fallback)
-            if not ok and not self._is_cancelled:
-                ydl_opts = {
-                    "paths": {"home": self.save_path},
-                    "windowsfilenames": True,
-                    "trim_file_name": 120,
-                    "http_headers": {
-                        "User-Agent": DESKTOP_UA,
-                        "X-IG-App-ID": IG_APP_ID,
-                    },
-                    "outtmpl": "%(uploader,uploader_id|Instagram)s_%(upload_date>%Y%m%d,Unknown)s_%(id)s.%(ext)s",
-                    "progress_hooks": [progress_hook],
-                    "logger": SilentLogger(),
-                    "quiet": True,
-                    "merge_output_format": "mp4",
-                }
-                if ffmpeg_dir:
-                    ydl_opts["ffmpeg_location"] = ffmpeg_dir
-                if self.cookie_path and os.path.exists(self.cookie_path):
-                    ydl_opts["cookiefile"] = self.cookie_path
-
-                if chosen_format == "audio_mp3":
-                    ydl_opts["format"] = "best"
-                    ydl_opts["postprocessors"] = [
-                        {
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": "mp3",
-                            "preferredquality": "192",
-                        }
-                    ]
-                elif chosen_format == "video_h264":
-                    ydl_opts["format"] = "bestvideo*+bestaudio/best"
-                    ydl_opts["format_sort"] = ["vcodec:h264", "res", "fps"]
-                else:
-                    ydl_opts["format"] = "bestvideo*+bestaudio/best"
-                    ydl_opts["format_sort"] = ["res:1080", "res", "vbr", "fps", "size"]
-
+            # Strategy 2: Fallback to yt-dlp Engine
+            if not item_success and not self._is_cancelled and web_url:
                 try:
+                    out_tmpl = os.path.join(self.save_dir, f"{uploader}_%(id)s.%(ext)s")
+                    ydl_opts = {
+                        "outtmpl": out_tmpl,
+                        "quiet": True,
+                        "logger": SilentLogger(),
+                        "http_headers": {
+                            "User-Agent": DESKTOP_UA,
+                            "X-IG-App-ID": IG_APP_ID,
+                        },
+                    }
+                    if selected_format == "audio_mp3":
+                        ydl_opts["format"] = "bestaudio/best"
+                        ydl_opts["postprocessors"] = [
+                            {
+                                "key": "FFmpegExtractAudio",
+                                "preferredcodec": "mp3",
+                                "preferredquality": "192",
+                            }
+                        ]
+
+                    if self.cookie_path and os.path.exists(self.cookie_path):
+                        ydl_opts["cookiefile"] = self.cookie_path
+
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
+                        info = ydl.extract_info(web_url, download=True)
                         if info:
-                            final_saved_path = ydl.prepare_filename(info)
-                    ok = True
-                except Exception:
-                    ok = False
+                            first_saved_path = ydl.prepare_filename(info)
+                            item_success = True
+                except Exception as e:
+                    print(f"[DEBUG] yt-dlp Download Fallback Error: {e}")
 
-            if ok:
+            if item_success:
                 success_count += 1
-                self.item_finished.emit(idx - 1, True, "Done", final_saved_path)
+                self.item_finished.emit(idx, True, "Done", first_saved_path)
             else:
-                if not self._is_cancelled:
-                    fail_count += 1
-                    self.item_finished.emit(idx - 1, False, "Failed", "")
+                fail_count += 1
+                self.item_finished.emit(idx, False, "Failed", "")
 
-            time.sleep(0.3)
+            time.sleep(0.05)
 
         self.all_finished.emit(success_count, fail_count, self._is_cancelled)
