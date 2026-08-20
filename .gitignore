@@ -88,3 +88,7 @@ desktop.ini
 *.log
 *:Zone.Identifier
 .ipynb_checkpoints/
+
+# Logs & test payloads
+logs/
+*.log
