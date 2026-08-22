@@ -62,6 +62,19 @@ tmp/
 *.mkv
 *.webm
 
+# Logs & Diagnostic Dumps
+logs/
+*.log
+
+# PyInstaller & Inno Setup Build Artifacts
+installer_output/
+Output/
+_MEI*/
+*.manifest
+*.spec.bak
+MyApp.spec
+*.iss.bak
+
 # Heavy Binaries & Local Dependencies
 ffmpeg/
 ffmpeg.exe
@@ -71,24 +84,14 @@ yt-dlp.exe
 *.dll
 *.dylib
 
-# Packaging & PyInstaller Artifacts
-Output/
-_MEI*/
-*.manifest
-*.spec.bak
-
 # IDE, Editor & OS Metadata
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 .DS_Store
 Thumbs.db
 desktop.ini
-*.log
 *:Zone.Identifier
 .ipynb_checkpoints/
-
-# Logs & test payloads
-logs/
-*.log
