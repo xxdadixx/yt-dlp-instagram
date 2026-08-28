@@ -75,6 +75,12 @@ from config.constants import (
     QUALITY_PRESETS,
     REQUEST_DELAY_SECONDS,
 )
+from core.parser import (
+    id_to_shortcode,
+    is_standalone_video,
+    parse_instagram_url,
+    shortcode_to_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -416,9 +422,13 @@ class InspectWorker(QThread):
             return None
 
         # Thumbnail extraction
-        candidates = item.get("image_versions2", {}).get("candidates", [])
+        candidates = (item.get("image_versions2") or {}).get("candidates", [])
         thumbnail_url = ""
-        if candidates and isinstance(candidates, list):
+        if (
+            candidates
+            and isinstance(candidates, list)
+            and isinstance(candidates[0], dict)
+        ):
             thumbnail_url = candidates[0].get("url", "")
         if not thumbnail_url:
             thumbnail_url = (
@@ -428,10 +438,14 @@ class InspectWorker(QThread):
                 or ""
             )
 
-        # Video direct stream URL extraction (if available)
-        video_versions = item.get("video_versions", [])
+        # Video direct stream URL extraction
+        video_versions = item.get("video_versions") or []
         video_url = ""
-        if video_versions and isinstance(video_versions, list):
+        if (
+            video_versions
+            and isinstance(video_versions, list)
+            and isinstance(video_versions[0], dict)
+        ):
             video_url = video_versions[0].get("url", "")
         if not video_url:
             video_url = item.get("video_url") or ""
@@ -517,7 +531,7 @@ class InspectWorker(QThread):
             "url": url,
             "thumbnail_url": thumbnail_url,
             "video_url": video_url,
-            "download_url": video_url,
+            "download_url": video_url or thumbnail_url,
             "caption": caption_text,
             "duration": duration,
             "view_count": view_count,
@@ -762,48 +776,91 @@ class InspectWorker(QThread):
         except Exception as ex:
             self.error.emit(f"yt-dlp error: {str(ex)}")
 
-    def _inspect_single_post(self, shortcode: str) -> None:
-        """Resolves a single Instagram post, reel, or TV video."""
-        # 1. Mobile media info endpoint
+    def _inspect_single_post(self, shortcode: str, raw_target: str = "") -> None:
+        """Resolves a single post across mobile API, embed HTML, oEmbed, and yt-dlp tiers."""
+        # Tier 1: Mobile media info endpoint (when cookie is available)
         try:
             media_id = shortcode_to_id(shortcode)
             if media_id:
                 url_m = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
-                h_m = {
-                    "User-Agent": MOBILE_USER_AGENT,
-                    "X-IG-App-ID": IG_APP_ID,
-                }
-                res_m = self._make_request(url_m, headers=h_m)
+                res_m = self._make_request(
+                    url_m,
+                    headers={"User-Agent": MOBILE_USER_AGENT, "X-IG-App-ID": IG_APP_ID},
+                )
                 if res_m and isinstance(res_m, dict):
-                    items = res_m.get("items", [])
+                    items = res_m.get("items", []) or (
+                        [res_m["media"]] if "media" in res_m else []
+                    )
                     if items:
                         card = self._extract_media_card(items[0])
-                        if card:
-                            sc = card["shortcode"]
-                            if sc not in self.seen_ids:
-                                self.seen_ids.add(sc)
-                                self.item_found.emit(card)
-                                return
+                        if card and card["shortcode"] not in self.seen_ids:
+                            self.seen_ids.add(card["shortcode"])
+                            self.item_found.emit(card)
+                            return
         except Exception:
             pass
 
-        # 2. Web info endpoint
-        url = f"{IG_BASE_URL}/p/{shortcode}/?__a=1&__d=dis"
-        res = self._make_request(url)
-        if res and isinstance(res, dict):
-            items = res.get("items", [])
-            if items:
-                media = items[0]
-                card = self._extract_media_card(media)
-                if card:
-                    sc = card["shortcode"]
-                    if sc not in self.seen_ids:
-                        self.seen_ids.add(sc)
+        # Tier 2: Public Embed HTML scraper
+        for embed_url in (
+            f"{IG_BASE_URL}/p/{shortcode}/embed/captioned/",
+            f"{IG_BASE_URL}/reel/{shortcode}/embed/captioned/",
+        ):
+            if self.is_cancelled:
+                return
+            embed_html = self._fetch_html(embed_url)
+            if embed_html:
+                card = self._extract_from_embed_html(
+                    embed_html, shortcode, raw_target=raw_target
+                )
+                if card and card["shortcode"] not in self.seen_ids:
+                    self.seen_ids.add(card["shortcode"])
+                    self.item_found.emit(card)
+                    return
+
+        # Tier 3: Public oEmbed API
+        clean_item_url = f"{IG_BASE_URL}/p/{shortcode}/"
+        for oembed_url in (
+            f"https://www.instagram.com/api/v1/oembed/?url={clean_item_url}",
+            f"https://api.instagram.com/oembed/?url={clean_item_url}",
+        ):
+            if self.is_cancelled:
+                return
+            res_oembed = self._make_request(oembed_url)
+            if res_oembed and isinstance(res_oembed, dict):
+                title = res_oembed.get("title", "")
+                username = res_oembed.get("author_name", "")
+                thumb = res_oembed.get("thumbnail_url", "")
+                if thumb or title:
+                    card = {
+                        "id": shortcode,
+                        "shortcode": shortcode,
+                        "title": (
+                            title.splitlines()[0][:60]
+                            if title
+                            else f"Instagram Media {shortcode}"
+                        ),
+                        "username": username,
+                        "url": raw_target or clean_item_url,
+                        "thumbnail_url": thumb,
+                        "video_url": "",
+                        "download_url": thumb,
+                        "caption": title,
+                        "duration": 0.0,
+                        "view_count": 0,
+                        "like_count": 0,
+                        "media_type": "post",
+                        "quality": self.quality_preset,
+                        "selected": True,
+                        "status": "ready",
+                    }
+                    if shortcode not in self.seen_ids:
+                        self.seen_ids.add(shortcode)
                         self.item_found.emit(card)
                         return
 
-        # 3. Fallback to yt-dlp
-        self._inspect_via_ytdlp(f"{IG_BASE_URL}/p/{shortcode}/")
+        # Tier 4: Fallback to yt-dlp
+        target_url = raw_target or f"{IG_BASE_URL}/p/{shortcode}/"
+        self._inspect_via_ytdlp(target_url)
 
     def run(self) -> None:
         """Worker execution loop over all input targets."""
@@ -847,8 +904,12 @@ class InspectWorker(QThread):
                             f"{IG_BASE_URL}/{username}/", default_username=username
                         )
 
-                elif ttype in ("reel", "post", "tv") and shortcode:
-                    self._inspect_single_post(shortcode)
+                elif ttype in ("reel", "post", "carousel", "tv") and shortcode:
+                    self._inspect_single_post(shortcode, raw_target=raw_target)
+
+                elif ttype == "audio":
+                    self.status_message.emit(f"Inspecting Audio: {raw_target}")
+                    self._inspect_via_ytdlp(raw_target)
 
                 elif ttype == "highlight":
                     self._inspect_via_ytdlp(raw_target)

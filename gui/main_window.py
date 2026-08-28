@@ -754,18 +754,20 @@ class MainWindow(QMainWindow):
             return
         try:
             cb = QApplication.clipboard()
-            mime = cb.mimeData() if hasattr(cb, "mimeData") else None
-            if mime and hasattr(mime, "hasText") and not mime.hasText():
+            if not hasattr(cb, "text"):
                 return
-            text = cb.text().strip() if hasattr(cb, "text") else ""
+            text = cb.text().strip()
             if not text or text == self._last_clipboard_text:
                 return
 
             self._last_clipboard_text = text
-            info = parse_instagram_url(text)
-            if info.get("valid") and info.get("type") != "unknown":
-                self.url_container.add_url_chip(text)
-                self.show_toast(f"Pasted: {text[:45]}...")
+            from core.parser import extract_instagram_urls
+
+            urls = extract_instagram_urls(text)
+            if urls:
+                for u in urls:
+                    self.url_container.add_url_chip(u)
+                self.show_toast(f"Pasted {len(urls)} link(s)")
         except Exception:
             pass
 
