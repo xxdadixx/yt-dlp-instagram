@@ -1,9 +1,11 @@
 """
 gui/main_window.py - Main GUI Window for Instagram Pro Downloader & Studio Inspector.
+Handles worker coordination, persistent settings, cookie management, and media card grid lifecycle.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -48,7 +50,7 @@ try:
         QWidget,
     )
 except ImportError:
-    # Headless runtime fallback
+
     class MagicSignal:
         def __init__(self):
             self._slots = []
@@ -137,6 +139,9 @@ except ImportError:
         def setToolTip(self, *a):
             pass
 
+        def setStyleSheet(self, *a):
+            pass
+
     class QPushButton(QWidget):
         def __init__(self, text="", parent=None):
             super().__init__(parent)
@@ -160,13 +165,18 @@ except ImportError:
         def setToolTip(self, *a):
             pass
 
+        def setStyleSheet(self, *a):
+            pass
+
     class QCheckBox(QWidget):
         def __init__(self, text="", parent=None):
             super().__init__(parent)
             self._checked = False
+            self.stateChanged = MagicSignal()
 
         def setChecked(self, c: bool):
             self._checked = c
+            self.stateChanged.emit(c)
 
         def isChecked(self) -> bool:
             return self._checked
@@ -235,6 +245,7 @@ from config.constants import (
     DEFAULT_HEADERS,
     QUALITY_PRESETS,
 )
+from core.cookie_manager import CookieManager
 from core.inspect_worker import InspectWorker
 
 try:
@@ -265,24 +276,6 @@ except ImportError:
             pass
 
         def cancel(self):
-            pass
-
-
-try:
-    from core.cookie_manager import CookieManager
-except ImportError:
-
-    class CookieManager:  # type: ignore
-        def get_cookie_string(self):
-            return ""
-
-        def get_cookie_file_path(self):
-            return ""
-
-        def import_cookie_file(self, p):
-            pass
-
-        def clear_cookies(self):
             pass
 
 
@@ -376,39 +369,101 @@ class MainWindow(QMainWindow):
     """
     Main Application Window for Instagram Pro Downloader - Studio Inspector.
     Provides complete URL entry, progress visualization, media card grid management,
-    and SVG vector icon integration without emojis.
+    persistent link settings, and seamless cookie importing.
     """
+
+    SETTINGS_FILE = os.path.join("config", "settings.json")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.cards: List[MediaCard] = []
         self.inspect_worker: Optional[InspectWorker] = None
         self.download_worker: Optional[DownloadWorker] = None
+
+        # Cookie Management
         self.cookie_manager = CookieManager()
-        self.cookie_str: str = (
-            self.cookie_manager.get_cookie_string()
-            if hasattr(self.cookie_manager, "get_cookie_string")
-            else ""
-        )
-        self.cookie_file: str = (
-            self.cookie_manager.get_cookie_file_path()
-            if hasattr(self.cookie_manager, "get_cookie_file_path")
-            else ""
-        )
+        self.cookie_str: str = self.cookie_manager.get_cookie_string()
+        self.cookie_file: str = self.cookie_manager.get_cookie_file_path()
 
+        # Defaults before settings load
         self.save_folder: str = os.path.abspath("downloads")
-        os.makedirs(self.save_folder, exist_ok=True)
-
-        self.current_lang = "en"
+        self.current_lang: str = "en"
+        self.auto_clipboard: bool = True
+        self.quality_preset: str = "best_video"
         self._last_clipboard_text: str = ""
 
+        # Load persistent settings
+        self.load_settings()
+        os.makedirs(self.save_folder, exist_ok=True)
+
         self.init_ui()
+        self.apply_loaded_settings()
         self.setup_clipboard_monitor()
         self.update_cookie_status()
 
+    # --------------------------------------------------------
+    # Settings Persistence
+    # --------------------------------------------------------
+    def load_settings(self) -> None:
+        """Loads user preferences and link settings from settings.json."""
+        if os.path.exists(self.SETTINGS_FILE):
+            try:
+                with open(self.SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self.save_folder = data.get("save_folder", self.save_folder)
+                    self.current_lang = data.get("language", self.current_lang)
+                    self.auto_clipboard = bool(
+                        data.get("auto_clipboard", self.auto_clipboard)
+                    )
+                    self.quality_preset = data.get(
+                        "quality_preset", self.quality_preset
+                    )
+            except Exception as e:
+                logger.debug(f"Failed to load settings: {e}")
+
+    def save_settings(self) -> None:
+        """Persists current link settings and user preferences to settings.json."""
+        try:
+            os.makedirs(os.path.dirname(self.SETTINGS_FILE), exist_ok=True)
+            if hasattr(self, "chk_clipboard") and hasattr(
+                self.chk_clipboard, "isChecked"
+            ):
+                self.auto_clipboard = self.chk_clipboard.isChecked()
+
+            settings_payload = {
+                "save_folder": self.save_folder,
+                "language": self.current_lang,
+                "auto_clipboard": self.auto_clipboard,
+                "quality_preset": self.quality_preset,
+            }
+            with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(settings_payload, f, indent=2)
+        except Exception as e:
+            logger.debug(f"Failed to save settings: {e}")
+
+    def apply_loaded_settings(self) -> None:
+        """Applies loaded settings into UI widgets."""
+        if hasattr(self, "chk_clipboard"):
+            self.chk_clipboard.setChecked(self.auto_clipboard)
+        if hasattr(self, "lbl_save_folder"):
+            self.lbl_save_folder.setText(f"Save Folder: {self.save_folder}")
+        if hasattr(self, "combo_lang"):
+            lang_idx = 1 if self.current_lang == "th" else 0
+            self.combo_lang.setCurrentIndex(lang_idx)
+            self.on_language_changed(lang_idx)
+
+    def closeEvent(self, event) -> None:
+        """Saves settings on window close."""
+        self.save_settings()
+        super().closeEvent(event) if hasattr(super(), "closeEvent") else None
+
+    # --------------------------------------------------------
+    # UI Initialization
+    # --------------------------------------------------------
     def init_ui(self) -> None:
         self.setWindowTitle(f"{APP_NAME}")
-        self.resize(1020, 840)
+        self.resize(1040, 860)
         self.setMinimumSize(920, 700)
         self.setStyleSheet(DARK_STYLESHEET)
 
@@ -454,7 +509,11 @@ class MainWindow(QMainWindow):
         self.chk_clipboard = QCheckBox(
             "Auto Clipboard Monitor (Auto-paste when IG link is copied)", self
         )
-        self.chk_clipboard.setChecked(True)
+        self.chk_clipboard.setChecked(self.auto_clipboard)
+        if hasattr(self.chk_clipboard, "stateChanged") and hasattr(
+            self.chk_clipboard.stateChanged, "connect"
+        ):
+            self.chk_clipboard.stateChanged.connect(self._on_clipboard_check_changed)
         action_row.addWidget(self.chk_clipboard)
         action_row.addStretch()
 
@@ -618,12 +677,20 @@ class MainWindow(QMainWindow):
             if hasattr(button, "setIconSize"):
                 button.setIconSize(QSize(size, size))
 
+    def _on_clipboard_check_changed(self, state: Any = None) -> None:
+        """Handles changes to clipboard monitor checkbox."""
+        if hasattr(self, "chk_clipboard") and hasattr(self.chk_clipboard, "isChecked"):
+            self.auto_clipboard = self.chk_clipboard.isChecked()
+        self.save_settings()
+
     # --------------------------------------------------------
     # Language Localization
     # --------------------------------------------------------
     def on_language_changed(self, index: int) -> None:
         lang = "th" if index == 1 else "en"
         self.current_lang = lang
+        self.save_settings()
+
         tr = TRANSLATIONS.get(lang, {})
         if not tr:
             return
@@ -684,7 +751,7 @@ class MainWindow(QMainWindow):
     # Media Inspection Workflow
     # --------------------------------------------------------
     def start_inspection(self) -> None:
-        """Starts the media inspection worker thread."""
+        """Starts the media inspection worker thread and clears previous inputs."""
         if self.inspect_worker and self.inspect_worker.isRunning():
             self.inspect_worker.cancel()
             self._set_button_icon(self.btn_inspect, "search", "#ffffff", 16)
@@ -698,7 +765,10 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("No URLs in queue.")
             return
 
-        # Reset progress bar to 0 (ModernProgressBar implements setValue)
+        # Automatically clear previously entered / inspected links from input field
+        self.url_container.clear()
+
+        # Reset progress bar to 0 and clear prior media grid cards
         self.progress_bar.setValue(0)
         self.clear_media_grid()
 
@@ -710,7 +780,7 @@ class MainWindow(QMainWindow):
             targets=targets,
             cookie_str=self.cookie_str,
             cookie_file=self.cookie_file,
-            quality_preset="best_video",
+            quality_preset=self.quality_preset,
             parent=self,
         )
 
@@ -810,7 +880,7 @@ class MainWindow(QMainWindow):
     # Cookie & Folder Management
     # --------------------------------------------------------
     def update_cookie_status(self) -> None:
-        has_cookie = bool(
+        has_cookie = self.cookie_manager.has_cookies() or bool(
             self.cookie_str or (self.cookie_file and os.path.exists(self.cookie_file))
         )
         if has_cookie:
@@ -821,6 +891,7 @@ class MainWindow(QMainWindow):
             self.lbl_cookie_status.setStyleSheet("color: #94a3b8;")
 
     def import_cookie(self) -> None:
+        """Opens file dialog and imports cookie file in Netscape, JSON, or text format."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Import Instagram Cookie",
@@ -828,68 +899,88 @@ class MainWindow(QMainWindow):
             "Cookie Files (*.txt *.json);;All Files (*.*)",
         )
         if file_path:
-            if hasattr(self.cookie_manager, "import_cookie_file"):
-                self.cookie_manager.import_cookie_file(file_path)
-                self.cookie_file = file_path
+            success = self.cookie_manager.import_cookie_file(file_path)
+            if success:
+                self.cookie_file = self.cookie_manager.get_cookie_file_path()
                 self.cookie_str = self.cookie_manager.get_cookie_string()
-            self.update_cookie_status()
-            self.show_toast("Cookie imported successfully!")
+                self.update_cookie_status()
+                self.save_settings()
+                self.show_toast("Cookie imported successfully!")
+            else:
+                self.show_toast(
+                    "Failed to import cookie file. Invalid format.", is_error=True
+                )
 
     def clear_cookie(self) -> None:
-        if hasattr(self.cookie_manager, "clear_cookies"):
-            self.cookie_manager.clear_cookies()
+        """Clears all stored cookies."""
+        self.cookie_manager.clear_cookies()
         self.cookie_str = ""
         self.cookie_file = ""
         self.update_cookie_status()
+        self.save_settings()
         self.show_toast("Cookie cleared.")
 
     def browse_save_folder(self) -> None:
+        """Opens directory picker and updates persistent save directory."""
         folder = QFileDialog.getExistingDirectory(
             self, "Select Save Directory", self.save_folder
         )
         if folder:
             self.save_folder = folder
             self.lbl_save_folder.setText(f"Save Folder: {self.save_folder}")
+            self.save_settings()
 
     def open_save_folder(self) -> None:
         if os.path.exists(self.save_folder):
             if sys.platform == "win32":
-                os.startfile(self.save_folder)
+                os.startfile(self.save_folder)  # type: ignore
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", self.save_folder])
             else:
                 subprocess.Popen(["xdg-open", self.save_folder])
+        else:
+            self.show_toast("Save folder does not exist.", is_error=True)
 
     # --------------------------------------------------------
-    # Download Execution
+    # Download Execution Flow
     # --------------------------------------------------------
     def start_download(self) -> None:
         selected_cards = [c for c in self.cards if getattr(c, "is_selected", True)]
         if not selected_cards:
-            self.show_toast("No items selected for download.", is_error=True)
+            self.show_toast("No media items selected for download.", is_error=True)
             return
 
+        items_to_download = [c.get_item_data() for c in selected_cards]
         self.btn_download_all.setEnabled(False)
-        self.lbl_status.setText(f"Starting download for {len(selected_cards)} items...")
+        self.lbl_status.setText(f"Downloading {len(items_to_download)} items...")
 
-        items_payload = [
-            c.get_item_data() if hasattr(c, "get_item_data") else c.item_data
-            for c in selected_cards
-        ]
         self.download_worker = DownloadWorker(
-            items=items_payload,
+            items=items_to_download,
             save_folder=self.save_folder,
-            cookie_str=self.cookie_str,
             cookie_file=self.cookie_file,
+            cookie_str=self.cookie_str,
             parent=self,
         )
         if hasattr(self.download_worker, "progress"):
             self.download_worker.progress.connect(self.on_download_progress)
+        if hasattr(self.download_worker, "item_started"):
+            self.download_worker.item_started.connect(self.on_download_item_started)
         if hasattr(self.download_worker, "item_finished"):
             self.download_worker.item_finished.connect(self.on_download_item_finished)
+        if hasattr(self.download_worker, "status_message"):
+            self.download_worker.status_message.connect(self.on_status_message)
         if hasattr(self.download_worker, "finished"):
             self.download_worker.finished.connect(self.on_download_finished)
         self.download_worker.start()
+
+    def on_download_item_started(self, item_id: str) -> None:
+        for card in self.cards:
+            if (
+                getattr(card, "item_id", None) == item_id
+                or getattr(card, "shortcode", None) == item_id
+            ):
+                if hasattr(card, "set_status"):
+                    card.set_status("downloading")
 
     def cancel_download(self) -> None:
         if self.download_worker and self.download_worker.isRunning():

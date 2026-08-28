@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Set
 try:
     from PyQt6.QtCore import QThread, pyqtSignal
 except ImportError:
-    # Headless runtime fallback
+
     class QThread:  # type: ignore
         def __init__(self, parent=None):
             pass
@@ -115,6 +115,14 @@ class InspectWorker(QThread):
         self.download_scope: str = download_scope
         self.is_cancelled: bool = False
         self.seen_ids: Set[str] = set()
+
+        if (
+            not self.cookie_str
+            and self.cookie_file
+            and os.path.exists(self.cookie_file)
+        ):
+            self.cookie_str = self._load_cookie_file(self.cookie_file)
+
         self._csrf_token: Optional[str] = self._extract_csrf_token(self.cookie_str)
         self._ssl_ctx = ssl._create_unverified_context()
 
@@ -122,11 +130,24 @@ class InspectWorker(QThread):
         """Gracefully flags the worker to stop processing."""
         self.is_cancelled = True
 
+    def _load_cookie_file(self, file_path: str) -> str:
+        """Loads Netscape, JSON, or plain cookie file into standard header string."""
+        try:
+            from core.cookie_manager import CookieManager
+
+            cm = CookieManager()
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                raw_text = f.read()
+            header_str, _ = cm._parse_cookie_data(raw_text)
+            return header_str if header_str else raw_text.strip()
+        except Exception:
+            return ""
+
     def _extract_csrf_token(self, cookie_str: str) -> Optional[str]:
-        """Extracts the csrftoken value from a raw cookie string."""
+        """Extracts the csrftoken value from a cookie string or cookie file."""
         if not cookie_str:
             return None
-        match = re.search(r"(?:^|;\s*)csrftoken=([^;]+)", cookie_str)
+        match = re.search(r"(?:^|;\s*|\b)csrftoken=([^;]+)", cookie_str)
         return match.group(1) if match else None
 
     def _make_request(
@@ -216,7 +237,11 @@ class InspectWorker(QThread):
             h2 = {"User-Agent": MOBILE_USER_AGENT, "X-IG-App-ID": IG_APP_ID}
             res2 = self._make_request(url2, headers=h2)
             if res2 and isinstance(res2, dict):
-                uid = res2.get("user", {}).get("pk") or res2.get("user", {}).get("id")
+                uid = (
+                    res2.get("user", {}).get("pk")
+                    or res2.get("user", {}).get("id")
+                    or res2.get("user", {}).get("pk_id")
+                )
                 if uid:
                     logger.info(
                         f"Resolved User ID {uid} via Strategy 2 (mobile usernameinfo)"
@@ -250,6 +275,8 @@ class InspectWorker(QThread):
                     r'"props"\s*:\s*\{\s*"id"\s*:\s*"(\d+)"',
                     r'"id"\s*:\s*"(\d{6,})"',
                     r"instagram://user\?id=(\d+)",
+                    r'content="instagram://user\?id=(\d+)"',
+                    r"users/(\d+)/",
                 ]
                 for pat in patterns:
                     m = re.search(pat, html)
@@ -295,6 +322,7 @@ class InspectWorker(QThread):
     ) -> Optional[Dict[str, Any]]:
         """
         Formats raw Instagram media dictionary into a normalized card dictionary.
+        Extracts thumbnail, direct video URL (if available), duration, and stats.
         """
         if not media or not isinstance(media, dict):
             return None
@@ -328,6 +356,14 @@ class InspectWorker(QThread):
                 or ""
             )
 
+        # Video direct stream URL extraction (if available)
+        video_versions = item.get("video_versions", [])
+        video_url = ""
+        if video_versions and isinstance(video_versions, list):
+            video_url = video_versions[0].get("url", "")
+        if not video_url:
+            video_url = item.get("video_url") or ""
+
         # Caption extraction
         caption_obj = item.get("caption")
         caption_text = ""
@@ -352,9 +388,18 @@ class InspectWorker(QThread):
 
         # Media type determination
         media_type_raw = item.get("media_type")
-        is_video = (media_type_raw == MEDIA_TYPE_VIDEO) or item.get("is_video", False)
-        is_carousel = (media_type_raw == MEDIA_TYPE_CAROUSEL) or (
-            "carousel_media" in item and item["carousel_media"]
+        is_video = (
+            (media_type_raw == MEDIA_TYPE_VIDEO)
+            or (media_type_raw == 2)
+            or item.get("is_video", False)
+            or bool(video_url)
+            or (item.get("product_type") == "clips")
+        )
+        is_carousel = (
+            (media_type_raw == MEDIA_TYPE_CAROUSEL)
+            or (media_type_raw == 8)
+            or ("carousel_media" in item and item["carousel_media"])
+            or (item.get("carousel_media_count", 0) > 0)
         )
 
         if is_carousel:
@@ -399,6 +444,8 @@ class InspectWorker(QThread):
             "username": item_username,
             "url": url,
             "thumbnail_url": thumbnail_url,
+            "video_url": video_url,
+            "download_url": video_url,
             "caption": caption_text,
             "duration": duration,
             "view_count": view_count,
@@ -487,8 +534,17 @@ class InspectWorker(QThread):
             )
 
             paging_info = res.get("paging_info", {})
-            more_available = paging_info.get("more_available", False)
-            next_max_id = paging_info.get("max_id")
+            more_available = (
+                paging_info.get("more_available")
+                if "more_available" in paging_info
+                else res.get("more_available", False)
+            )
+            next_max_id = (
+                paging_info.get("max_id")
+                or paging_info.get("next_max_id")
+                or res.get("next_max_id")
+                or res.get("max_id")
+            )
 
             if not more_available or not next_max_id or next_max_id == max_id:
                 break
@@ -511,6 +567,9 @@ class InspectWorker(QThread):
                 "User-Agent": MOBILE_USER_AGENT,
                 "X-IG-App-ID": IG_APP_ID,
             }
+            if self._csrf_token:
+                h_feed["X-CSRFToken"] = self._csrf_token
+
             res_feed = self._make_request(feed_url, headers=h_feed)
             if not res_feed or not isinstance(res_feed, dict):
                 break
@@ -536,7 +595,7 @@ class InspectWorker(QThread):
 
             tier2_pages += 1
             more_available = res_feed.get("more_available", False)
-            next_max_id = res_feed.get("next_max_id")
+            next_max_id = res_feed.get("next_max_id") or res_feed.get("max_id")
 
             if not more_available or not next_max_id or next_max_id == feed_max_id:
                 break
@@ -616,6 +675,8 @@ class InspectWorker(QThread):
                         "username": item_user,
                         "url": entry_url,
                         "thumbnail_url": entry.get("thumbnail") or "",
+                        "video_url": "",
+                        "download_url": "",
                         "caption": entry.get("description") or "",
                         "duration": float(entry.get("duration") or 0.0),
                         "view_count": entry.get("view_count") or 0,
@@ -631,7 +692,30 @@ class InspectWorker(QThread):
 
     def _inspect_single_post(self, shortcode: str) -> None:
         """Resolves a single Instagram post, reel, or TV video."""
-        # Web info endpoint
+        # 1. Mobile media info endpoint
+        try:
+            media_id = shortcode_to_id(shortcode)
+            if media_id:
+                url_m = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
+                h_m = {
+                    "User-Agent": MOBILE_USER_AGENT,
+                    "X-IG-App-ID": IG_APP_ID,
+                }
+                res_m = self._make_request(url_m, headers=h_m)
+                if res_m and isinstance(res_m, dict):
+                    items = res_m.get("items", [])
+                    if items:
+                        card = self._extract_media_card(items[0])
+                        if card:
+                            sc = card["shortcode"]
+                            if sc not in self.seen_ids:
+                                self.seen_ids.add(sc)
+                                self.item_found.emit(card)
+                                return
+        except Exception:
+            pass
+
+        # 2. Web info endpoint
         url = f"{IG_BASE_URL}/p/{shortcode}/?__a=1&__d=dis"
         res = self._make_request(url)
         if res and isinstance(res, dict):
@@ -646,7 +730,7 @@ class InspectWorker(QThread):
                         self.item_found.emit(card)
                         return
 
-        # Fallback to yt-dlp
+        # 3. Fallback to yt-dlp
         self._inspect_via_ytdlp(f"{IG_BASE_URL}/p/{shortcode}/")
 
     def run(self) -> None:
@@ -684,6 +768,9 @@ class InspectWorker(QThread):
                     if user_id:
                         self._fetch_all_reels_web(username, user_id)
                     else:
+                        self.status_message.emit(
+                            f"Could not resolve ID for @{username}. Trying yt-dlp fallback..."
+                        )
                         self._inspect_via_ytdlp(
                             f"{IG_BASE_URL}/{username}/", default_username=username
                         )
