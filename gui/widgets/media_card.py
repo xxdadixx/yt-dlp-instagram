@@ -1,235 +1,368 @@
-"""
-gui/widgets/media_card.py - Interactive Media Card Widget with Dynamic i18n & Quality Dropdown.
-"""
-
-import os
-import subprocess
 import sys
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QImage, QMouseEvent, QPixmap
-from PyQt6.QtWidgets import (
-    QFrame,
-    QGraphicsOpacityEffect,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-)
+from typing import Dict, Any, Optional
 
-from config.translations import TRANSLATIONS
-from gui.icons import get_icon
-from gui.styles import CARD_DEFAULT_QSS, CARD_SELECTED_QSS
-from gui.widgets.no_scroll_combo import NoScrollComboBox
-from gui.widgets.thumbnail_loader import ThumbnailLoader
+try:
+    from PyQt6.QtCore import Qt, pyqtSignal, QSize
+    from PyQt6.QtGui import QPixmap, QColor, QFont
+    from PyQt6.QtWidgets import (
+        QWidget,
+        QFrame,
+        QHBoxLayout,
+        QVBoxLayout,
+        QLabel,
+        QCheckBox,
+        QPushButton,
+        QSizePolicy,
+    )
+except ImportError:
+
+    class MagicSignal:
+        def __init__(self):
+            self._slots = []
+
+        def connect(self, f):
+            self._slots.append(f)
+
+        def emit(self, *a, **kw):
+            for s in self._slots:
+                try:
+                    s(*a, **kw)
+                except Exception:
+                    pass
+
+    class QSize:
+        def __init__(self, w=0, h=0):
+            self.w, self.h = w, h
+
+    class QPixmap:
+        def __init__(self, *a):
+            pass
+
+    class QWidget:
+        def __init__(self, parent=None):
+            pass
+
+        def setStyleSheet(self, *a):
+            pass
+
+        def setObjectName(self, *a):
+            pass
+
+        def deleteLater(self):
+            pass
+
+        def setParent(self, p):
+            pass
+
+    class QFrame(QWidget):
+        pass
+
+    class QHBoxLayout:
+        def __init__(self, parent=None):
+            pass
+
+        def setContentsMargins(self, *a):
+            pass
+
+        def setSpacing(self, *a):
+            pass
+
+        def addWidget(self, *a, **kw):
+            pass
+
+        def addLayout(self, *a, **kw):
+            pass
+
+        def addStretch(self, *a):
+            pass
+
+    class QVBoxLayout(QHBoxLayout):
+        pass
+
+    class QLabel(QWidget):
+        def __init__(self, text="", parent=None):
+            super().__init__(parent)
+
+        def setText(self, *a):
+            pass
+
+        def setPixmap(self, *a):
+            pass
+
+        def setScaledContents(self, *a):
+            pass
+
+        def setFixedSize(self, *a):
+            pass
+
+    class QCheckBox(QWidget):
+        def __init__(self, text="", parent=None):
+            super().__init__(parent)
+            self.stateChanged = MagicSignal()
+
+        def setChecked(self, *a):
+            pass
+
+        def isChecked(self):
+            return True
+
+    class QPushButton(QWidget):
+        def __init__(self, text="", parent=None):
+            super().__init__(parent)
+            self.clicked = MagicSignal()
+
+        def setText(self, *a):
+            pass
+
+        def setIcon(self, *a):
+            pass
+
+        def setFixedSize(self, *a):
+            pass
+
+        def setToolTip(self, *a):
+            pass
 
 
-class MediaCardWidget(QFrame):
-    clicked = pyqtSignal(object, object)
-    removed = pyqtSignal(object)
+try:
+    from gui.icons import get_icon
+except ImportError:
 
-    def __init__(self, data: dict, lang: str = "th"):
-        super().__init__()
-        self.data = data
-        self.lang = lang
-        self.is_selected = False
-        self.is_completed = False
-        self.saved_file_path = None
-        self.thumb_loader = None
+    def get_icon(name: str, color: str = "#ffffff", size: int = 18):
+        return None
 
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+try:
+    from gui.widgets.thumbnail_loader import ThumbnailLoader
+except ImportError:
+    ThumbnailLoader = None
+
+
+class MediaCard(QFrame):
+    """
+    Card item representing an inspected media entity in the queue grid.
+    Features thumbnail preview, badges, duration/stats, selection checkbox,
+    and action controls without emojis.
+    """
+
+    deleted = pyqtSignal() if "pyqtSignal" in globals() else MagicSignal()  # type: ignore
+    selection_changed = pyqtSignal() if "pyqtSignal" in globals() else MagicSignal()  # type: ignore
+
+    def __init__(self, item_data: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self.item_data = dict(item_data)
+        self.item_id = str(item_data.get("id") or item_data.get("shortcode") or "")
+        self.shortcode = str(item_data.get("shortcode") or "")
+        self.is_selected: bool = bool(item_data.get("selected", True))
+        self.status: str = item_data.get("status", "ready")
+        self.is_finished: bool = False
+        self.thumb_loader: Optional[ThumbnailLoader] = None
+
+        self.setObjectName("MediaCardFrame")
         self.init_ui()
-        self.update_style()
-        self.load_thumbnail_async()
 
-    def init_ui(self) -> None:
+    def init_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(14)
 
-        self.lbl_thumb = QLabel()
-        self.lbl_thumb.setFixedSize(70, 70)
-        self.lbl_thumb.setStyleSheet("background-color: #141419; border-radius: 5px;")
-        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_thumb.setText("Loading...")
-        layout.addWidget(self.lbl_thumb)
+        # 1. Selection Checkbox
+        self.chk_select = QCheckBox(self)
+        self.chk_select.setChecked(self.is_selected)
+        if hasattr(self.chk_select, "stateChanged") and hasattr(
+            self.chk_select.stateChanged, "connect"
+        ):
+            self.chk_select.stateChanged.connect(self._on_check_changed)
+        layout.addWidget(self.chk_select)
 
-        info_layout = QVBoxLayout()
-        info_layout.setSpacing(4)
-
-        top_row = QHBoxLayout()
-        self.lbl_uploader = QLabel(f"@{self.data.get('uploader', 'Instagram')}")
-        self.lbl_uploader.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        top_row.addWidget(self.lbl_uploader)
-
-        # Type Badge
-        self.lbl_badge = QLabel()
-        self.update_badge()
-        top_row.addWidget(self.lbl_badge)
-        top_row.addStretch()
-        info_layout.addLayout(top_row)
-
-        self.lbl_sub = QLabel(
-            f"ID: {self.data.get('shortcode')} | {self.data.get('url')[:45]}..."
-        )
-        self.lbl_sub.setStyleSheet("color: #888888; font-size: 10px;")
-        info_layout.addWidget(self.lbl_sub)
-
-        bottom_row = QHBoxLayout()
-        self.lbl_quality = QLabel(TRANSLATIONS[self.lang]["lbl_quality"])
-        self.lbl_quality.setStyleSheet("font-size: 11px; color: #cccccc;")
-        bottom_row.addWidget(self.lbl_quality)
-
-        self.cmb_quality = NoScrollComboBox()
-        self.cmb_quality.setFixedHeight(26)
-        for opt in self.data.get("format_options", []):
-            self.cmb_quality.addItem(opt["label"], opt["key"])
-
-        if self.cmb_quality.count() > 0:
-            self.cmb_quality.setCurrentIndex(0)
-
-        bottom_row.addWidget(self.cmb_quality, stretch=1)
-
-        self.lbl_status = QLabel("Ready")
-        self.lbl_status.setStyleSheet(
-            "color: #28a745; font-size: 11px; font-weight: bold;"
-        )
-        bottom_row.addWidget(self.lbl_status)
-
-        self.btn_open_file = QPushButton()
-        self.btn_open_file.setFixedHeight(26)
-        self.btn_open_file.setIcon(get_icon("open-external", "#ffffff", 13))
-        self.btn_open_file.setStyleSheet(
-            "background-color: #28a745; font-size: 11px; padding: 2px 10px;"
-        )
-        self.btn_open_file.setVisible(False)
-        self.btn_open_file.clicked.connect(self.open_downloaded_file)
-        bottom_row.addWidget(self.btn_open_file)
-
-        self.btn_delete = QPushButton()
-        self.btn_delete.setFixedSize(26, 26)
-        self.btn_delete.setIcon(get_icon("trash", "#ff6b81", 14))
-        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_delete.setToolTip(TRANSLATIONS[self.lang]["tooltip_delete_card"])
-        self.btn_delete.setStyleSheet(
+        # 2. Thumbnail Preview Box
+        self.lbl_thumb = QLabel(self)
+        self.lbl_thumb.setObjectName("CardThumbnail")
+        if hasattr(self.lbl_thumb, "setFixedSize"):
+            self.lbl_thumb.setFixedSize(80, 80)
+            self.lbl_thumb.setScaledContents(True)
+        self.lbl_thumb.setStyleSheet(
             """
-            QPushButton {
-                background-color: #261e27;
-                border: 1px solid #4a2d39;
-                border-radius: 5px;
-                padding: 0px;
-            }
-            QPushButton:hover {
-                background-color: #e84118;
-                border: 1px solid #e84118;
+            QLabel#CardThumbnail {
+                background-color: #121218;
+                border: 1px solid #2d2d3d;
+                border-radius: 6px;
             }
         """
         )
-        self.btn_delete.clicked.connect(self.cleanup_and_delete)
-        bottom_row.addWidget(self.btn_delete)
+        layout.addWidget(self.lbl_thumb)
 
-        info_layout.addLayout(bottom_row)
+        # Asynchronously load thumbnail
+        thumb_url = self.item_data.get("thumbnail_url")
+        if thumb_url and ThumbnailLoader:
+            self.thumb_loader = ThumbnailLoader(thumb_url, self)
+            if hasattr(self.thumb_loader, "loaded") and self.thumb_loader.loaded:
+                self.thumb_loader.loaded.connect(self._on_thumbnail_loaded)
+            self.thumb_loader.start()
+
+        # 3. Media Metadata Info (Vertical)
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(4)
+
+        # Title & Badges Row
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+
+        # Type Badge
+        badge_text = self.item_data.get("media_type", "reel").upper()
+        self.lbl_badge = QLabel(badge_text, self)
+        self.lbl_badge.setStyleSheet(
+            """
+            background-color: #3b82f6;
+            color: #ffffff;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 2px 6px;
+            border-radius: 4px;
+        """
+        )
+        title_row.addWidget(self.lbl_badge)
+
+        # Title / Caption
+        title_text = (
+            self.item_data.get("title")
+            or self.item_data.get("caption")
+            or f"Reel {self.shortcode}"
+        )
+        if len(title_text) > 75:
+            title_text = title_text[:72] + "..."
+        self.lbl_title = QLabel(title_text, self)
+        self.lbl_title.setStyleSheet(
+            "color: #f8fafc; font-weight: 600; font-size: 13px;"
+        )
+        title_row.addWidget(self.lbl_title)
+        title_row.addStretch()
+
+        info_layout.addLayout(title_row)
+
+        # Details Row: Username, Duration, Views, Likes
+        details_row = QHBoxLayout()
+        details_row.setSpacing(12)
+
+        username = self.item_data.get("username", "")
+        if username:
+            lbl_user = QLabel(f"@{username}", self)
+            lbl_user.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            details_row.addWidget(lbl_user)
+
+        duration = float(self.item_data.get("duration") or 0.0)
+        if duration > 0:
+            mins = int(duration // 60)
+            secs = int(duration % 60)
+            lbl_dur = QLabel(f"Duration: {mins:02d}:{secs:02d}", self)
+            lbl_dur.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            details_row.addWidget(lbl_dur)
+
+        views = self.item_data.get("view_count", 0)
+        if views:
+            lbl_views = QLabel(f"{views:,} views", self)
+            lbl_views.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            details_row.addWidget(lbl_views)
+
+        likes = self.item_data.get("like_count", 0)
+        if likes:
+            lbl_likes = QLabel(f"{likes:,} likes", self)
+            lbl_likes.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            details_row.addWidget(lbl_likes)
+
+        details_row.addStretch()
+        info_layout.addLayout(details_row)
+
+        # Status Line
+        self.lbl_status = QLabel(f"Status: {self.status.capitalize()}", self)
+        self.lbl_status.setStyleSheet(
+            "color: #38bdf8; font-size: 11px; font-weight: 500;"
+        )
+        info_layout.addWidget(self.lbl_status)
+
         layout.addLayout(info_layout, stretch=1)
 
-    def update_badge(self) -> None:
-        """อัปเดตข้อความและสีของ Type Badge ตามภาษาปัจจุบัน"""
-        m_type = self.data.get("media_type")
-        if m_type in ("story", "highlight"):
-            badge_text = TRANSLATIONS[self.lang]["badge_story"]
-            badge_color = "#9b51e0"
-        elif m_type == "carousel":
-            badge_text = TRANSLATIONS[self.lang]["badge_carousel"].format(
-                count=self.data.get("slides_count", 1)
-            )
-            badge_color = "#fa7e1e"
-        elif m_type == "video":
-            badge_text = TRANSLATIONS[self.lang]["badge_video"]
-            badge_color = "#d62976"
+        # 4. Action Button (Delete card)
+        self.btn_delete = QPushButton(self)
+        self.btn_delete.setObjectName("CardDeleteButton")
+        if hasattr(self.btn_delete, "setToolTip"):
+            self.btn_delete.setToolTip("Remove from queue")
+        icon = get_icon("trash", "#ef4444", 16)
+        if icon and hasattr(self.btn_delete, "setIcon"):
+            self.btn_delete.setIcon(icon)
         else:
-            badge_text = TRANSLATIONS[self.lang]["badge_photo"]
-            badge_color = "#4a90e2"
+            self.btn_delete.setText("✕")
+        if hasattr(self.btn_delete, "setFixedSize"):
+            self.btn_delete.setFixedSize(30, 30)
+        self.btn_delete.setStyleSheet(
+            """
+            QPushButton#CardDeleteButton {
+                background: #242432;
+                border: 1px solid #36364a;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QPushButton#CardDeleteButton:hover {
+                background: #ef4444;
+                border: 1px solid #dc2626;
+            }
+        """
+        )
+        self.btn_delete.clicked.connect(lambda: self.deleted.emit())
+        layout.addWidget(self.btn_delete)
 
-        self.lbl_badge.setText(f" {badge_text} ")
-        self.lbl_badge.setStyleSheet(
-            f"background-color: {badge_color}; color: white; border-radius: 3px; font-size: 10px; font-weight: bold; padding: 2px 6px;"
+        self.setStyleSheet(
+            """
+            QFrame#MediaCardFrame {
+                background: #1a1a24;
+                border: 1px solid #2a2a3a;
+                border-radius: 8px;
+            }
+            QFrame#MediaCardFrame:hover {
+                border: 1px solid #3b82f6;
+                background: #1e1e2c;
+            }
+        """
         )
 
-    def retranslate_ui(self, lang: str) -> None:
-        """เปลี่ยนภาษาของวิดเจ็ตภายในการ์ดแบบ Real-time"""
-        self.lang = lang
-        self.update_badge()
-        self.lbl_quality.setText(TRANSLATIONS[self.lang]["lbl_quality"])
-        self.btn_delete.setToolTip(TRANSLATIONS[self.lang]["tooltip_delete_card"])
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        self.clicked.emit(self, event)
-        super().mousePressEvent(event)
-
-    def set_selected(self, selected: bool) -> None:
-        self.is_selected = selected
-        self.update_style()
-
-    def update_style(self) -> None:
-        if self.is_selected:
-            self.setStyleSheet(CARD_SELECTED_QSS)
-        else:
-            self.setStyleSheet(CARD_DEFAULT_QSS)
-
-    def mark_completed(self, file_path: str) -> None:
-        self.is_completed = True
-        self.saved_file_path = file_path
-        self.lbl_status.setText("✔ Done")
-        self.lbl_status.setStyleSheet(
-            "color: #28a745; font-size: 11px; font-weight: bold;"
-        )
-        self.btn_open_file.setVisible(True)
-
-    def open_downloaded_file(self) -> None:
-        if self.saved_file_path and os.path.exists(self.saved_file_path):
-            if sys.platform == "win32":
-                os.startfile(os.path.normpath(self.saved_file_path))
-            else:
-                subprocess.Popen(["xdg-open", self.saved_file_path])
-
-    def load_thumbnail_async(self) -> None:
-        thumb_url = self.data.get("thumb_url")
-        if not thumb_url:
-            self.lbl_thumb.setText("No Preview")
-            return
-
-        self.thumb_loader = ThumbnailLoader(thumb_url)
-        self.thumb_loader.loaded.connect(self._on_thumbnail_loaded)
-        self.thumb_loader.start()
-
-    def _on_thumbnail_loaded(self, image: QImage) -> None:
-        try:
-            pixmap = QPixmap.fromImage(image).scaled(
-                70,
-                70,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+    def _on_thumbnail_loaded(self, pixmap):
+        if hasattr(self.lbl_thumb, "setPixmap"):
             self.lbl_thumb.setPixmap(pixmap)
-        except Exception:
-            pass
 
-    def cleanup_and_delete(self) -> None:
-        if self.thumb_loader and self.thumb_loader.isRunning():
-            self.thumb_loader.cancel()
-            self.thumb_loader.wait(300)
-        self.removed.emit(self)
+    def _on_check_changed(self, state: int):
+        self.is_selected = state == 2 or state is True
+        self.item_data["selected"] = self.is_selected
+        self.selection_changed.emit()
 
-    def get_selected_format(self) -> str:
-        return self.cmb_quality.currentData()
+    def set_selected(self, selected: bool):
+        self.is_selected = selected
+        self.item_data["selected"] = selected
+        if hasattr(self.chk_select, "setChecked"):
+            self.chk_select.setChecked(selected)
 
-    def animate_entry(self, duration: int = 280) -> None:
-        self.opacity_effect = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(self.opacity_effect)
+    def set_status(self, status: str):
+        self.status = status
+        if status == "finished":
+            self.is_finished = True
+            self.lbl_status.setText("Status: Completed")
+            self.lbl_status.setStyleSheet(
+                "color: #4ade80; font-size: 11px; font-weight: bold;"
+            )
+        elif status == "downloading":
+            self.lbl_status.setText("Status: Downloading...")
+            self.lbl_status.setStyleSheet(
+                "color: #fbbf24; font-size: 11px; font-weight: bold;"
+            )
+        elif status == "error":
+            self.lbl_status.setText("Status: Download Error")
+            self.lbl_status.setStyleSheet(
+                "color: #f87171; font-size: 11px; font-weight: bold;"
+            )
+        else:
+            self.lbl_status.setText(f"Status: {status.capitalize()}")
+            self.lbl_status.setStyleSheet(
+                "color: #38bdf8; font-size: 11px; font-weight: 500;"
+            )
 
-        self.anim = QPropertyAnimation(self.opacity_effect, b"opacity")
-        self.anim.setDuration(duration)
-        self.anim.setStartValue(0.0)
-        self.anim.setEndValue(1.0)
-        self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.anim.finished.connect(lambda: self.setGraphicsEffect(None))
-        self.anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+    def get_item_data(self) -> Dict[str, Any]:
+        return dict(self.item_data)
