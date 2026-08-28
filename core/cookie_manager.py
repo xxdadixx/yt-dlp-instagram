@@ -1,5 +1,6 @@
 """
 core/cookie_manager.py - Netscape cookies validation, sanitization, and Opener Director construction.
+Supports both functional and OOP (CookieManager) interfaces.
 """
 
 import http.cookiejar
@@ -21,7 +22,7 @@ def get_cookie_opener(cookie_path: str | None) -> urllib.request.OpenerDirector:
 
 
 def sanitize_and_save_instagram_cookies(
-    src_path: str, dest_path: str, lang: str = "th"
+    src_path: str, dest_path: str, lang: str = "en"
 ) -> tuple[bool, str]:
     """กรองไฟล์ cookies.txt โดยคงไว้เฉพาะโดเมน Instagram, Facebook และ Threads เพื่อความปลอดภัย"""
     try:
@@ -63,12 +64,59 @@ def sanitize_and_save_instagram_cookies(
                         cookie_count += 1
 
         if cookie_count == 0:
-            return False, TRANSLATIONS[lang]["cookie_import_fail"]
+            msg = TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(
+                "cookie_import_fail", "No valid Instagram cookies found."
+            )
+            return False, msg
 
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         with open(dest_path, "w", encoding="utf-8") as f:
             f.writelines(filtered_lines)
 
-        return True, TRANSLATIONS[lang]["cookie_import_success"].format(count=cookie_count)
+        msg_template = TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(
+            "cookie_import_success", "Successfully imported {count} cookies."
+        )
+        return True, msg_template.format(count=cookie_count)
     except Exception as e:
         return False, f"Error: {e}"
+
+
+class CookieManager:
+    """Class wrapper for Cookie management providing unified access across workers and UI."""
+
+    @staticmethod
+    def get_opener(cookie_path: str | None) -> urllib.request.OpenerDirector:
+        return get_cookie_opener(cookie_path)
+
+    @staticmethod
+    def sanitize_and_save(
+        src_path: str, dest_path: str, lang: str = "en"
+    ) -> tuple[bool, str]:
+        return sanitize_and_save_instagram_cookies(src_path, dest_path, lang)
+
+    @staticmethod
+    def is_cookie_valid(cookie_path: str | None) -> bool:
+        if not cookie_path or not os.path.exists(cookie_path):
+            return False
+        try:
+            with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.strip() and not line.startswith("#"):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def extract_csrf_token(cookie_path: str | None) -> str | None:
+        if not cookie_path or not os.path.exists(cookie_path):
+            return None
+        try:
+            with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) >= 7 and parts[5].lower() == "csrftoken":
+                        return parts[6]
+        except Exception:
+            pass
+        return None
