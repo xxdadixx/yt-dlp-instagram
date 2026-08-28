@@ -1,105 +1,143 @@
-"""
-core/parser.py - Robust Instagram URL decomposition and normalization.
-"""
-
 import re
-import urllib.parse
+from urllib.parse import urlparse, urlunparse
+from typing import Dict, Any, Optional
+
 from config.constants import (
-    IG_HIGHLIGHT_PATTERN,
-    IG_POST_PATTERN,
-    IG_PROFILE_PATTERN,
-    IG_REELS_TAB_PATTERN,
-    IG_STORIES_PATTERN,
+    REELS_TAB_REGEX,
+    POST_REEL_REGEX,
+    STORIES_REGEX,
+    HIGHLIGHTS_REGEX,
+    PROFILE_REGEX,
+    RESERVED_USERNAMES,
 )
 
 
 def normalize_url(url: str) -> str:
-    """Strips tracking query parameters while preserving critical path structures."""
+    """
+    Cleans, normalizes, and ensures protocol and canonical host formatting for Instagram URLs.
+    """
+    if not url:
+        return ""
     url = url.strip()
-    if not url.startswith("http://") and not url.startswith("https://"):
+    if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    parsed = urllib.parse.urlparse(url)
-    clean_path = parsed.path.rstrip("/") + "/"
-    return urllib.parse.urlunparse(
-        (parsed.scheme, parsed.netloc, clean_path, "", "", "")
-    )
+    parsed = urlparse(url)
+    netloc = parsed.netloc.lower()
+
+    if (
+        "instagram.com" in netloc
+        or "ddinstagram.com" in netloc
+        or "kkinstagram.com" in netloc
+        or "instagr.am" in netloc
+    ):
+        netloc = "www.instagram.com"
+
+    path = parsed.path
+    if not path.endswith("/") and not path.endswith((".jpg", ".png", ".mp4")):
+        path += "/"
+
+    clean_url = urlunparse((parsed.scheme, netloc, path, "", "", ""))
+    return clean_url
 
 
-def parse_instagram_input(raw_text: str) -> list[dict]:
+def parse_instagram_url(url: str) -> Dict[str, Any]:
     """
-    Parses multiline input strings into clean target descriptors.
+    Decomposes an Instagram URL into its corresponding entity type and identifiers.
     """
-    results = []
-    lines = raw_text.splitlines()
+    if not url:
+        return {"type": "unknown", "valid": False, "raw_url": url}
 
-    for line in lines:
-        cleaned = line.strip()
-        if not cleaned:
-            continue
+    clean_url = normalize_url(url)
 
-        url = normalize_url(cleaned)
+    # 1. Profile Reels Tab
+    reels_match = REELS_TAB_REGEX.match(clean_url)
+    if reels_match:
+        username = reels_match.group(1).lower()
+        if username not in RESERVED_USERNAMES:
+            return {
+                "type": "profile_reels",
+                "valid": True,
+                "username": username,
+                "shortcode": None,
+                "target_id": None,
+                "clean_url": clean_url,
+                "raw_url": url,
+            }
 
-        # 1. Reels Tab (/username/reels/)
-        reels_match = re.search(IG_REELS_TAB_PATTERN, url, re.IGNORECASE)
-        if reels_match:
-            username = reels_match.group(1)
-            results.append(
-                {
-                    "type": "profile_reels",
-                    "username": username,
-                    "url": url,
-                }
-            )
-            continue
+    # 2. Single Post / Reel / TV
+    post_match = POST_REEL_REGEX.match(clean_url)
+    if post_match:
+        shortcode = post_match.group(1)
+        url_lower = clean_url.lower()
+        if "/reel/" in url_lower:
+            media_type = "reel"
+        elif "/tv/" in url_lower:
+            media_type = "tv"
+        else:
+            media_type = "post"
 
-        # 2. Stories (/stories/username/123456/)
-        story_match = re.search(IG_STORIES_PATTERN, url, re.IGNORECASE)
-        if story_match:
-            results.append(
-                {
-                    "type": "stories",
-                    "username": story_match.group(1),
-                    "url": url,
-                }
-            )
-            continue
+        return {
+            "type": media_type,
+            "valid": True,
+            "username": None,
+            "shortcode": shortcode,
+            "target_id": None,
+            "clean_url": clean_url,
+            "raw_url": url,
+        }
 
-        # 3. Highlights (/stories/highlights/123456/)
-        highlight_match = re.search(IG_HIGHLIGHT_PATTERN, url, re.IGNORECASE)
-        if highlight_match:
-            results.append(
-                {
-                    "type": "highlights",
-                    "username": "",
-                    "url": url,
-                }
-            )
-            continue
+    # 3. Highlights
+    highlight_match = HIGHLIGHTS_REGEX.match(clean_url)
+    if highlight_match:
+        highlight_id = highlight_match.group(1)
+        return {
+            "type": "highlight",
+            "valid": True,
+            "username": None,
+            "shortcode": None,
+            "target_id": highlight_id,
+            "clean_url": clean_url,
+            "raw_url": url,
+        }
 
-        # 4. Single Post / Reel (/p/CODE/, /reel/CODE/, /tv/CODE/)
-        post_match = re.search(IG_POST_PATTERN, url, re.IGNORECASE)
-        if post_match:
-            results.append(
-                {
-                    "type": "single_post",
-                    "shortcode": post_match.group(1),
-                    "url": url,
-                }
-            )
-            continue
+    # 4. Stories
+    story_match = STORIES_REGEX.match(clean_url)
+    if story_match:
+        username = story_match.group(1).lower()
+        story_id = story_match.group(2)
+        if username not in RESERVED_USERNAMES:
+            return {
+                "type": "story",
+                "valid": True,
+                "username": username,
+                "shortcode": None,
+                "target_id": story_id,
+                "clean_url": clean_url,
+                "raw_url": url,
+            }
 
-        # 5. Profile Feed (/username/)
-        profile_match = re.search(IG_PROFILE_PATTERN, url, re.IGNORECASE)
-        if profile_match:
-            username = profile_match.group(1)
-            results.append(
-                {
-                    "type": "profile_posts",
-                    "username": username,
-                    "url": url,
-                }
-            )
-            continue
+    # 5. Base User Profile
+    profile_match = PROFILE_REGEX.match(clean_url)
+    if profile_match:
+        username = profile_match.group(1).lower()
+        if username not in RESERVED_USERNAMES:
+            return {
+                "type": "profile",
+                "valid": True,
+                "username": username,
+                "shortcode": None,
+                "target_id": None,
+                "clean_url": clean_url,
+                "raw_url": url,
+            }
 
-    return results
+    return {
+        "type": "unknown",
+        "valid": False,
+        "username": None,
+        "shortcode": None,
+        "target_id": None,
+        "clean_url": clean_url,
+        "raw_url": url,
+    }

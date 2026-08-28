@@ -1,38 +1,84 @@
-"""
-config/constants.py - Global constants, headers, and endpoints for yt-dlp-instagram.
-"""
+import re
+from typing import Dict, Any, List, Tuple
 
-import os
-from pathlib import Path
+# Application Metadata
+APP_USER_MODEL_ID = "xxdadixx.instagramprodownloader.app.1.0"
+APP_NAME = "Instagram Pro Downloader - Studio Inspector"
+APP_VERSION = "1.0.0"
 
-# Paths
-APP_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DOWNLOAD_DIR = os.path.join(APP_ROOT, "downloads")
-DEFAULT_SESSION_DIR = os.path.join(APP_ROOT, "session")
+# Instagram Application IDs
+IG_APP_ID = "936619743392459"
+IG_WEB_APP_ID = "936619743392459"
 
-# Headers & Tokens
-APP_ID = "936619743392459"
-DESKTOP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-MOBILE_USER_AGENT = "Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; Xiaomi; 2201116PG; veux; qcom; en_US; 454316182)"
-
-# API Endpoints
-GRAPHQL_URL = "https://www.instagram.com/graphql/query/"
-GRAPHQL_REELS_QUERY_HASH = "bc78b1f868b0f4439c2c62c2f6d538e1"
-WEB_PROFILE_INFO_URL = "https://i.instagram.com/api/v1/users/web_profile_info/"
-CLIPS_API_URL = "https://i.instagram.com/api/v1/clips/user/"
-USER_FEED_API_URL = "https://i.instagram.com/api/v1/feed/user/{user_id}/"
-
-# Regex URL Patterns
-IG_REELS_TAB_PATTERN = (
-    r"(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/reels/?"
+# User-Agent Definitions & Backward Compatibility Aliases
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36"
 )
-IG_POST_PATTERN = (
-    r"(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)/?"
+DEFAULT_USER_AGENT = DESKTOP_UA
+USER_AGENT = DESKTOP_UA
+UA_DESKTOP = DESKTOP_UA
+
+MOBILE_UA = "Instagram 315.0.0.38.109 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991N; o1s; exynos2100; en_US; 564998762)"
+MOBILE_USER_AGENT = MOBILE_UA
+UA_MOBILE = MOBILE_UA
+
+# Default HTTP Headers
+DEFAULT_HEADERS: Dict[str, str] = {
+    "User-Agent": DESKTOP_UA,
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "X-IG-App-ID": IG_APP_ID,
+    "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+}
+
+# URL Parsing Regular Expressions
+REELS_TAB_REGEX = re.compile(
+    r"^https?:\/\/(?:www\.)?instagram\.com\/([a-zA-Z0-9_\.]+)\/reels\/?(?:\?.*)?$",
+    re.IGNORECASE,
 )
-IG_STORIES_PATTERN = (
-    r"(?:https?://)?(?:www\.)?instagram\.com/stories/([A-Za-z0-9_.]+)/(\d+)/?"
+POST_REEL_REGEX = re.compile(
+    r"^https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel|tv)\/([a-zA-Z0-9_\-]+)\/?(?:\?.*)?$",
+    re.IGNORECASE,
 )
-IG_HIGHLIGHT_PATTERN = (
-    r"(?:https?://)?(?:www\.)?instagram\.com/stories/highlights/(\d+)/?"
+STORIES_REGEX = re.compile(
+    r"^https?:\/\/(?:www\.)?instagram\.com\/stories\/([a-zA-Z0-9_\.]+)(?:\/(\d+))?\/?(?:\?.*)?$",
+    re.IGNORECASE,
 )
-IG_PROFILE_PATTERN = r"(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/?"
+HIGHLIGHTS_REGEX = re.compile(
+    r"^https?:\/\/(?:www\.)?instagram\.com\/stories\/highlights\/([a-zA-Z0-9_\-]+)\/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
+PROFILE_REGEX = re.compile(
+    r"^https?:\/\/(?:www\.)?instagram\.com\/([a-zA-Z0-9_\.]+)\/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
+
+RESERVED_USERNAMES = {
+    "p",
+    "reel",
+    "reels",
+    "tv",
+    "stories",
+    "explore",
+    "direct",
+    "accounts",
+    "developer",
+    "about",
+    "legal",
+    "api",
+    "graphql",
+    "support",
+    "press",
+}
+
+QUALITY_PRESETS: List[Tuple[str, str]] = [
+    ("best_video", "Best Video (Highest Quality)"),
+    ("1080p", "1080p Full HD"),
+    ("720p", "720p HD"),
+    ("audio_only", "Audio Only (MP3/M4A)"),
+]
