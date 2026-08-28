@@ -1,38 +1,51 @@
 """
-gui/widgets/thumbnail_loader.py - Asynchronous thumbnail image fetcher with caching and safe cancellation.
-Downloads image bytes in the background and emits raw bytes to avoid QPixmap thread-affinity issues.
+gui/widgets/thumbnail_loader.py - Asynchronous thumbnail image fetcher with caching, thread-safe pooling, and safe cancellation.
+Downloads image bytes in the background via QThreadPool to prevent OS thread leaks and emits raw bytes to avoid QPixmap thread-affinity issues.
 """
 
 from __future__ import annotations
 
 import logging
 import ssl
+import threading
 import urllib.error
 import urllib.request
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional, Set
 
 try:
-    from PyQt6.QtCore import QThread, pyqtSignal
+    from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 except ImportError:
 
-    class QThread:  # type: ignore
+    class QObject:  # type: ignore
+
         def __init__(self, parent=None):
             pass
 
-        def isRunning(self) -> bool:
-            return False
+    class QRunnable:  # type: ignore
 
-        def start(self):
-            self.run()
-
-        def cancel(self):
+        def __init__(self):
             pass
 
-        def wait(self, timeout=None):
+    class QThreadPool:  # type: ignore
+
+        _instance = None
+
+        @classmethod
+        def globalInstance(cls):
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+        def setMaxThreadCount(self, count: int):
             pass
+
+        def start(self, runnable):
+            if hasattr(runnable, "run"):
+                runnable.run()
 
     def pyqtSignal(*a):  # type: ignore
         class Signal:
+
             def __init__(self):
                 self._slots = []
 
@@ -44,7 +57,8 @@ except ImportError:
                         pass
 
             def connect(self, f):
-                self._slots.append(f)
+                if f not in self._slots:
+                    self._slots.append(f)
 
             def disconnect(self, f=None):
                 if f is None:
@@ -59,56 +73,72 @@ logger = logging.getLogger(__name__)
 
 
 class ThumbnailCache:
-    """In-memory cache for downloaded thumbnail byte data to eliminate redundant network requests."""
+    """Thread-safe in-memory cache for downloaded thumbnail byte data."""
 
+    _lock: threading.Lock = threading.Lock()
     _cache: Dict[str, bytes] = {}
     _max_size: int = 500
 
     @classmethod
     def get(cls, url: str) -> Optional[bytes]:
-        return cls._cache.get(url)
+        with cls._lock:
+            return cls._cache.get(url)
 
     @classmethod
     def set(cls, url: str, data: bytes) -> None:
-        if len(cls._cache) >= cls._max_size:
-            cls._cache.clear()
-        cls._cache[url] = data
+        with cls._lock:
+            if len(cls._cache) >= cls._max_size:
+                evict_count = max(1, cls._max_size // 4)
+                keys_to_evict = list(cls._cache.keys())[:evict_count]
+                for k in keys_to_evict:
+                    cls._cache.pop(k, None)
+            cls._cache[url] = data
 
     @classmethod
     def clear(cls) -> None:
-        cls._cache.clear()
+        with cls._lock:
+            cls._cache.clear()
+
+    @classmethod
+    def has(cls, url: str) -> bool:
+        with cls._lock:
+            return url in cls._cache
 
 
-class ThumbnailLoader(QThread):
-    """
-    Asynchronous background worker to fetch image thumbnail bytes over HTTPS.
-    Emits raw image bytes to ensure safe QPixmap creation on the Qt GUI main thread.
-    """
-
+class _ThumbnailSignalBridge(QObject):
     loaded = pyqtSignal(bytes) if "pyqtSignal" in globals() else None
 
-    def __init__(self, url: str, parent=None):
-        super().__init__(parent)
-        self.url: str = (url or "").strip()
-        self._is_cancelled: bool = False
+
+class ThumbnailTask(QRunnable):
+    """Runnable task executed within QThreadPool for non-blocking thumbnail fetching."""
+
+    def __init__(self, url: str, loader_ref: ThumbnailLoader):
+        super().__init__()
+        self.url = url
+        self.loader_ref = loader_ref
         self._ssl_ctx = ssl._create_unverified_context()
 
-    def cancel(self) -> None:
-        """Flags the thumbnail loader to cancel and suppress signal emissions."""
-        self._is_cancelled = True
-
     def run(self) -> None:
-        if not self.url or not self.url.startswith("http") or self._is_cancelled:
+        if not self.url or not self.url.startswith("http"):
             return
 
-        # 1. Check memory cache first
+        loader = self.loader_ref
+        if not loader or loader.is_cancelled:
+            return
+
+        # 1. Check memory cache
         cached_data = ThumbnailCache.get(self.url)
         if cached_data:
-            if not self._is_cancelled and self.loaded:
-                self.loaded.emit(cached_data)
+            if (
+                loader
+                and not loader.is_cancelled
+                and loader.signals
+                and loader.signals.loaded
+            ):
+                loader.signals.loaded.emit(cached_data)
             return
 
-        # 2. Download from network
+        # 2. Network fetch
         try:
             headers = {
                 "User-Agent": (
@@ -116,7 +146,9 @@ class ThumbnailLoader(QThread):
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/128.0.0.0 Safari/537.36"
                 ),
-                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Accept": (
+                    "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+                ),
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://www.instagram.com/",
                 "Sec-Fetch-Dest": "image",
@@ -125,12 +157,58 @@ class ThumbnailLoader(QThread):
             }
             req = urllib.request.Request(self.url, headers=headers)
             with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=8) as resp:
-                if self._is_cancelled:
+                if not loader or loader.is_cancelled:
                     return
                 data = resp.read()
-                if data and not self._is_cancelled:
+                if data and loader and not loader.is_cancelled:
                     ThumbnailCache.set(self.url, data)
-                    if self.loaded:
-                        self.loaded.emit(data)
+                    if (
+                        loader.signals
+                        and loader.signals.loaded
+                        and not loader.is_cancelled
+                    ):
+                        loader.signals.loaded.emit(data)
         except Exception as e:
             logger.debug(f"Thumbnail load failed for {self.url}: {e}")
+
+
+class ThumbnailLoader:
+    """High-performance thumbnail loader facade backed by QThreadPool."""
+
+    def __init__(self, url: str, parent=None):
+        self.url: str = (url or "").strip()
+        self.is_cancelled: bool = False
+        self.signals = _ThumbnailSignalBridge(parent)
+        self.loaded = self.signals.loaded
+
+    def cancel(self) -> None:
+        self.is_cancelled = True
+        if self.signals and hasattr(self.signals.loaded, "disconnect"):
+            try:
+                self.signals.loaded.disconnect()
+            except Exception:
+                pass
+
+    def start(self) -> None:
+        if not self.url or not self.url.startswith("http") or self.is_cancelled:
+            return
+
+        cached_data = ThumbnailCache.get(self.url)
+        if cached_data:
+            if not self.is_cancelled and self.loaded:
+                self.loaded.emit(cached_data)
+            return
+
+        task = ThumbnailTask(self.url, self)
+        pool = QThreadPool.globalInstance()
+        pool.start(task)
+
+    def run(self) -> None:
+        task = ThumbnailTask(self.url, self)
+        task.run()
+
+    def wait(self, timeout: Optional[int] = None) -> bool:
+        return True
+
+    def isRunning(self) -> bool:
+        return not self.is_cancelled

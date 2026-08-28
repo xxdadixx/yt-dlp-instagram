@@ -678,9 +678,10 @@ class MainWindow(QMainWindow):
                 button.setIconSize(QSize(size, size))
 
     def _on_clipboard_check_changed(self, state: Any = None) -> None:
-        """Handles changes to clipboard monitor checkbox."""
+        """Handles changes to clipboard monitor checkbox with dynamic listener toggling."""
         if hasattr(self, "chk_clipboard") and hasattr(self.chk_clipboard, "isChecked"):
             self.auto_clipboard = self.chk_clipboard.isChecked()
+            self._toggle_clipboard_listener(self.auto_clipboard)
         self.save_settings()
 
     # --------------------------------------------------------
@@ -726,48 +727,53 @@ class MainWindow(QMainWindow):
     # Clipboard & Toast Helpers
     # --------------------------------------------------------
     def setup_clipboard_monitor(self) -> None:
-        self.clipboard = QApplication.clipboard()
-        self.clipboard.dataChanged.connect(self.on_clipboard_changed)
+        """Connects clipboard listener only when auto-monitoring is active."""
+        if self.auto_clipboard:
+            self._toggle_clipboard_listener(True)
+
+    def _toggle_clipboard_listener(self, enable: bool) -> None:
+        try:
+            cb = QApplication.clipboard()
+            if not hasattr(cb, "dataChanged"):
+                return
+            if enable:
+                cb.dataChanged.connect(self.on_clipboard_changed)
+            else:
+                cb.dataChanged.disconnect(self.on_clipboard_changed)
+        except Exception:
+            pass
 
     def on_clipboard_changed(self) -> None:
-        if not self.chk_clipboard.isChecked():
+        if not self.auto_clipboard:
             return
-        text = self.clipboard.text().strip()
-        if not text or text == self._last_clipboard_text:
+        # Debounce by 250ms to ensure Windows OLE clipboard lock is released before read
+        QTimer.singleShot(250, self._process_clipboard_data)
+
+    def _process_clipboard_data(self) -> None:
+        if not self.auto_clipboard:
             return
-        self._last_clipboard_text = text
+        try:
+            cb = QApplication.clipboard()
+            mime = cb.mimeData() if hasattr(cb, "mimeData") else None
+            if mime and hasattr(mime, "hasText") and not mime.hasText():
+                return
+            text = cb.text().strip() if hasattr(cb, "text") else ""
+            if not text or text == self._last_clipboard_text:
+                return
 
-        from core.parser import extract_instagram_urls, parse_instagram_url
+            self._last_clipboard_text = text
+            info = parse_instagram_url(text)
+            if info.get("valid") and info.get("type") != "unknown":
+                self.url_container.add_url_chip(text)
+                self.show_toast(f"Pasted: {text[:45]}...")
+        except Exception:
+            pass
 
-        valid_urls = extract_instagram_urls(text)
-        if not valid_urls:
-            return
-
-        for clean_u in valid_urls:
-            info = parse_instagram_url(clean_u)
-            ttype = info.get("type", "url").upper().replace("_", " ")
-            user = info.get("username")
-            code = info.get("shortcode")
-            tid = info.get("target_id")
-
-            self.url_container.add_url_chip(clean_u)
-
-            if "REELS" in ttype:
-                self.show_toast(f"[REELS] Added @{user} from clipboard")
-            elif ttype == "PROFILE":
-                self.show_toast(f"[PROFILE] Added @{user} from clipboard")
-            elif ttype == "REEL":
-                self.show_toast(f"[REEL] Added #{code} from clipboard")
-            elif ttype in ("POST", "TV"):
-                self.show_toast(f"[POST] Added #{code} from clipboard")
-            elif ttype == "STORY":
-                self.show_toast(f"[STORY] Added @{user} from clipboard")
-            elif ttype == "HIGHLIGHT":
-                self.show_toast(f"[HIGHLIGHT] Added #{tid} from clipboard")
-            elif ttype == "AUDIO":
-                self.show_toast(f"[AUDIO] Added #{tid} from clipboard")
-            else:
-                self.show_toast(f"[{ttype}] Added link from clipboard")
+    def _cleanup_worker(self, worker: Any) -> None:
+        if hasattr(self, "_active_workers"):
+            self._active_workers.discard(worker)
+        if hasattr(worker, "deleteLater"):
+            worker.deleteLater()
 
     def show_toast(
         self, message: str, is_error: bool = False, duration_ms: int = 4000
