@@ -1,3 +1,14 @@
+try:
+    from core.parser import extract_instagram_urls, parse_instagram_url
+except ImportError:
+
+    def extract_instagram_urls(text: str) -> List[str]:
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    def parse_instagram_url(url: str) -> dict:
+        return {"type": "url", "url": url}
+
+
 import re
 from typing import List, Set, Optional
 
@@ -207,6 +218,49 @@ class URLChip(QFrame):
         )
         layout.addWidget(self.lbl_text)
 
+        # Remove / Close Button
+        self.btn_close = QPushButton("✕", self)
+        self.btn_close.setObjectName("ChipCloseButton")
+        self.btn_close.setToolTip("Remove URL")
+        if hasattr(self.btn_close, "setFixedSize"):
+            self.btn_close.setFixedSize(16, 16)
+        if hasattr(self.btn_close, "setCursor") and "Qt" in globals():
+            cursor_shape = getattr(
+                getattr(Qt, "CursorShape", Qt), "PointingHandCursor", None
+            )
+            if cursor_shape is not None:
+                self.btn_close.setCursor(cursor_shape)
+        if hasattr(self.btn_close, "setFocusPolicy") and "Qt" in globals():
+            focus_policy = getattr(getattr(Qt, "FocusPolicy", Qt), "NoFocus", None)
+            if focus_policy is not None:
+                self.btn_close.setFocusPolicy(focus_policy)
+        self.btn_close.setStyleSheet(
+            """
+            QPushButton#ChipCloseButton {
+                background: transparent;
+                color: #94a3b8;
+                border: none;
+                border-radius: 8px;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 0;
+            }
+            QPushButton#ChipCloseButton:hover {
+                background: rgba(239, 68, 68, 0.2);
+                color: #ef4444;
+            }
+            QPushButton#ChipCloseButton:pressed {
+                background: rgba(239, 68, 68, 0.35);
+                color: #dc2626;
+            }
+        """
+        )
+        self.btn_close.clicked.connect(self._on_remove_clicked)
+        layout.addWidget(self.btn_close)
+
+    def _on_remove_clicked(self) -> None:
+        self.removed.emit(self.url)
+
 
 class URLChipInput(QWidget):
     """
@@ -221,6 +275,8 @@ class URLChipInput(QWidget):
         super().__init__(parent)
         self.setObjectName("URLChipInputContainer")
         self._chips: List[str] = []
+        self._chips_widgets: List[URLChip] = []
+        self._is_internal_updating: bool = False
         self.init_ui()
 
     def init_ui(self):
@@ -256,7 +312,83 @@ class URLChipInput(QWidget):
             }
         """
         )
+        if hasattr(self.text_edit, "textChanged"):
+            self.text_edit.textChanged.connect(self._on_text_changed)
         layout.addWidget(self.text_edit)
+
+        # Chips horizontal scroll area
+        self.chips_scroll = QScrollArea(self)
+        self.chips_scroll.setWidgetResizable(True)
+        self.chips_scroll.setFixedHeight(34)
+        self.chips_scroll.setFrameShape(
+            QFrame.Shape.NoFrame if hasattr(QFrame, "Shape") else 0
+        )
+        if hasattr(Qt, "ScrollBarPolicy"):
+            self.chips_scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            self.chips_scroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+        self.chips_scroll.setVisible(False)
+
+        self.chips_widget = QWidget()
+        self.chips_layout = QHBoxLayout(self.chips_widget)
+        self.chips_layout.setContentsMargins(0, 0, 0, 0)
+        self.chips_layout.setSpacing(6)
+        self.chips_layout.addStretch()
+        self.chips_scroll.setWidget(self.chips_widget)
+
+        layout.addWidget(self.chips_scroll)
+
+    def _on_text_changed(self) -> None:
+        if self._is_internal_updating:
+            return
+        self._rebuild_chips()
+        self.urls_changed.emit()
+
+    def _rebuild_chips(self) -> None:
+        targets = self.get_targets()
+
+        # Clear existing chips
+        for chip in list(self._chips_widgets):
+            if hasattr(self.chips_layout, "removeWidget"):
+                self.chips_layout.removeWidget(chip)
+            chip.setParent(None)
+            if hasattr(chip, "deleteLater"):
+                chip.deleteLater()
+        self._chips_widgets.clear()
+
+        if not targets:
+            if hasattr(self.chips_scroll, "setVisible"):
+                self.chips_scroll.setVisible(False)
+            return
+
+        if hasattr(self.chips_scroll, "setVisible"):
+            self.chips_scroll.setVisible(True)
+
+        for target in targets:
+            info = parse_instagram_url(target)
+            cat_name = info.get("type", "URL").upper().replace("_", " ")
+            chip = URLChip(target, category=cat_name, parent=self.chips_widget)
+            chip.removed.connect(self._remove_url)
+            # Insert before the trailing stretch
+            idx = max(0, self.chips_layout.count() - 1)
+            if hasattr(self.chips_layout, "insertWidget"):
+                self.chips_layout.insertWidget(idx, chip)
+            elif hasattr(self.chips_layout, "addWidget"):
+                self.chips_layout.addWidget(chip)
+            self._chips_widgets.append(chip)
+
+    def _remove_url(self, target_url: str) -> None:
+        """Removes a specific URL from the text input."""
+        targets = self.get_targets()
+        filtered = [t for t in targets if t != target_url]
+        self._is_internal_updating = True
+        self.text_edit.setPlainText("\n".join(filtered))
+        self._is_internal_updating = False
+        self._rebuild_chips()
+        self.urls_changed.emit()
 
     def add_url_chip(self, url: str) -> None:
         """Adds a valid Instagram URL to the input textbox and categorizes it."""
@@ -296,8 +428,12 @@ class URLChipInput(QWidget):
 
     def clear(self) -> None:
         """Clears the text input and resets state."""
+        self._is_internal_updating = True
         self.text_edit.clear()
+        self._is_internal_updating = False
         self._chips.clear()
+        self._rebuild_chips()
+        self.urls_changed.emit()
 
     def set_text(self, text: str) -> None:
         """Sets raw text content."""
