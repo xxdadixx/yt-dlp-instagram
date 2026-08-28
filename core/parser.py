@@ -1,124 +1,141 @@
 """
-core/parser.py - URL decomposition, Regex matching, and MediaID calculation.
+core/parser.py - URL decomposition and normalization
 """
 
 import re
+from urllib.parse import urlparse, urlunparse
+from config.constants import (
+    RE_PROFILE_REELS,
+    RE_REEL,
+    RE_POST,
+    RE_STORIES,
+    RE_HIGHLIGHTS,
+    RE_PROFILE,
+)
 
-RESERVED_USERNAMES = {
+RESERVED_PATHS = {
     "explore",
-    "accounts",
-    "direct",
-    "stories",
     "reels",
-    "reel",
-    "p",
-    "tv",
-    "api",
+    "stories",
+    "direct",
+    "accounts",
+    "legal",
     "about",
     "developer",
+    "api",
+    "graphql",
+    "p",
+    "reel",
+    "tv",
 }
 
 
-def shortcode_to_media_id(shortcode: str) -> int:
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-    media_id = 0
-    for char in shortcode:
-        if char in alphabet:
-            media_id = media_id * 64 + alphabet.index(char)
-    return media_id
+def normalize_url(url: str) -> str:
+    """Cleans tracking parameters and normalizes URL to standard HTTPS format."""
+    if not url:
+        return ""
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    parsed = urlparse(url)
+    netloc = parsed.netloc.lower()
+    if "instagram.com" not in netloc:
+        return url
+
+    netloc = "www.instagram.com"
+    path = parsed.path.rstrip("/") + "/"
+    if path == "/":
+        path = ""
+
+    return urlunparse(("https", netloc, path, "", "", ""))
 
 
 def parse_instagram_url(url: str) -> dict | None:
-    # 1. Highlight Story: /stories/highlights/{highlight_id}
-    hl_match = re.search(r"instagram\.com/stories/highlights/([0-9]+)", url)
-    if hl_match:
-        hl_id = hl_match.group(1)
-        return {
-            "type": "highlight",
-            "username": "highlight",
-            "story_id": hl_id,
-            "media_id": int(hl_id),
-            "identifier": f"highlight_{hl_id}",
-            "clean_url": f"https://www.instagram.com/stories/highlights/{hl_id}/",
-        }
+    """
+    Parses and categorizes an Instagram URL.
+    Returns metadata dictionary or None if unparseable.
+    """
+    if not url:
+        return None
 
-    # 2. User Story: /stories/{username}/{story_id} หรือ /stories/{username}/
-    story_match = re.search(
-        r"instagram\.com/stories/([A-Za-z0-9_\-\.]+)(?:/([0-9]+))?", url
-    )
-    if story_match:
-        username = story_match.group(1)
-        story_id = story_match.group(2)
-        if username.lower() not in RESERVED_USERNAMES:
-            if story_id:
-                return {
-                    "type": "story",
-                    "username": username,
-                    "story_id": story_id,
-                    "media_id": int(story_id),
-                    "identifier": f"{username}_{story_id}",
-                    "clean_url": f"https://www.instagram.com/stories/{username}/{story_id}/",
-                }
-            else:
-                return {
-                    "type": "story_user",
-                    "username": username,
-                    "story_id": "",
-                    "media_id": 0,
-                    "identifier": f"{username}_all_stories",
-                    "clean_url": f"https://www.instagram.com/stories/{username}/",
-                }
+    clean = normalize_url(url)
 
-    # 3. Reel / Reels / TV (Single): /(reel|reels|tv)/{shortcode}
-    reel_match = re.search(r"instagram\.com/(?:reel|reels|tv)/([A-Za-z0-9_\-\.]+)", url)
-    if reel_match:
-        shortcode = reel_match.group(1).rstrip("/")
-        return {
-            "type": "video",
-            "username": "Instagram",
-            "shortcode": shortcode,
-            "media_id": shortcode_to_media_id(shortcode),
-            "identifier": shortcode,
-            "clean_url": f"https://www.instagram.com/reel/{shortcode}/",
-        }
-
-    # 4. Standard Post (Single): /p/{shortcode}
-    post_match = re.search(r"instagram\.com/p/([A-Za-z0-9_\-\.]+)", url)
-    if post_match:
-        shortcode = post_match.group(1).rstrip("/")
-        return {
-            "type": "post",
-            "username": "Instagram",
-            "shortcode": shortcode,
-            "media_id": shortcode_to_media_id(shortcode),
-            "identifier": shortcode,
-            "clean_url": f"https://www.instagram.com/p/{shortcode}/",
-        }
-
-    # 5. Profile Reels Channel: /{username}/reels/
-    profile_reels_match = re.search(r"instagram\.com/([A-Za-z0-9_\-\.]+)/reels/?", url)
-    if profile_reels_match:
-        username = profile_reels_match.group(1)
-        if username.lower() not in RESERVED_USERNAMES:
+    # 1. Profile Reels Tab (e.g. /<username>/reels/)
+    m = RE_PROFILE_REELS.match(clean)
+    if m:
+        username = m.group(1).lower()
+        if username not in RESERVED_PATHS:
             return {
                 "type": "profile_reels",
-                "username": username,
-                "media_id": 0,
-                "identifier": f"{username}_all_reels",
+                "target": username,
+                "extra": None,
                 "clean_url": f"https://www.instagram.com/{username}/reels/",
+                "original_url": url,
             }
 
-    # 6. Full Profile Feed: /{username}/
-    profile_match = re.search(r"instagram\.com/([A-Za-z0-9_\-\.]+)/?", url)
-    if profile_match:
-        username = profile_match.group(1)
-        if username.lower() not in RESERVED_USERNAMES:
+    # 2. Single Reel (/reel/<code>/)
+    m = RE_REEL.match(clean)
+    if m:
+        code = m.group(1)
+        return {
+            "type": "reel",
+            "target": code,
+            "extra": None,
+            "clean_url": f"https://www.instagram.com/reel/{code}/",
+            "original_url": url,
+        }
+
+    # 3. Single Post (/p/<code>/)
+    m = RE_POST.match(clean)
+    if m:
+        code = m.group(1)
+        return {
+            "type": "post",
+            "target": code,
+            "extra": None,
+            "clean_url": f"https://www.instagram.com/p/{code}/",
+            "original_url": url,
+        }
+
+    # 4. Stories Highlights (/stories/highlights/<id>/)
+    m = RE_HIGHLIGHTS.match(clean)
+    if m:
+        highlight_id = m.group(1)
+        return {
+            "type": "highlight",
+            "target": highlight_id,
+            "extra": None,
+            "clean_url": f"https://www.instagram.com/stories/highlights/{highlight_id}/",
+            "original_url": url,
+        }
+
+    # 5. User Stories (/stories/<username>/[<story_id>]/)
+    m = RE_STORIES.match(clean)
+    if m:
+        username = m.group(1).lower()
+        story_id = m.group(2)
+        if username != "highlights":
             return {
-                "type": "profile_posts",
-                "username": username,
-                "media_id": 0,
-                "identifier": f"{username}_all_posts",
+                "type": "story",
+                "target": username,
+                "extra": story_id,
+                "clean_url": f"https://www.instagram.com/stories/{username}/"
+                + (f"{story_id}/" if story_id else ""),
+                "original_url": url,
+            }
+
+    # 6. Base Profile (/<username>/)
+    m = RE_PROFILE.match(clean)
+    if m:
+        username = m.group(1).lower()
+        if username not in RESERVED_PATHS:
+            return {
+                "type": "profile",
+                "target": username,
+                "extra": None,
                 "clean_url": f"https://www.instagram.com/{username}/",
+                "original_url": url,
             }
 
     return None

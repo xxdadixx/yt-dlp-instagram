@@ -1,809 +1,398 @@
 """
-gui/main_window.py - Main Window with Modern Studio Workspace Layout.
-Optimized for spacious media grid inspection and streamlined controls.
+gui/main_window.py - Main Application Window
 """
 
 import os
-import re
-import subprocess
-import sys
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from PyQt6.QtCore import (
-    QEasingCurve,
-    QLocale,
-    QPropertyAnimation,
-    QSettings,
-    Qt,
-    QTimer,
-)
-from PyQt6.QtGui import QCloseEvent, QFont, QIcon, QKeySequence
+from pathlib import Path
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
     QFileDialog,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from config.constants import APPLICATION_NAME, ORGANIZATION_NAME
-from config.translations import TRANSLATIONS
-from core.cookie_manager import sanitize_and_save_instagram_cookies
-from core.download_worker import GridDownloadWorker
-from core.inspect_worker import InspectionWorker
-from gui.icons import get_icon
-from gui.styles import DARK_THEME_QSS
-from gui.widgets.media_card import MediaCardWidget
+from config.constants import (
+    APP_NAME,
+    DEFAULT_DOWNLOAD_DIR,
+    QUALITY_PRESETS,
+)
+from core.cookie_manager import CookieManager
+from core.download_worker import DownloadWorker
+from core.inspect_worker import InspectWorker
+from gui.styles import MAIN_STYLESHEET
+from gui.widgets.media_card import MediaCard
 from gui.widgets.modern_progress_bar import ModernProgressBar
-from gui.widgets.url_chip_input import UrlBlockContainer
-from utils.file_utils import get_icon_path
+from gui.widgets.no_scroll_combo import NoScrollComboBox
+from gui.widgets.url_chip_input import UrlChipInput
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(880, 680)
-        self.resize(960, 780)
+        self.setWindowTitle(APP_NAME)
+        self.resize(1180, 840)
+        self.setMinimumSize(960, 680)
 
-        icon_file = get_icon_path()
-        if os.path.exists(icon_file):
-            self.setWindowIcon(QIcon(icon_file))
+        self.cookie_manager = CookieManager()
+        self.inspect_worker: InspectWorker | None = None
+        self.download_worker: DownloadWorker | None = None
+        self.media_cards: list[MediaCard] = []
 
-        self.settings = QSettings(ORGANIZATION_NAME, APPLICATION_NAME)
-        self.inspect_worker: InspectionWorker | None = None
-        self.download_worker: GridDownloadWorker | None = None
-        self.cards: list[MediaCardWidget] = []
-        self.anchor_card_idx: int | None = None
-        self.last_clipboard_text = ""
+        self.download_path = DEFAULT_DOWNLOAD_DIR
+        os.makedirs(self.download_path, exist_ok=True)
 
-        system_lang = "th" if QLocale.system().name().startswith("th") else "en"
-        self.current_lang = str(self.settings.value("language", system_lang))
+        self._init_ui()
+        self._setup_shortcuts()
+        self._check_cookie_status()
 
-        self.load_paths()
-        self.init_ui()
-        self.apply_dark_theme()
-        self.setup_clipboard_monitor()
-        self.load_saved_settings()
-        self.retranslate_ui()
+    def _init_ui(self):
+        self.setStyleSheet(MAIN_STYLESHEET)
 
-    def t(self, key: str) -> str:
-        return TRANSLATIONS.get(self.current_lang, {}).get(key, key)
-
-    def load_paths(self) -> None:
-        default_dl = os.path.join(
-            os.path.expanduser("~"), "Downloads", "InstagramDownloads"
-        )
-        self.save_dir = str(self.settings.value("save_dir", default_dl))
-        app_data_dir = os.path.join(
-            os.environ.get("APPDATA", os.path.expanduser("~")), APPLICATION_NAME
-        )
-        os.makedirs(app_data_dir, exist_ok=True)
-        self.cookie_path = os.path.join(app_data_dir, "cookies.txt")
-
-    def init_ui(self) -> None:
-        central_widget = QWidget()
+        central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(16, 12, 16, 12)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
 
-        # 1. TOP HEADER & URL INPUT DECK
-        self.input_group = QGroupBox()
-        input_layout = QVBoxLayout(self.input_group)
-        input_layout.setContentsMargins(10, 8, 10, 8)
-        input_layout.setSpacing(6)
+        # --- Section 1: URL Input Area ---
+        input_group = QFrame(self)
+        input_group.setObjectName("CardGroup")
+        input_layout = QVBoxLayout(input_group)
+        input_layout.setContentsMargins(12, 12, 12, 12)
+        input_layout.setSpacing(8)
 
-        header_top_row = QHBoxLayout()
-        self.title_label = QLabel("Instagram Pro Downloader - Studio Inspector")
-        self.title_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-        header_top_row.addWidget(self.title_label)
+        group_title = QLabel(
+            "Instagram URLs (Supports Posts, Reels, Carousels, Stories & Highlights)",
+            self,
+        )
+        group_title.setObjectName("SectionTitle")
+        input_layout.addWidget(group_title)
 
-        header_top_row.addStretch()
-
-        self.cmb_lang = QComboBox()
-        self.cmb_lang.addItem("🇹🇭 ภาษาไทย", "th")
-        self.cmb_lang.addItem("🇺🇸 English", "en")
-        self.cmb_lang.setFixedHeight(24)
-        idx = self.cmb_lang.findData(self.current_lang)
-        if idx >= 0:
-            self.cmb_lang.setCurrentIndex(idx)
-        self.cmb_lang.currentIndexChanged.connect(self.on_language_changed)
-        header_top_row.addWidget(self.cmb_lang)
-        input_layout.addLayout(header_top_row)
-
-        self.url_container = UrlBlockContainer(self.current_lang)
+        self.url_container = UrlChipInput(self)
         input_layout.addWidget(self.url_container)
 
-        input_action_row = QHBoxLayout()
-        self.chk_clipboard = QCheckBox()
-        input_action_row.addWidget(self.chk_clipboard, stretch=1)
-
-        self.btn_inspect = QPushButton()
-        self.btn_inspect.setFixedHeight(28)
-        self.btn_inspect.setIcon(get_icon("search", "#ffffff", 14))
-        self.btn_inspect.setStyleSheet(
-            "background-color: #007acc; font-size: 11px; padding: 0 16px;"
-        )
+        # Action Buttons
+        btn_bar = QHBoxLayout()
+        self.btn_inspect = QPushButton("🔍 Inspect Media", self)
+        self.btn_inspect.setObjectName("PrimaryButton")
         self.btn_inspect.clicked.connect(self.start_inspection)
-        input_action_row.addWidget(self.btn_inspect)
 
-        self.btn_clear_input = QPushButton()
-        self.btn_clear_input.setFixedHeight(28)
-        self.btn_clear_input.setIcon(get_icon("clear", "#ffffff", 13))
-        self.btn_clear_input.setStyleSheet(
-            "background-color: #3d3d4e; font-size: 11px; padding: 0 12px;"
-        )
-        self.btn_clear_input.clicked.connect(lambda: self.url_container.clear())
-        input_action_row.addWidget(self.btn_clear_input)
+        self.btn_clear_input = QPushButton("✕ Clear Textbox", self)
+        self.btn_clear_input.setObjectName("SecondaryButton")
+        self.btn_clear_input.clicked.connect(self.url_container.clear_all)
 
-        input_layout.addLayout(input_action_row)
-        main_layout.addWidget(self.input_group)
+        btn_bar.addWidget(self.btn_inspect)
+        btn_bar.addWidget(self.btn_clear_input)
+        btn_bar.addStretch()
+        input_layout.addLayout(btn_bar)
 
-        # 2. MAIN MEDIA GRID INSPECTOR
-        self.grid_group = QGroupBox()
-        grid_layout = QVBoxLayout(self.grid_group)
-        grid_layout.setContentsMargins(10, 8, 10, 8)
-        grid_layout.setSpacing(6)
+        main_layout.addWidget(input_group)
 
-        sel_toolbar = QHBoxLayout()
-        self.btn_select_all = QPushButton()
-        self.btn_select_all.setFixedHeight(24)
-        self.btn_select_all.setIcon(get_icon("check-all", "#ffffff", 13))
-        self.btn_select_all.setStyleSheet(
-            "background-color: #2e2e3d; font-size: 11px; padding: 2px 10px;"
-        )
+        # --- Section 2: Media Queue / Grid Area ---
+        queue_group = QFrame(self)
+        queue_group.setObjectName("CardGroup")
+        queue_layout = QVBoxLayout(queue_group)
+        queue_layout.setContentsMargins(12, 12, 12, 12)
+        queue_layout.setSpacing(8)
+
+        # Queue Toolbar
+        queue_toolbar = QHBoxLayout()
+        queue_title = QLabel("Media Queue Cards (Media Grid Inspector)", self)
+        queue_title.setObjectName("SectionTitle")
+        queue_toolbar.addWidget(queue_title)
+
+        self.btn_select_all = QPushButton("☑ Select All (Ctrl+A)", self)
         self.btn_select_all.clicked.connect(self.select_all_cards)
-        sel_toolbar.addWidget(self.btn_select_all)
+        queue_toolbar.addWidget(self.btn_select_all)
 
-        self.btn_delete_selected = QPushButton()
-        self.btn_delete_selected.setFixedHeight(24)
-        self.btn_delete_selected.setIcon(get_icon("trash", "#ffffff", 13))
-        self.btn_delete_selected.setStyleSheet(
-            "background-color: #8b2635; font-size: 11px; padding: 2px 10px;"
-        )
+        self.btn_delete_selected = QPushButton("🗑 Delete Selected (Del)", self)
         self.btn_delete_selected.clicked.connect(self.delete_selected_cards)
-        sel_toolbar.addWidget(self.btn_delete_selected)
+        queue_toolbar.addWidget(self.btn_delete_selected)
 
-        self.btn_clear_completed = QPushButton()
-        self.btn_clear_completed.setFixedHeight(24)
-        self.btn_clear_completed.setIcon(get_icon("clear-completed", "#ffffff", 13))
-        self.btn_clear_completed.setStyleSheet(
-            "background-color: #3b3b4f; font-size: 11px; padding: 2px 10px;"
-        )
+        self.btn_clear_completed = QPushButton("🧹 Clear Completed", self)
         self.btn_clear_completed.clicked.connect(self.clear_completed_cards)
-        sel_toolbar.addWidget(self.btn_clear_completed)
+        queue_toolbar.addWidget(self.btn_clear_completed)
 
-        sel_toolbar.addStretch()
-        self.lbl_selection_count = QLabel()
-        self.lbl_selection_count.setStyleSheet("color: #aaaaaa; font-size: 11px;")
-        sel_toolbar.addWidget(self.lbl_selection_count)
-        grid_layout.addLayout(sel_toolbar)
+        queue_toolbar.addStretch()
 
-        self.scroll_area = QScrollArea()
+        self.lbl_selection_count = QLabel("Selected: 0 / 0 items", self)
+        self.lbl_selection_count.setObjectName("MutedLabel")
+        queue_toolbar.addWidget(self.lbl_selection_count)
+
+        queue_layout.addLayout(queue_toolbar)
+
+        # Scroll Area for Cards
+        self.scroll_area = QScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setObjectName("mediaGridScroll")
-        self.scroll_area.setStyleSheet(
-            """
-            #mediaGridScroll {
-                background-color: #17171e;
-                border: 1px solid #252533;
-                border-radius: 6px;
-            }
-        """
-        )
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
 
         self.cards_container = QWidget()
         self.cards_layout = QVBoxLayout(self.cards_container)
-        self.cards_layout.setContentsMargins(8, 8, 8, 8)
+        self.cards_layout.setContentsMargins(0, 0, 0, 0)
         self.cards_layout.setSpacing(8)
-        self.cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.cards_layout.addStretch()
 
         self.scroll_area.setWidget(self.cards_container)
-        grid_layout.addWidget(self.scroll_area)
-        main_layout.addWidget(self.grid_group, stretch=1)
+        queue_layout.addWidget(self.scroll_area)
 
-        # 3. BOTTOM COMMAND & SETTINGS DECK
-        self.bottom_deck = QFrame()
-        self.bottom_deck.setStyleSheet(
-            """
-            QFrame#bottomDeck {
-                background-color: #1c1c24;
-                border: 1px solid #2e2e3d;
-                border-radius: 6px;
-            }
-        """
-        )
-        self.bottom_deck.setObjectName("bottomDeck")
-        bottom_deck_layout = QVBoxLayout(self.bottom_deck)
-        bottom_deck_layout.setContentsMargins(10, 8, 10, 8)
-        bottom_deck_layout.setSpacing(6)
+        main_layout.addWidget(queue_group, stretch=1)
 
-        deck_row = QHBoxLayout()
-        deck_row.setSpacing(12)
+        # --- Section 3: Bottom Control & Download Bar ---
+        bottom_bar = QFrame(self)
+        bottom_bar.setObjectName("BottomBar")
+        bottom_layout = QVBoxLayout(bottom_bar)
+        bottom_layout.setContentsMargins(12, 8, 12, 8)
+        bottom_layout.setSpacing(6)
 
-        left_settings_col = QVBoxLayout()
-        left_settings_col.setSpacing(4)
+        ctrl_row = QHBoxLayout()
+        self.lbl_save_folder = QLabel(f"Save Folder: {self.download_path}", self)
+        ctrl_row.addWidget(self.lbl_save_folder)
 
-        path_row = QHBoxLayout()
-        self.lbl_path = QLabel()
-        self.lbl_path.setStyleSheet("color: #cccccc; font-size: 11px;")
-        path_row.addWidget(self.lbl_path, stretch=1)
+        btn_browse = QPushButton("📁 Browse", self)
+        btn_browse.clicked.connect(self.browse_folder)
+        ctrl_row.addWidget(btn_browse)
 
-        self.btn_browse = QPushButton()
-        self.btn_browse.setFixedHeight(24)
-        self.btn_browse.setIcon(get_icon("folder", "#ffffff", 12))
-        self.btn_browse.setStyleSheet(
-            "background-color: #2c2c3d; font-size: 10px; padding: 2px 8px;"
-        )
-        self.btn_browse.clicked.connect(self.browse_folder)
-        path_row.addWidget(self.btn_browse)
+        btn_open_folder = QPushButton("📂 Open Folder", self)
+        btn_open_folder.clicked.connect(self.open_save_folder)
+        ctrl_row.addWidget(btn_open_folder)
 
-        self.btn_open = QPushButton()
-        self.btn_open.setFixedHeight(24)
-        self.btn_open.setIcon(get_icon("folder-open", "#ffffff", 12))
-        self.btn_open.setStyleSheet(
-            "background-color: #2c2c3d; font-size: 10px; padding: 2px 8px;"
-        )
-        self.btn_open.clicked.connect(self.open_folder)
-        path_row.addWidget(self.btn_open)
-        left_settings_col.addLayout(path_row)
+        ctrl_row.addSpacing(16)
 
-        cookie_row = QHBoxLayout()
-        self.lbl_cookie_status = QLabel()
-        self.lbl_cookie_status.setStyleSheet("font-size: 11px;")
-        cookie_row.addWidget(self.lbl_cookie_status, stretch=1)
+        self.lbl_cookie_status = QLabel("Cookie: Disconnected", self)
+        ctrl_row.addWidget(self.lbl_cookie_status)
 
-        self.btn_import_cookie = QPushButton()
-        self.btn_import_cookie.setFixedHeight(24)
-        self.btn_import_cookie.setIcon(get_icon("cookie", "#ffffff", 12))
-        self.btn_import_cookie.setStyleSheet(
-            "background-color: #2c2c3d; font-size: 10px; padding: 2px 8px;"
-        )
-        self.btn_import_cookie.clicked.connect(self.import_cookie_file)
-        cookie_row.addWidget(self.btn_import_cookie)
+        self.btn_import_cookie = QPushButton("🔑 Import Cookie", self)
+        self.btn_import_cookie.clicked.connect(self.import_cookie)
+        ctrl_row.addWidget(self.btn_import_cookie)
 
-        self.btn_clear_cookie = QPushButton()
-        self.btn_clear_cookie.setFixedHeight(24)
-        self.btn_clear_cookie.setIcon(get_icon("trash", "#ffffff", 12))
-        self.btn_clear_cookie.setStyleSheet(
-            "background-color: #8b2635; font-size: 10px; padding: 2px 8px;"
-        )
-        self.btn_clear_cookie.clicked.connect(self.clear_cookie_file)
-        cookie_row.addWidget(self.btn_clear_cookie)
-        left_settings_col.addLayout(cookie_row)
+        self.btn_clear_cookie = QPushButton("🗑 Clear Cookie", self)
+        self.btn_clear_cookie.clicked.connect(self.clear_cookie)
+        ctrl_row.addWidget(self.btn_clear_cookie)
 
-        deck_row.addLayout(left_settings_col, stretch=3)
+        ctrl_row.addStretch()
 
-        right_action_col = QHBoxLayout()
-        right_action_col.setSpacing(6)
+        self.btn_download_all = QPushButton("⬇ Download All", self)
+        self.btn_download_all.setObjectName("DownloadButton")
+        self.btn_download_all.clicked.connect(self.start_download)
+        ctrl_row.addWidget(self.btn_download_all)
 
-        self.btn_download_all = QPushButton()
-        self.btn_download_all.setFixedHeight(48)
-        self.btn_download_all.setIcon(get_icon("download", "#ffffff", 18))
-        self.btn_download_all.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #d62976;
-                font-size: 13px;
-                font-weight: bold;
-                border-radius: 6px;
-                padding: 0 16px;
-            }
-            QPushButton:hover { background-color: #fa7e1e; }
-            QPushButton:disabled { background-color: #2c2c38; color: #606070; }
-        """
-        )
-        self.btn_download_all.clicked.connect(self.start_download_all)
-        right_action_col.addWidget(self.btn_download_all, stretch=3)
-
-        self.btn_cancel = QPushButton()
-        self.btn_cancel.setFixedHeight(48)
+        self.btn_cancel = QPushButton("⏹ Cancel", self)
         self.btn_cancel.setEnabled(False)
-        self.btn_cancel.setIcon(get_icon("stop", "#ffffff", 15))
-        self.btn_cancel.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #4a4a5a;
-                font-size: 11px;
-                font-weight: bold;
-                border-radius: 6px;
-                padding: 0 12px;
-            }
-            QPushButton:hover { background-color: #8b2635; }
-            QPushButton:disabled { background-color: #22222b; color: #555566; }
-        """
-        )
-        self.btn_cancel.clicked.connect(self.cancel_operation)
-        right_action_col.addWidget(self.btn_cancel, stretch=1)
+        self.btn_cancel.clicked.connect(self.cancel_current_task)
+        ctrl_row.addWidget(self.btn_cancel)
 
-        deck_row.addLayout(right_action_col, stretch=2)
-        bottom_deck_layout.addLayout(deck_row)
+        bottom_layout.addLayout(ctrl_row)
 
-        status_bar_row = QHBoxLayout()
-        self.lbl_status = QLabel()
-        self.lbl_status.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        status_bar_row.addWidget(self.lbl_status)
+        # Modern Progress Bar & Status Text
+        self.progress_bar = ModernProgressBar(self)
+        self.progress_bar.setValue(0)
+        bottom_layout.addWidget(self.progress_bar)
 
-        status_bar_row.addStretch()
+        self.lbl_status = QLabel("Ready", self)
+        self.lbl_status.setObjectName("StatusLabel")
+        bottom_layout.addWidget(self.lbl_status)
 
-        self.lbl_footer = QLabel()
-        self.lbl_footer.setStyleSheet("color: #888888; font-size: 10px;")
-        status_bar_row.addWidget(self.lbl_footer)
-        bottom_deck_layout.addLayout(status_bar_row)
+        main_layout.addWidget(bottom_bar)
 
-        self.progress_bar = ModernProgressBar()
-        bottom_deck_layout.addWidget(self.progress_bar)
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+A"), self, self.select_all_cards)
+        QShortcut(QKeySequence("Delete"), self, self.delete_selected_cards)
 
-        main_layout.addWidget(self.bottom_deck)
+    # =========================================================================
+    # Media Inspection Flow
+    # =========================================================================
 
-    def keyPressEvent(self, event) -> None:
-        is_input_focused = self.url_container.txt_input.hasFocus()
-
-        if event.matches(QKeySequence.StandardKey.SelectAll) or (
-            event.key() == Qt.Key.Key_A
-            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        ):
-            if not is_input_focused:
-                self.select_all_cards()
-                return
-
-        elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            if not is_input_focused:
-                self.delete_selected_cards()
-                return
-
-        elif event.key() == Qt.Key.Key_Escape:
-            self.deselect_all_cards()
-            return
-
-        super().keyPressEvent(event)
-
-    def on_card_clicked(self, card: MediaCardWidget, event) -> None:
-        modifiers = event.modifiers()
-        idx = self.cards.index(card)
-
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
-            card.set_selected(not card.is_selected)
-            self.anchor_card_idx = idx
-
-        elif (
-            modifiers & Qt.KeyboardModifier.ShiftModifier
-            and self.anchor_card_idx is not None
-        ):
-            start = min(self.anchor_card_idx, idx)
-            end = max(self.anchor_card_idx, idx)
-            for i, c in enumerate(self.cards):
-                c.set_selected(start <= i <= end)
-
-        else:
-            for c in self.cards:
-                c.set_selected(c == card)
-            self.anchor_card_idx = idx
-
-        self.update_selection_ui()
-
-    def select_all_cards(self) -> None:
-        for card in self.cards:
-            card.set_selected(True)
-        self.update_selection_ui()
-
-    def deselect_all_cards(self) -> None:
-        for card in self.cards:
-            card.set_selected(False)
-        self.anchor_card_idx = None
-        self.update_selection_ui()
-
-    def delete_selected_cards(self) -> None:
-        selected_cards = [c for c in self.cards if c.is_selected]
-        for card in selected_cards:
-            self.remove_card(card)
-        self.update_selection_ui()
-
-    def clear_completed_cards(self) -> None:
-        completed_cards = [c for c in self.cards if c.is_completed]
-        for card in completed_cards:
-            self.remove_card(card)
-        self.update_selection_ui()
-
-    def update_selection_ui(self) -> None:
-        selected_count = sum(1 for c in self.cards if c.is_selected)
-        total_count = len(self.cards)
-        self.lbl_selection_count.setText(
-            self.t("lbl_selection_format").format(
-                selected=selected_count, total=total_count
-            )
-        )
-        # Disable Download button if the grid is completely empty
-        self.btn_download_all.setEnabled(total_count > 0)
-
-    def update_cookie_status_ui(self) -> None:
-        has_cookie = os.path.exists(self.cookie_path)
-        if has_cookie:
-            self.lbl_cookie_status.setText(self.t("cookie_connected"))
-            self.lbl_cookie_status.setStyleSheet("color: #28a745; font-size: 11px;")
-            self.btn_clear_cookie.setEnabled(True)
-        else:
-            self.lbl_cookie_status.setText(self.t("cookie_none"))
-            self.lbl_cookie_status.setStyleSheet("color: #888888; font-size: 11px;")
-            self.btn_clear_cookie.setEnabled(False)
-
-    def import_cookie_file(self) -> None:
-        reply = QMessageBox.warning(
-            self,
-            self.t("cookie_warn_title"),
-            self.t("cookie_warn_msg"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select cookies.txt",
-            "",
-            "Text Files (*.txt);;All Files (*)",
-        )
-        if file_path:
-            success, msg = sanitize_and_save_instagram_cookies(
-                file_path, self.cookie_path, self.current_lang
-            )
-            self.update_cookie_status_ui()
-            if success:
-                QMessageBox.information(self, self.t("success_title"), msg)
-            else:
-                QMessageBox.critical(self, "Error", msg)
-
-    def clear_cookie_file(self) -> None:
-        if os.path.exists(self.cookie_path):
-            reply = QMessageBox.question(
-                self,
-                self.t("cookie_clear_title"),
-                self.t("cookie_clear_msg"),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                try:
-                    os.remove(self.cookie_path)
-                    self.update_cookie_status_ui()
-                    QMessageBox.information(
-                        self, "Success", "Cookie deleted successfully."
-                    )
-                except Exception as e:
-                    QMessageBox.warning(self, "Error", f"Could not remove file: {e}")
-
-    def on_language_changed(self) -> None:
-        self.current_lang = self.cmb_lang.currentData()
-        self.settings.setValue("language", self.current_lang)
-        self.retranslate_ui()
-
-    def retranslate_ui(self) -> None:
-        self.setWindowTitle(self.t("title"))
-        self.title_label.setText(self.t("title"))
-        self.input_group.setTitle(self.t("url_group"))
-        self.chk_clipboard.setText(self.t("clipboard_chk"))
-        self.chk_clipboard.setToolTip(self.t("clipboard_tooltip"))
-        self.btn_inspect.setText(self.t("btn_inspect"))
-        self.btn_clear_input.setText(self.t("btn_clear_input"))
-        self.grid_group.setTitle(self.t("grid_group"))
-        self.btn_select_all.setText(self.t("btn_select_all"))
-        self.btn_delete_selected.setText(self.t("btn_delete_selected"))
-        self.btn_clear_completed.setText(self.t("btn_clear_completed"))
-        self.lbl_path.setText(f"{self.t('save_path_prefix')}{self.save_dir}")
-        self.btn_browse.setText(self.t("btn_browse"))
-        self.btn_open.setText(self.t("btn_open"))
-        self.btn_import_cookie.setText(self.t("btn_import_cookie"))
-        self.btn_clear_cookie.setText(self.t("btn_clear_cookie"))
-        self.btn_download_all.setText(self.t("btn_download_all"))
-        self.btn_cancel.setText(self.t("btn_cancel"))
-        self.lbl_status.setText(self.t("status_ready"))
-        self.update_selection_ui()
-        self.update_cookie_status_ui()
-        self.url_container.retranslate_ui(self.current_lang)
-
-        for card in self.cards:
-            card.retranslate_ui(self.current_lang)
-
-    def apply_dark_theme(self) -> None:
-        self.setStyleSheet(DARK_THEME_QSS)
-
-    def load_saved_settings(self) -> None:
-        self.chk_clipboard.setChecked(
-            self.settings.value("auto_clipboard", True, type=bool)
-        )
-
-    def setup_clipboard_monitor(self) -> None:
-        self.clipboard = QApplication.clipboard()
-        self.clipboard.dataChanged.connect(self.on_clipboard_change)
-
-    def on_clipboard_change(self) -> None:
-        if not self.chk_clipboard.isChecked():
-            return
-
-        text = self.clipboard.text().strip()
-        if not text or text == self.last_clipboard_text:
-            return
-
-        added = self.url_container.add_from_text(text)
-        if added > 0:
-            self.last_clipboard_text = text
-            self.lbl_footer.setText(self.t("footer_clip_detected"))
-            self.lbl_footer.setStyleSheet("color: #28a745; font-size: 10px;")
-
-    def clear_media_grid(self) -> None:
-        """Removes all existing media card widgets from the grid/layout."""
-        while self.cards_layout.count():
-            item = self.cards_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
-        self.cards.clear()
-        self.update_selection_ui()
-
-    def start_inspection(self) -> None:
+    def start_inspection(self):
         targets = self.url_container.get_targets()
         if not targets:
-            QMessageBox.warning(
-                self, "Warning", "Please add at least one Instagram URL."
+            self.lbl_status.setText(
+                "Please enter or paste at least one valid Instagram URL."
             )
             return
 
-        # 1. Clear previous media cards
         self.clear_media_grid()
-
-        # 2. Update UI Controls and Progress Bar
         self.btn_inspect.setEnabled(False)
-        self.btn_download_all.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)  # Reset progress bar
+        self.progress_bar.setValue(0)
         self.lbl_status.setText("Starting inspection...")
 
-        # 3. Extract existing shortcodes from current cards
-        existing_codes = {
-            c.data.get("shortcode") for c in self.cards if c.data.get("shortcode")
-        }
+        cookie_file = self.cookie_manager.get_cookie_file_path()
+        cookie_str = self.cookie_manager.get_cookie_header_string()
 
-        # 4. Start worker using self.inspect_worker
-        self.inspect_worker = InspectionWorker(
+        self.inspect_worker = InspectWorker(
             targets=targets,
-            cookie_path=self.cookie_path,
-            existing_shortcodes=existing_codes,
+            cookie_file=cookie_file,
+            cookie_str=cookie_str,
         )
-        self.inspect_worker.item_inspected.connect(self.on_item_inspected)
-        self.inspect_worker.progress_status.connect(self.on_inspect_status)
+        self.inspect_worker.progress.connect(self.on_inspection_progress)
+        self.inspect_worker.card_ready.connect(self.add_card)
         self.inspect_worker.finished_inspection.connect(self.on_inspection_finished)
+        self.inspect_worker.error.connect(self.on_inspection_error)
         self.inspect_worker.start()
 
-    def on_inspect_status(self, message: str) -> None:
-        self.lbl_status.setText(message)
+    def on_inspection_progress(self, val: int, msg: str):
+        self.progress_bar.setValue(val)
+        self.lbl_status.setText(msg)
 
-    def on_item_inspected(self, item_data: dict) -> None:
-        self.add_card(item_data)
-
-    def on_inspection_finished(self, count: int) -> None:
-        self.progress_bar.setValue(100)  # Mark inspection complete
+    def on_inspection_finished(self, total_count: int):
+        self.progress_bar.setValue(100)
+        self.lbl_status.setText(
+            f"Inspection completed! Found {total_count} items ready."
+        )
         self.btn_inspect.setEnabled(True)
-        self.btn_download_all.setEnabled(len(self.cards) > 0)
         self.btn_cancel.setEnabled(False)
-        self.lbl_status.setText(self.t("inspect_done").format(count=len(self.cards)))
-        self.url_container.clear()
-        self.update_selection_ui()
+        self.update_selection_counter()
 
-    def add_card(self, data: dict) -> None:
-        shortcode = data.get("shortcode")
+    def on_inspection_error(self, err_msg: str):
+        self.lbl_status.setText(f"Inspection Warning: {err_msg}")
 
-        for existing_card in self.cards:
-            if existing_card.data.get("shortcode") == shortcode:
-                return
+    # =========================================================================
+    # Media Card Grid Management
+    # =========================================================================
 
-        card = MediaCardWidget(data, self.current_lang)
-        card.clicked.connect(self.on_card_clicked)
-        card.removed.connect(self.remove_card)
+    def add_card(self, item_data: dict):
+        card = MediaCard(item_data, parent=self.cards_container)
+        card.deleted.connect(lambda: self.remove_card(card))
+        card.selection_changed.connect(self.update_selection_counter)
 
-        self.cards.append(card)
-        self.cards_layout.addWidget(card)
-        card.animate_entry()
+        # Insert before stretch item at the bottom
+        insert_idx = max(0, self.cards_layout.count() - 1)
+        self.cards_layout.insertWidget(insert_idx, card)
+        self.media_cards.append(card)
+        self.update_selection_counter()
 
-        self.update_selection_ui()
-        self.scroll_grid_to_bottom()
-
-    def scroll_grid_to_bottom(self) -> None:
-        QTimer.singleShot(30, self._do_scroll_grid_to_bottom)
-
-    def _do_scroll_grid_to_bottom(self) -> None:
-        scroll_bar = self.scroll_area.verticalScrollBar()
-        self.grid_scroll_anim = QPropertyAnimation(scroll_bar, b"value", self)
-        self.grid_scroll_anim.setDuration(240)
-        self.grid_scroll_anim.setStartValue(scroll_bar.value())
-        self.grid_scroll_anim.setEndValue(scroll_bar.maximum())
-        self.grid_scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.grid_scroll_anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
-
-    def remove_card(self, card: MediaCardWidget) -> None:
-        if card in self.cards:
-            if card.thumb_loader and card.thumb_loader.isRunning():
-                card.thumb_loader.cancel()
-                try:
-                    card.thumb_loader.loaded.disconnect()
-                except Exception:
-                    pass
-                card.thumb_loader.wait(300)
-
-            self.cards.remove(card)
+    def remove_card(self, card: MediaCard):
+        if card in self.media_cards:
+            self.media_cards.remove(card)
             self.cards_layout.removeWidget(card)
             card.deleteLater()
-            self.anchor_card_idx = None
-            self.update_selection_ui()
+            self.update_selection_counter()
 
-    def on_inspection_finished(self, count: int) -> None:
-        self.btn_inspect.setEnabled(True)
-        self.btn_download_all.setEnabled(len(self.cards) > 0)
-        self.btn_cancel.setEnabled(False)
-        self.lbl_status.setText(self.t("inspect_done").format(count=len(self.cards)))
-        self.url_container.clear()
-        self.update_selection_ui()
+    def clear_media_grid(self):
+        for card in list(self.media_cards):
+            self.cards_layout.removeWidget(card)
+            card.deleteLater()
+        self.media_cards.clear()
+        self.update_selection_counter()
 
-    def start_download_all(self) -> None:
-        # 1. Check if the grid has any items at all
-        if not self.cards:
-            QMessageBox.warning(self, "Warning", "No media items in queue to download.")
-            return
+    def select_all_cards(self):
+        for card in self.media_cards:
+            card.set_selected(True)
+        self.update_selection_counter()
 
-        # 2. Determine target cards (selected cards or all cards in queue)
-        selected_cards = [c for c in self.cards if c.is_selected]
-        targets = selected_cards if selected_cards else self.cards
+    def delete_selected_cards(self):
+        for card in list(self.media_cards):
+            if card.is_selected():
+                self.remove_card(card)
 
-        # 3. Filter only cards that are NOT completed yet
-        target_cards = [c for c in targets if not c.is_completed]
+    def clear_completed_cards(self):
+        for card in list(self.media_cards):
+            if card.get_status().lower() == "completed":
+                self.remove_card(card)
 
-        if not target_cards:
-            QMessageBox.information(
-                self, "Info", "All items in the queue are already downloaded."
-            )
+    def update_selection_counter(self):
+        selected = sum(1 for c in self.media_cards if c.is_selected())
+        total = len(self.media_cards)
+        self.lbl_selection_count.setText(f"Selected: {selected} / {total} items")
+
+    # =========================================================================
+    # Download Flow
+    # =========================================================================
+
+    def start_download(self):
+        selected_cards = [c for c in self.media_cards if c.is_selected()]
+        items_to_download = selected_cards if selected_cards else self.media_cards
+
+        if not items_to_download:
+            self.lbl_status.setText("No items in queue to download.")
             return
 
         self.btn_download_all.setEnabled(False)
-        self.btn_inspect.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.progress_bar.setValue(0.0)
+        self.progress_bar.setValue(0)
 
-        self.download_worker = GridDownloadWorker(
-            target_cards, self.save_dir, self.cookie_path
+        # Spawn DownloadWorker
+        payload = [c.get_payload() for c in items_to_download]
+        self.download_worker = DownloadWorker(
+            items=payload,
+            download_dir=self.download_path,
+            cookie_file=self.cookie_manager.get_cookie_file_path(),
         )
-        self.download_worker.item_started.connect(self.on_item_download_started)
-        self.download_worker.item_finished.connect(self.on_item_download_finished)
-        self.download_worker.progress_signal.connect(self.update_progress)
-        self.download_worker.all_finished.connect(self.on_all_downloads_finished)
+        self.download_worker.progress.connect(self.on_download_progress)
+        self.download_worker.item_completed.connect(self.on_item_download_completed)
+        self.download_worker.finished_download.connect(self.on_download_finished)
         self.download_worker.start()
 
-    def on_item_download_started(
-        self, card_idx: int, total: int, shortcode: str
-    ) -> None:
-        if self.download_worker and card_idx < len(self.download_worker.target_cards):
-            card = self.download_worker.target_cards[card_idx]
-            card.lbl_status.setText("Downloading...")
-            card.lbl_status.setStyleSheet("color: #fa7e1e; font-size: 11px;")
-        self.lbl_status.setText(f"Downloading [{card_idx + 1}/{total}]: {shortcode}")
+    def on_download_progress(self, val: int, msg: str):
+        self.progress_bar.setValue(val)
+        self.lbl_status.setText(msg)
 
-    def on_item_download_finished(
-        self, card_idx: int, ok: bool, text: str, saved_path: str
-    ) -> None:
-        if self.download_worker and card_idx < len(self.download_worker.target_cards):
-            card = self.download_worker.target_cards[card_idx]
-            if ok:
-                card.mark_completed(saved_path)
-            else:
-                card.lbl_status.setText("✖ Failed")
-                card.lbl_status.setStyleSheet("color: #dc3545; font-size: 11px;")
+    def on_item_download_completed(self, item_id: str, success: bool):
+        for card in self.media_cards:
+            if card.item_id == item_id:
+                card.set_status("Completed" if success else "Failed")
+                break
 
-    def update_progress(self, d: dict) -> None:
-        self.progress_bar.setValue(int(d["percent"]))
-        dl_mb = d["downloaded"] / (1024 * 1024)
-        total_mb = d["total"] / (1024 * 1024) if d["total"] else 0
-        speed = d["speed"]
-        speed_str = (
-            f"{speed / (1024 * 1024):.2f} MB/s"
-            if speed > 1024 * 1024
-            else f"{speed / 1024:.1f} KB/s"
+    def on_download_finished(self, success_count: int, fail_count: int):
+        self.progress_bar.setValue(100)
+        self.lbl_status.setText(
+            f"Download finished! Completed: {success_count}, Failed: {fail_count}"
         )
-        if total_mb > 0:
-            self.lbl_status.setText(
-                f"Downloading... {dl_mb:.2f} / {total_mb:.2f} MB ({speed_str})"
-            )
-
-    def on_all_downloads_finished(
-        self, success: int, fail: int, is_cancelled: bool
-    ) -> None:
-        self.btn_inspect.setEnabled(True)
         self.btn_download_all.setEnabled(True)
         self.btn_cancel.setEnabled(False)
-        self.progress_bar.setValue(100 if not is_cancelled else 0)
 
-        if is_cancelled:
-            self.lbl_status.setText(self.t("status_cancelled"))
-            return
+    def cancel_current_task(self):
+        if self.inspect_worker and self.inspect_worker.isRunning():
+            self.inspect_worker.cancel()
+            self.lbl_status.setText("Cancelling inspection...")
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.cancel()
+            self.lbl_status.setText("Cancelling download...")
 
-        self.lbl_status.setText(f"Finished: {success} Success | {fail} Failed")
-        QMessageBox.information(
-            self,
-            self.t("success_title"),
-            self.t("success_msg").format(success=success, path=self.save_dir),
+    # =========================================================================
+    # Directory & Cookie Configuration
+    # =========================================================================
+
+    def browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Save Folder", self.download_path
         )
+        if folder:
+            self.download_path = folder
+            self.lbl_save_folder.setText(f"Save Folder: {self.download_path}")
 
-    def cancel_operation(self) -> None:
-        if self.inspect_worker and self.inspect_worker.isRunning():
-            self.inspect_worker.cancel()
-        if self.download_worker and self.download_worker.isRunning():
-            self.download_worker.cancel()
-        self.lbl_status.setText(self.t("status_cancelled"))
-        self.btn_cancel.setEnabled(False)
+    def open_save_folder(self):
+        if os.path.exists(self.download_path):
+            os.startfile(self.download_path)
 
-    def browse_folder(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "Select Folder", self.save_dir)
-        if chosen:
-            self.save_dir = chosen
-            self.lbl_path.setText(f"{self.t('save_path_prefix')}{self.save_dir}")
-
-    def open_folder(self) -> None:
-        os.makedirs(self.save_dir, exist_ok=True)
-        if sys.platform == "win32":
-            os.startfile(os.path.normpath(self.save_dir))
+    def _check_cookie_status(self):
+        if self.cookie_manager.has_valid_cookie():
+            self.lbl_cookie_status.setText("Cookie: Connected (Instagram)")
+            self.lbl_cookie_status.setStyleSheet("color: #4cd964;")
         else:
-            subprocess.Popen(["xdg-open", self.save_dir])
+            self.lbl_cookie_status.setText("Cookie: Disconnected")
+            self.lbl_cookie_status.setStyleSheet("color: #ff3b30;")
 
-    def closeEvent(self, event: QCloseEvent) -> None:
-        if self.inspect_worker and self.inspect_worker.isRunning():
-            self.inspect_worker.cancel()
-            try:
-                self.inspect_worker.item_inspected.disconnect()
-                self.inspect_worker.finished_inspection.disconnect()
-                self.inspect_worker.progress_status.disconnect()
-            except Exception:
-                pass
-            self.inspect_worker.wait(1000)
+    def import_cookie(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Instagram Cookies",
+            "",
+            "Text/Cookie Files (*.txt *.json);;All Files (*.*)",
+        )
+        if file_path:
+            self.cookie_manager.import_from_file(file_path)
+            self._check_cookie_status()
 
-        if self.download_worker and self.download_worker.isRunning():
-            self.download_worker.cancel()
-            try:
-                self.download_worker.item_started.disconnect()
-                self.download_worker.item_finished.disconnect()
-                self.download_worker.progress_signal.disconnect()
-                self.download_worker.all_finished.disconnect()
-            except Exception:
-                pass
-            self.download_worker.wait(1000)
-
-        for card in self.cards:
-            if card.thumb_loader and card.thumb_loader.isRunning():
-                card.thumb_loader.cancel()
-                try:
-                    card.thumb_loader.loaded.disconnect()
-                except Exception:
-                    pass
-                card.thumb_loader.wait(300)
-
-        self.settings.setValue("save_dir", self.save_dir)
-        self.settings.setValue("auto_clipboard", self.chk_clipboard.isChecked())
-        self.settings.setValue("language", self.current_lang)
-        event.accept()
-
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    def clear_cookie(self):
+        self.cookie_manager.clear_cookies()
+        self._check_cookie_status()

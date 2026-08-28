@@ -1,1371 +1,931 @@
 """
-core/inspect_worker.py - Background QThread for inspecting Instagram media payloads.
-Features Dedicated User Stories Engine, Profile Feed Scraper, Infinite Reels Pagination,
-Duplicate Detection, Netscape #HttpOnly_ Parsing, and yt-dlp Auto-Fallback.
+Instagram Media Inspection Worker
+Multi-tier crawler for Reels tabs, creator profiles, single posts, and stories.
 """
 
 import json
-import os
-import random
+import re
+import ssl
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
-from PyQt6.QtCore import QThread, pyqtSignal
+from typing import Any, Dict, List, Optional
+
 import yt_dlp
-import re
+from PyQt6.QtCore import QThread, pyqtSignal
 
-from config.constants import DESKTOP_UA, IG_APP_ID, MOBILE_UA
-from core.cookie_manager import get_cookie_opener
+from config.constants import (
+    DEFAULT_USER_AGENT,
+    IG_APP_ID,
+    MOBILE_USER_AGENT,
+)
 from core.parser import parse_instagram_url
-from utils.logger import SilentLogger
+from utils.logger import logger
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
+try:
+    from config.constants import (
+        DEFAULT_USER_AGENT,
+        MOBILE_USER_AGENT,
+        IG_APP_ID,
+        IG_ASBD_ID,
+    )
+except ImportError:
+    DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    MOBILE_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 290.0.0.13.111"
+    IG_APP_ID = "936619743392459"
+    IG_ASBD_ID = "129477"
+
+try:
+    from core.parser import parse_instagram_url, normalize_url
+except ImportError:
+
+    def parse_instagram_url(url: str) -> Dict[str, Any]:
+        return {"url": url, "type": "unknown"}
+
+    def normalize_url(url: str) -> str:
+        return url
 
 
-class InspectionWorker(QThread):
-    item_inspected = pyqtSignal(dict)
-    finished_inspection = pyqtSignal(int)
-    progress_status = pyqtSignal(str)
+try:
+    from utils.logger import logger
+except ImportError:
+    import logging
+
+    logger = logging.getLogger("InspectWorker")
+
+
+class InspectWorker(QThread):
+    progress = pyqtSignal(int, str)  # (percentage, status_text)
+    card_ready = pyqtSignal(dict)  # (media_item_data)
+    finished_inspection = pyqtSignal(int)  # (total_found_items)
+    error = pyqtSignal(str)  # (error_message)
 
     def __init__(
         self,
-        targets: list[dict | str],
-        cookie_path: str | None,
-        existing_shortcodes: set[str] | None = None,
+        targets: List[str],
+        cookie_file: Optional[str] = None,
+        cookie_str: Optional[str] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.targets = targets
-        self.cookie_path = cookie_path
-        self.existing_shortcodes = (
-            set(existing_shortcodes) if existing_shortcodes else set()
-        )
+        self.cookie_file = cookie_file
+        self.cookie_str = cookie_str
         self._is_cancelled = False
+        self.ssl_context = ssl.create_default_context()
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = ssl.CERT_NONE
 
-    def cancel(self) -> None:
+    def cancel(self):
         self._is_cancelled = True
-        self.requestInterruption()
-
-    def _should_terminate(self) -> bool:
-        return self._is_cancelled or self.isInterruptionRequested()
 
     # -------------------------------------------------------------------------
-    # Cookie & Header Management
+    # Network & Cookie Session Management
     # -------------------------------------------------------------------------
 
-    def _get_csrf_token(self) -> str:
-        if not self.cookie_path or not os.path.exists(self.cookie_path):
-            return ""
+    def _build_network_opener(self) -> urllib.request.OpenerDirector:
+        """Constructs an urllib opener with SSL bypass and cookie jar."""
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            try:
+                self.cookie_jar.load(
+                    self.cookie_file, ignore_discard=True, ignore_expires=True
+                )
+            except Exception as e:
+                logger.warning(f"Could not load cookies via MozillaCookieJar: {e}")
+                self._load_cookies_manual(self.cookie_file)
+
+        self.csrf_token = self._get_cookie_value("csrftoken") or ""
+
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        https_handler = urllib.request.HTTPSHandler(context=ssl_ctx)
+        cookie_handler = urllib.request.HTTPCookieProcessor(self.cookie_jar)
+        return urllib.request.build_opener(cookie_handler, https_handler)
+
+    def _load_cookies_manual(self, filepath: str):
+        """Fallback line-by-line parser for Netscape cookies.txt files."""
         try:
-            with open(self.cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    clean_line = line.strip()
-                    # Strip Netscape HttpOnly prefix to prevent token drop
-                    if clean_line.startswith("#HttpOnly_"):
-                        clean_line = clean_line[len("#HttpOnly_") :]
-                    elif clean_line.startswith("#"):
+                    line = line.strip()
+                    if not line or line.startswith("#"):
                         continue
+                    parts = line.split("\t")
+                    if len(parts) >= 7:
+                        domain, flag, path, secure, expires, name, value = parts[:7]
+                        c = http.cookiejar.Cookie(
+                            version=0,
+                            name=name,
+                            value=value,
+                            port=None,
+                            port_specified=False,
+                            domain=domain,
+                            domain_specified=True,
+                            domain_initial_dot=domain.startswith("."),
+                            path=path,
+                            path_specified=True,
+                            secure=secure.lower() == "true",
+                            expires=int(expires) if expires.isdigit() else None,
+                            discard=False,
+                            comment=None,
+                            comment_url=None,
+                            rest={"HttpOnly": None},
+                            rfc2109=False,
+                        )
+                        self.cookie_jar.set_cookie(c)
+        except Exception as e:
+            logger.error(f"Manual cookie loading failed: {e}")
 
-                    if "csrftoken" in clean_line:
-                        parts = clean_line.split("\t")
-                        if len(parts) >= 7:
-                            return parts[6].strip()
-        except Exception:
-            pass
-        return ""
+    def _get_cookie_value(self, name: str) -> Optional[str]:
+        """Retrieves a specific cookie value from the active jar."""
+        for cookie in self.cookie_jar:
+            if cookie.name == name:
+                return cookie.value
+        return None
 
-    def _build_web_headers(self, referer_url: str) -> dict:
-        csrf = self._get_csrf_token()
-        headers = {
-            "User-Agent": DESKTOP_UA,
-            "X-IG-App-ID": IG_APP_ID,
-            "X-ASBD-ID": "129477",
-            "X-IG-WWW-Claim": "0",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": referer_url,
+    def _make_request(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[bytes] = None,
+        method: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Executes an HTTP request and parses JSON response."""
+        if self._is_cancelled:
+            return None
+
+        req_headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
+            "X-IG-App-ID": IG_APP_ID,
+            "X-ASBD-ID": IG_ASBD_ID,
+            "X-IG-WWW-Claim": "0",
+            "Origin": "https://www.instagram.com",
+            "Referer": "https://www.instagram.com/",
             "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
         }
-        if csrf:
-            headers["X-CSRFToken"] = csrf
+
+        if self.csrf_token:
+            req_headers["X-CSRFToken"] = self.csrf_token
+
+        if headers:
+            req_headers.update(headers)
+
+        req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+        try:
+            with self.opener.open(req, timeout=18) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            logger.debug(f"HTTP Error {e.code} for {url}")
+            return None
+        except Exception as e:
+            logger.debug(f"Request failed for {url}: {e}")
+            return None
+
+    # -------------------------------------------------------------------------
+    # Target Execution Lifecycle
+    # -------------------------------------------------------------------------
+
+    def run(self):
+        total_items_emitted = 0
+        self.progress.emit(5, "Initializing media inspection...")
+
+        for idx, target_raw in enumerate(self.targets):
+            if self._is_cancelled:
+                break
+
+            parsed = parse_instagram_url(target_raw)
+            if not parsed:
+                logger.warning(f"Unable to parse target URL: {target_raw}")
+                continue
+
+            target_type = parsed["type"]
+            target_val = parsed["target"]
+
+            self.progress.emit(
+                10 + int((idx / max(len(self.targets), 1)) * 80),
+                f"Inspecting [{target_type}]: {target_val}...",
+            )
+
+            try:
+                if target_type == "profile_reels":
+                    found = self._fetch_all_reels_multi_tier(
+                        target_val, parsed["clean_url"]
+                    )
+                    total_items_emitted += found
+                elif target_type in ("reel", "post"):
+                    found = self._inspect_single_post(
+                        target_val, parsed["clean_url"], target_type
+                    )
+                    total_items_emitted += found
+                elif target_type == "profile":
+                    found = self._fetch_all_reels_multi_tier(
+                        target_val, parsed["clean_url"]
+                    )
+                    total_items_emitted += found
+                else:
+                    found = self._inspect_with_ytdlp(parsed["clean_url"])
+                    total_items_emitted += found
+            except Exception as e:
+                logger.error(f"Inspection error on {target_raw}: {e}", exc_info=True)
+                self.error.emit(f"Error inspecting {target_val}: {str(e)}")
+
+        self.progress.emit(
+            100, f"Inspection completed! Found {total_items_emitted} items ready."
+        )
+        self.finished_inspection.emit(total_items_emitted)
+
+    # =========================================================================
+    # Request Helpers
+    # =========================================================================
+
+    def _get_headers(self, is_mobile: bool = False) -> Dict[str, str]:
+        headers = {
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-IG-App-ID": IG_APP_ID,
+        }
+        if is_mobile:
+            headers.update(
+                {
+                    "User-Agent": MOBILE_USER_AGENT,
+                    "X-IG-Capabilities": "36r/Fx8=",
+                    "X-IG-Connection-Type": "WIFI",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                }
+            )
+        else:
+            headers.update(
+                {
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Referer": "https://www.instagram.com/",
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+            )
+
+        if self.cookie_str:
+            headers["Cookie"] = self.cookie_str
+            csrf_match = re.search(r"csrftoken=([a-zA-Z0-9_-]+)", self.cookie_str)
+            if csrf_match:
+                headers["X-CSRFToken"] = csrf_match.group(1)
+
         return headers
 
-    def _safe_fetch_json(
+    def _http_request(
         self,
-        req: urllib.request.Request,
-        opener: urllib.request.OpenerDirector,
-        timeout: int = 12,
-        max_retries: int = 3,
-    ) -> dict | None:
-        for attempt in range(1, max_retries + 1):
-            if self._should_terminate():
-                return None
-            try:
-                with opener.open(req, timeout=timeout) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-                    return json.loads(raw)
-            except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    wait_time = attempt * 8
-                    self.progress_status.emit(
-                        f"⚠️ Rate limited (429). Throttling {wait_time}s..."
-                    )
-                    time.sleep(wait_time)
-                elif e.code in (401, 403):
-                    self.progress_status.emit(
-                        "⚠️ Session checkpoint/unauthorized (401/403)."
-                    )
-                    return None
-                else:
-                    time.sleep(1.5)
-            except Exception:
-                time.sleep(1.0)
-        return None
+        url: str,
+        data: Optional[Dict[str, Any]] = None,
+        is_mobile: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        headers = self._get_headers(is_mobile=is_mobile)
+        req_data = None
+        if data is not None:
+            req_data = urllib.parse.urlencode(data).encode("utf-8")
+
+        req = urllib.request.Request(url, data=req_data, headers=headers)
+        try:
+            with urllib.request.urlopen(
+                req, context=self.ssl_context, timeout=15
+            ) as resp:
+                raw_bytes = resp.read()
+                return json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+        except Exception as e:
+            logger.debug(f"HTTP request failed for {url}: {e}")
+            return None
 
     # -------------------------------------------------------------------------
-    # User ID Resolvers
+    # Robust User ID Resolution
     # -------------------------------------------------------------------------
 
-    def _get_user_id(
-        self, username: str, opener: urllib.request.OpenerDirector
-    ) -> int | None:
-        # Method 1: Web Profile Info API
-        try:
-            headers = self._build_web_headers(f"https://www.instagram.com/{username}/")
-            profile_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-            req = urllib.request.Request(profile_url, headers=headers)
-            data = self._safe_fetch_json(req, opener, timeout=10)
-            if data:
-                user_data = data.get("data", {}).get("user")
-                if user_data:
-                    user_id = user_data.get("id") or user_data.get("pk")
-                    if user_id:
-                        return int(user_id)
-        except Exception:
-            pass
+    def _get_user_id(self, username: str) -> Optional[str]:
+        """Resolves numeric user ID using Web Profile Info, Mobile API, and HTML Regex."""
+        # Strategy 1: Web Profile Info API
+        url_web = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+        data_web = self._http_request(url_web, is_mobile=False)
+        if data_web and "data" in data_web and data_web["data"].get("user"):
+            uid = data_web["data"]["user"].get("id")
+            if uid:
+                return str(uid)
 
-        # Method 2: Mobile Username Info API
-        try:
-            url = f"https://i.instagram.com/api/v1/users/{username}/usernameinfo/"
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": MOBILE_UA,
-                    "X-IG-App-ID": IG_APP_ID,
-                    "Accept": "*/*",
-                },
-            )
-            data = self._safe_fetch_json(req, opener, timeout=10)
-            if data:
-                user_pk = data.get("user", {}).get("pk") or data.get("user", {}).get(
-                    "pk_id"
-                )
-                if user_pk:
-                    return int(user_pk)
-        except Exception:
-            pass
+        # Strategy 2: Mobile Lookup API
+        url_lookup = f"https://i.instagram.com/api/v1/users/lookup/?username={username}"
+        data_lookup = self._http_request(url_lookup, is_mobile=True)
+        if data_lookup and "user" in data_lookup:
+            uid = data_lookup["user"].get("pk") or data_lookup["user"].get("id")
+            if uid:
+                return str(uid)
 
-        # Method 3: Direct Web Page HTML Scraping for User ID
+        # Strategy 3: Direct Profile HTML Regex Scanning
         try:
-            headers = self._build_web_headers(f"https://www.instagram.com/{username}/")
+            profile_url = f"https://www.instagram.com/{username}/"
             req = urllib.request.Request(
-                f"https://www.instagram.com/{username}/", headers=headers
+                profile_url, headers=self._get_headers(is_mobile=False)
             )
-            with opener.open(req, timeout=10) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-                m = (
-                    re.search(r'"user_id":"(\d+)"', html)
-                    or re.search(r'"owner":{"id":"(\d+)"}', html)
-                    or re.search(r'"id":"(\d+)"', html)
-                )
-                if m:
-                    return int(m.group(1))
-        except Exception:
-            pass
+            with urllib.request.urlopen(
+                req, context=self.ssl_context, timeout=12
+            ) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+                for pattern in [
+                    r'"user_id":"(\d+)"',
+                    r'"profile_id":"(\d+)"',
+                    r'"owner":\{"id":"(\d+)"\}',
+                    r'"props":\{"id":"(\d+)"\}',
+                ]:
+                    m = re.search(pattern, html)
+                    if m:
+                        return m.group(1)
+        except Exception as e:
+            logger.debug(f"HTML scraping user_id fallback failed for @{username}: {e}")
 
         return None
 
-    # -------------------------------------------------------------------------
-    # Scrapers (Stories, Feed, Reels)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Multi-Tier Reels Inspection Engine
+    # =========================================================================
 
-    def _fetch_user_stories_web(
-        self, username: str, user_id: int, opener: urllib.request.OpenerDirector
-    ) -> int:
-        found_count = 0
+    def _fetch_all_reels_multi_tier(self, username: str, target_url: str) -> int:
         seen_codes = set()
-        headers = self._build_web_headers(
-            f"https://www.instagram.com/stories/{username}/"
-        )
-        self.progress_status.emit(f"Fetching active stories from @{username}...")
+        user_id = self._get_user_id(username)
 
-        try:
-            story_url = (
-                f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}"
+        # --- Tier 1: Mobile Clips API Pagination (Primary) ---
+        if user_id:
+            logger.info(
+                f"Starting Tier 1 Clips API pagination for @{username} (ID: {user_id})"
             )
-            req = urllib.request.Request(story_url, headers=headers)
-            data = self._safe_fetch_json(req, opener, timeout=12)
-            if not data:
-                return 0
-
-            reels_data = data.get("reels", {}) or data.get("reels_media", {})
-            user_reel = {}
-            if isinstance(reels_data, dict):
-                user_reel = reels_data.get(str(user_id), {})
-            elif isinstance(reels_data, list) and reels_data:
-                user_reel = reels_data[0]
-
-            items = user_reel.get("items", [])
-            for post in items:
-                if self._should_terminate():
-                    break
-
-                story_pk = str(post.get("pk") or post.get("id", ""))
-                if (
-                    not story_pk
-                    or story_pk in seen_codes
-                    or story_pk in self.existing_shortcodes
-                ):
-                    continue
-                seen_codes.add(story_pk)
-
-                v_list = post.get("video_versions", [])
-                is_story_video = bool(
-                    v_list or post.get("is_video") or post.get("media_type") == 2
-                )
-                cands = post.get("image_versions2", {}).get("candidates", [])
-                thumb = cands[0]["url"] if cands else ""
-
-                single_item = {
-                    "url": f"https://www.instagram.com/stories/{username}/{story_pk}/",
-                    "shortcode": story_pk,
-                    "uploader": username,
-                    "thumb_url": thumb,
-                    "media_type": "story",
-                    "slides_count": 1,
-                    "format_options": [],
-                    "raw_media_items": [],
-                }
-
-                if is_story_video:
-                    best_v = (
-                        max(v_list, key=lambda x: int(x.get("width", 0)))
-                        if v_list
-                        else {}
-                    )
-                    vw = best_v.get("width", 1080)
-                    vh = best_v.get("height", 1920)
-                    single_item["format_options"] = [
-                        {
-                            "label": f"🎬 Story Video ({vw}x{vh} - Best)",
-                            "key": "story_video",
-                        },
-                        {
-                            "label": "🎵 Audio Only (MP3 192kbps)",
-                            "key": "audio_mp3",
-                        },
-                    ]
-                    if best_v.get("url"):
-                        single_item["raw_media_items"].append(
-                            {
-                                "url": best_v["url"],
-                                "ext": "mp4",
-                                "is_video": True,
-                            }
-                        )
-                else:
-                    w = cands[0].get("width", 1080) if cands else 1080
-                    h = cands[0].get("height", 1920) if cands else 1920
-                    single_item["format_options"] = [
-                        {
-                            "label": f"🖼️ Story Photo ({w}x{h} - Original)",
-                            "key": "story_photo",
-                        }
-                    ]
-                    if cands:
-                        best_s = max(cands, key=lambda x: int(x.get("width", 0)))
-                        single_item["raw_media_items"].append(
-                            {
-                                "url": best_s["url"],
-                                "ext": "jpg",
-                                "is_video": False,
-                            }
-                        )
-
-                self.item_inspected.emit(single_item)
-                found_count += 1
-                self.progress_status.emit(
-                    f"Found [{found_count}] stories from @{username}"
-                )
-                time.sleep(0.05)
-
-        except Exception as e:
-            print(f"[DEBUG] Story fetch error: {e}")
-
-        return found_count
-
-    def _fetch_profile_feed_web(
-        self, username: str, opener: urllib.request.OpenerDirector, scope: str = "all"
-    ) -> int:
-        found_count = 0
-        seen_codes = set()
-        seen_cursors = set()
-        user_id = None
-        headers = self._build_web_headers(f"https://www.instagram.com/{username}/")
-
-        self.progress_status.emit(f"Loading Feed from @{username} (Mode: {scope})...")
-        try:
-            profile_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-            req = urllib.request.Request(profile_url, headers=headers)
-            data = self._safe_fetch_json(req, opener, timeout=12)
-
-            if data:
-                user_data = data.get("data", {}).get("user", {})
-                user_id = user_data.get("id") or user_data.get("pk")
-                timeline_edges = user_data.get("edge_owner_to_timeline_media", {}).get(
-                    "edges", []
-                )
-                felix_edges = user_data.get("edge_felix_video_timeline", {}).get(
-                    "edges", []
-                )
-
-                all_edges = (
-                    felix_edges + timeline_edges
-                    if scope in ("all", "videos_only")
-                    else timeline_edges
-                )
-
-                for edge in all_edges:
-                    if self._should_terminate():
-                        break
-                    node = edge.get("node", {})
-                    sc = node.get("shortcode") or node.get("id")
-                    if not sc or sc in seen_codes or sc in self.existing_shortcodes:
-                        continue
-                    seen_codes.add(sc)
-                    self.existing_shortcodes.add(sc)
-
-                    typename = node.get("__typename", "")
-                    is_vid = bool(node.get("is_video") or typename == "GraphVideo")
-                    thumb = node.get("display_url", "")
-
-                    if (
-                        scope == "videos_only"
-                        and not is_vid
-                        and typename != "GraphSidecar"
-                    ):
-                        continue
-                    if scope == "photos_only" and is_vid:
-                        continue
-
-                    if typename == "GraphSidecar":
-                        children = node.get("edge_sidecar_to_children", {}).get(
-                            "edges", []
-                        )
-                        raw_media = []
-                        for c in children:
-                            c_node = c.get("node", {})
-                            c_is_vid = c_node.get("is_video", False)
-                            c_url = (
-                                c_node.get("video_url")
-                                if c_is_vid
-                                else c_node.get("display_url")
-                            )
-                            if not c_url:
-                                continue
-
-                            if scope == "photos_only" and c_is_vid:
-                                continue
-                            if scope == "videos_only" and not c_is_vid:
-                                continue
-
-                            raw_media.append(
-                                {
-                                    "url": c_url,
-                                    "ext": "mp4" if c_is_vid else "jpg",
-                                    "is_video": c_is_vid,
-                                }
-                            )
-
-                        if not raw_media:
-                            continue
-
-                        single_item = {
-                            "url": f"https://www.instagram.com/p/{sc}/",
-                            "shortcode": sc,
-                            "uploader": username,
-                            "thumb_url": thumb,
-                            "media_type": "carousel",
-                            "slides_count": len(raw_media),
-                            "format_options": [
-                                {
-                                    "label": f"⚡ Best Quality - {len(raw_media)} Items",
-                                    "key": "best_all",
-                                }
-                            ],
-                            "raw_media_items": raw_media,
-                        }
-
-                    elif is_vid:
-                        video_url = node.get("video_url", "")
-                        single_item = {
-                            "url": f"https://www.instagram.com/reel/{sc}/",
-                            "shortcode": sc,
-                            "uploader": username,
-                            "thumb_url": thumb,
-                            "media_type": "video",
-                            "slides_count": 1,
-                            "format_options": [
-                                {
-                                    "label": "🎬 Best Video (Highest Quality)",
-                                    "key": "video_best",
-                                },
-                                {
-                                    "label": "🎞️ H.264 Compatibility Mode",
-                                    "key": "video_h264",
-                                },
-                                {
-                                    "label": "🎵 Audio Only (MP3 192kbps)",
-                                    "key": "audio_mp3",
-                                },
-                            ],
-                            "raw_media_items": [],
-                        }
-                        if video_url:
-                            single_item["raw_media_items"].append(
-                                {
-                                    "url": video_url,
-                                    "ext": "mp4",
-                                    "is_video": True,
-                                }
-                            )
-
-                    else:
-                        single_item = {
-                            "url": f"https://www.instagram.com/p/{sc}/",
-                            "shortcode": sc,
-                            "uploader": username,
-                            "thumb_url": thumb,
-                            "media_type": "photo",
-                            "slides_count": 1,
-                            "format_options": [
-                                {
-                                    "label": "🖼️ Original Resolution",
-                                    "key": "best_single",
-                                },
-                                {
-                                    "label": "🖼️ Compressed Web Size",
-                                    "key": "720p_single",
-                                },
-                            ],
-                            "raw_media_items": [
-                                {"url": thumb, "ext": "jpg", "is_video": False}
-                            ],
-                        }
-
-                    self.item_inspected.emit(single_item)
-                    found_count += 1
-                    self.progress_status.emit(
-                        f"Found [{found_count}] items ({scope}) from @{username}"
-                    )
-                    time.sleep(0.02)
-        except Exception as e:
-            print(f"[DEBUG] Profile Feed initial fetch error: {e}")
-
-        # Paginated Feed Crawl
-        if user_id and not self._should_terminate():
             max_id = None
-            page_num = 2
+            page_count = 0
 
-            while not self._should_terminate():
-                self.progress_status.emit(
-                    f"Fetching Feed page {page_num} ({scope}) from @{username}..."
-                )
-                feed_url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
-                if max_id:
-                    feed_url += f"?max_id={urllib.parse.quote(str(max_id))}"
-
-                req = urllib.request.Request(feed_url, headers=headers)
-                f_data = self._safe_fetch_json(req, opener, timeout=12)
-                if not f_data:
-                    break
-
-                raw_items = f_data.get("items", [])
-                if not raw_items:
-                    break
-
-                batch_added = 0
-                for post in raw_items:
-                    if self._should_terminate():
-                        break
-                    sc = post.get("code")
-                    if not sc or sc in seen_codes or sc in self.existing_shortcodes:
-                        continue
-                    seen_codes.add(sc)
-                    self.existing_shortcodes.add(sc)
-
-                    m_type_num = post.get("media_type", 1)
-                    is_post_vid = bool(m_type_num == 2 or post.get("is_video", False))
-                    cands = post.get("image_versions2", {}).get("candidates", [])
-                    thumb = cands[0]["url"] if cands else ""
-
-                    if scope == "videos_only" and not is_post_vid and m_type_num != 8:
-                        continue
-                    if scope == "photos_only" and is_post_vid:
-                        continue
-
-                    if m_type_num == 8 and "carousel_media" in post:
-                        slides = post.get("carousel_media", [])
-                        raw_media = []
-                        for s in slides:
-                            v_list = s.get("video_versions", [])
-                            is_s_vid = bool(
-                                v_list or s.get("is_video") or s.get("media_type") == 2
-                            )
-                            if scope == "photos_only" and is_s_vid:
-                                continue
-                            if scope == "videos_only" and not is_s_vid:
-                                continue
-
-                            if is_s_vid and v_list:
-                                best_v = max(
-                                    v_list, key=lambda x: int(x.get("width", 0))
-                                )
-                                raw_media.append(
-                                    {
-                                        "url": best_v["url"],
-                                        "ext": "mp4",
-                                        "is_video": True,
-                                    }
-                                )
-                            else:
-                                s_cands = s.get("image_versions2", {}).get(
-                                    "candidates", []
-                                )
-                                if s_cands:
-                                    best_s = max(
-                                        s_cands, key=lambda x: int(x.get("width", 0))
-                                    )
-                                    raw_media.append(
-                                        {
-                                            "url": best_s["url"],
-                                            "ext": "jpg",
-                                            "is_video": False,
-                                        }
-                                    )
-
-                        if not raw_media:
-                            continue
-
-                        single_item = {
-                            "url": f"https://www.instagram.com/p/{sc}/",
-                            "shortcode": sc,
-                            "uploader": username,
-                            "thumb_url": thumb,
-                            "media_type": "carousel",
-                            "slides_count": len(raw_media),
-                            "format_options": [
-                                {
-                                    "label": f"⚡ Best Quality - {len(raw_media)} Items",
-                                    "key": "best_all",
-                                }
-                            ],
-                            "raw_media_items": raw_media,
-                        }
-
-                    elif is_post_vid:
-                        v_list = post.get("video_versions", [])
-                        single_item = {
-                            "url": f"https://www.instagram.com/reel/{sc}/",
-                            "shortcode": sc,
-                            "uploader": username,
-                            "thumb_url": thumb,
-                            "media_type": "video",
-                            "slides_count": 1,
-                            "format_options": [
-                                {
-                                    "label": "🎬 Best Video (Highest Quality)",
-                                    "key": "video_best",
-                                },
-                                {
-                                    "label": "🎞️ H.264 Compatibility Mode",
-                                    "key": "video_h264",
-                                },
-                                {
-                                    "label": "🎵 Audio Only (MP3 192kbps)",
-                                    "key": "audio_mp3",
-                                },
-                            ],
-                            "raw_media_items": [],
-                        }
-                        if v_list:
-                            best_v = max(v_list, key=lambda x: int(x.get("width", 0)))
-                            if best_v.get("url"):
-                                single_item["raw_media_items"].append(
-                                    {
-                                        "url": best_v["url"],
-                                        "ext": "mp4",
-                                        "is_video": True,
-                                    }
-                                )
-
-                    else:
-                        single_item = {
-                            "url": f"https://www.instagram.com/p/{sc}/",
-                            "shortcode": sc,
-                            "uploader": username,
-                            "thumb_url": thumb,
-                            "media_type": "photo",
-                            "slides_count": 1,
-                            "format_options": [
-                                {
-                                    "label": "🖼️ Original Resolution",
-                                    "key": "best_single",
-                                },
-                                {
-                                    "label": "🖼️ Compressed Web Size",
-                                    "key": "720p_single",
-                                },
-                            ],
-                            "raw_media_items": [],
-                        }
-                        if cands:
-                            best_s = max(cands, key=lambda x: int(x.get("width", 0)))
-                            if best_s.get("url"):
-                                single_item["raw_media_items"].append(
-                                    {
-                                        "url": best_s["url"],
-                                        "ext": "jpg",
-                                        "is_video": False,
-                                    }
-                                )
-
-                    self.item_inspected.emit(single_item)
-                    found_count += 1
-                    batch_added += 1
-                    self.progress_status.emit(
-                        f"Found [{found_count}] items ({scope}) from @{username}"
-                    )
-                    time.sleep(0.02)
-
-                more_available = bool(f_data.get("more_available", False))
-                next_max_id = f_data.get("next_max_id")
-
-                # Strong termination guard: empty items, missing cursor, or cycling cursor
-                if (
-                    not more_available
-                    or not next_max_id
-                    or str(next_max_id) in seen_cursors
-                    or batch_added == 0
-                ):
-                    break
-
-                seen_cursors.add(str(next_max_id))
-                max_id = next_max_id
-                page_num += 1
-                time.sleep(random.uniform(1.2, 2.2))
-
-        return found_count
-
-    def _fetch_all_reels_web(
-        self, username: str, opener: urllib.request.OpenerDirector
-    ) -> int:
-        found_count = 0
-        seen_codes = set()
-        seen_cursors = set()
-
-        user_id = self._get_user_id(username, opener)
-        self.progress_status.emit(f"Connecting to @{username} reels...")
-
-        mobile_headers = {
-            "User-Agent": MOBILE_UA,
-            "X-IG-App-ID": IG_APP_ID,
-            "Accept": "*/*",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        }
-        csrf = self._get_csrf_token()
-        if csrf:
-            mobile_headers["X-CSRFToken"] = csrf
-
-        def _process_reel_item(post: dict) -> bool:
-            nonlocal found_count
-            if not isinstance(post, dict):
-                return False
-
-            # Strict Reel Filter: Exclude carousels (media_type 8) and photos (media_type 1)
-            m_type = post.get("media_type", 1)
-            is_vid = bool(
-                m_type == 2 or post.get("is_video", False) or post.get("video_versions")
-            )
-            if not is_vid or m_type == 8 or "carousel_media" in post:
-                return False
-
-            sc = (
-                post.get("code")
-                or post.get("shortcode")
-                or str(post.get("pk") or post.get("id", ""))
-            )
-            if not sc or sc in seen_codes or sc in self.existing_shortcodes:
-                return False
-
-            seen_codes.add(sc)
-            self.existing_shortcodes.add(sc)
-
-            v_list = post.get("video_versions", [])
-            cands = post.get("image_versions2", {}).get("candidates", [])
-            thumb = cands[0]["url"] if cands else post.get("display_url", "")
-
-            single_item = {
-                "url": f"https://www.instagram.com/reel/{sc}/",
-                "shortcode": sc,
-                "uploader": username,
-                "thumb_url": thumb,
-                "media_type": "video",
-                "slides_count": 1,
-                "format_options": [
-                    {"label": "🎬 Best Video (Highest Quality)", "key": "video_best"},
-                    {"label": "🎞️ H.264 Compatibility Mode", "key": "video_h264"},
-                    {"label": "🎵 Audio Only (MP3 192kbps)", "key": "audio_mp3"},
-                ],
-                "raw_media_items": [],
-            }
-
-            if v_list:
-                best_v = max(v_list, key=lambda x: int(x.get("width", 0)))
-                if best_v.get("url"):
-                    single_item["raw_media_items"].append(
-                        {"url": best_v["url"], "ext": "mp4", "is_video": True}
-                    )
-
-            self.item_inspected.emit(single_item)
-            found_count += 1
-            self.progress_status.emit(f"Found [{found_count}] reels from @{username}")
-            time.sleep(0.01)
-            return True
-
-        # ---------------------------------------------------------------------
-        # Channel 1: Mobile Clips User API (i.instagram.com)
-        # ---------------------------------------------------------------------
-        if user_id and not self._should_terminate():
-            max_id = None
-            page_num = 1
-
-            while not self._should_terminate():
-                self.progress_status.emit(
-                    f"Fetching Clips batch {page_num} from @{username} (Found: {found_count})..."
-                )
-
-                clips_url = "https://i.instagram.com/api/v1/clips/user/"
-                post_params = {
-                    "target_user_id": str(user_id),
-                    "page_size": "50",
+            while not self._is_cancelled and page_count < 40:
+                payload = {
+                    "target_user_id": user_id,
+                    "page_size": 50,
                     "include_feed_video": "true",
                 }
                 if max_id:
-                    post_params["max_id"] = str(max_id)
+                    payload["max_id"] = max_id
 
-                post_data = urllib.parse.urlencode(post_params).encode("utf-8")
-                req = urllib.request.Request(
-                    clips_url, data=post_data, headers=mobile_headers
+                resp = self._http_request(
+                    "https://i.instagram.com/api/v1/clips/user/",
+                    data=payload,
+                    is_mobile=True,
                 )
-                c_data = self._safe_fetch_json(req, opener, timeout=12)
-
-                if not c_data:
+                if not resp or "items" not in resp:
                     break
 
-                raw_items = c_data.get("items", [])
-                if not raw_items:
+                items = resp.get("items", [])
+                if not items:
                     break
 
-                batch_added = 0
-                for entry in raw_items:
-                    if self._should_terminate():
-                        break
-                    post = (
-                        entry.get("media", {})
-                        if isinstance(entry, dict) and "media" in entry
-                        else entry
-                    )
-                    if _process_reel_item(post):
-                        batch_added += 1
+                for item in items:
+                    media = item.get("media", item)
+                    code = media.get("code")
+                    if not code or code in seen_codes:
+                        continue
 
-                paging = c_data.get("paging_info", {})
-                more_available = bool(
-                    paging.get("more_available") or c_data.get("more_available", False)
-                )
-                next_max_id = (
-                    paging.get("max_id")
-                    or c_data.get("next_max_id")
-                    or c_data.get("max_id")
+                    # Pure standalone video reel check
+                    media_type = media.get("media_type")
+                    if media_type not in (2, None) and not media.get("is_video"):
+                        continue
+
+                    seen_codes.add(code)
+                    card = self._build_card_dict(media, username, "reel")
+                    self.card_ready.emit(card)
+
+                paging = resp.get("paging_info", {})
+                next_max_id = paging.get("max_id")
+                has_next = paging.get("more_available", False) or paging.get(
+                    "has_max_id", False
                 )
 
-                if (
-                    not more_available
-                    or not next_max_id
-                    or str(next_max_id) in seen_cursors
-                    or batch_added == 0
-                ):
+                if not has_next or not next_max_id or next_max_id == max_id:
                     break
 
-                seen_cursors.add(str(next_max_id))
                 max_id = next_max_id
-                page_num += 1
-                time.sleep(random.uniform(0.6, 1.2))
+                page_count += 1
+                time.sleep(0.1)
 
-        # ---------------------------------------------------------------------
-        # Channel 2: Paginated User Feed (Strictly Video/Reel items only)
-        # ---------------------------------------------------------------------
-        if user_id and not self._should_terminate():
-            feed_max_id = None
-            feed_page = 1
-            seen_feed_cursors = set()
-
-            while not self._should_terminate():
-                self.progress_status.emit(
-                    f"Scanning feed batch {feed_page} for reels from @{username} (Total: {found_count})..."
-                )
-
-                feed_url = f"https://i.instagram.com/api/v1/feed/user/{user_id}/"
-                if feed_max_id:
-                    feed_url += f"?max_id={urllib.parse.quote(str(feed_max_id))}"
-
-                req = urllib.request.Request(feed_url, headers=mobile_headers)
-                f_data = self._safe_fetch_json(req, opener, timeout=12)
-
-                if not f_data:
-                    break
-
-                raw_items = f_data.get("items", [])
-                if not raw_items:
-                    break
-
-                batch_added = 0
-                for post in raw_items:
-                    if self._should_terminate():
-                        break
-                    if _process_reel_item(post):
-                        batch_added += 1
-
-                more_available = bool(f_data.get("more_available", False))
-                next_max_id = f_data.get("next_max_id")
-
-                if (
-                    not more_available
-                    or not next_max_id
-                    or str(next_max_id) in seen_feed_cursors
-                ):
-                    break
-
-                seen_feed_cursors.add(str(next_max_id))
-                feed_max_id = next_max_id
-                feed_page += 1
-                time.sleep(random.uniform(0.6, 1.2))
-
-        # ---------------------------------------------------------------------
-        # Channel 3: yt-dlp Flat Playlist Fallback (If API endpoints yielded 0)
-        # ---------------------------------------------------------------------
-        if found_count == 0 and not self._should_terminate():
-            self.progress_status.emit(
-                f"Retrying @{username} reels with yt-dlp engine..."
+        # --- Tier 2: Strict Video-Only Feed Pagination (For Creator/Model Profiles) ---
+        if user_id and len(seen_codes) < 6:
+            logger.info(
+                f"Tier 1 returned few items. Starting Tier 2 strict feed inspection for @{username}"
             )
-            try:
-                base_profile_url = f"https://www.instagram.com/{username}/"
-                ydl_opts = {
-                    "quiet": True,
-                    "extract_flat": True,
-                    "logger": SilentLogger(),
-                    "http_headers": {
-                        "User-Agent": DESKTOP_UA,
-                        "X-IG-App-ID": IG_APP_ID,
-                    },
-                }
-                if self.cookie_path and os.path.exists(self.cookie_path):
-                    ydl_opts["cookiefile"] = self.cookie_path
+            max_id = None
+            feed_pages = 0
 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(base_profile_url, download=False)
-                    if info and "entries" in info:
-                        for entry in info["entries"]:
-                            if not entry or self._should_terminate():
-                                continue
-                            sc = (
-                                entry.get("id")
-                                or entry.get("url", "").rstrip("/").split("/")[-1]
-                            )
-                            if (
-                                not sc
-                                or sc in seen_codes
-                                or sc in self.existing_shortcodes
-                            ):
-                                continue
-                            seen_codes.add(sc)
-                            self.existing_shortcodes.add(sc)
+            while not self._is_cancelled and feed_pages < 15:
+                feed_url = f"https://i.instagram.com/api/v1/feed/user/{user_id}/"
+                if max_id:
+                    feed_url += f"?max_id={max_id}"
 
-                            thumb = entry.get("thumbnail", "")
-                            if not thumb and entry.get("thumbnails"):
-                                thumb = entry["thumbnails"][0].get("url", "")
+                resp = self._http_request(feed_url, is_mobile=True)
+                if not resp or "items" not in resp:
+                    break
 
-                            single_item = {
-                                "url": f"https://www.instagram.com/reel/{sc}/",
-                                "shortcode": sc,
-                                "uploader": username,
-                                "thumb_url": thumb,
-                                "media_type": "video",
-                                "slides_count": 1,
-                                "format_options": [
-                                    {
-                                        "label": "🎬 Best Video (Highest Quality)",
-                                        "key": "video_best",
-                                    },
-                                    {
-                                        "label": "🎞️ H.264 Compatibility Mode",
-                                        "key": "video_h264",
-                                    },
-                                    {
-                                        "label": "🎵 Audio Only (MP3 192kbps)",
-                                        "key": "audio_mp3",
-                                    },
-                                ],
-                                "raw_media_items": [],
-                            }
-                            self.item_inspected.emit(single_item)
-                            found_count += 1
-                            self.progress_status.emit(
-                                f"Found [{found_count}] reels from @{username}"
-                            )
-                            time.sleep(0.01)
-            except Exception as e:
-                print(f"[DEBUG] yt-dlp reels fallback error: {e}")
+                items = resp.get("items", [])
+                if not items:
+                    break
+
+                for media in items:
+                    # STRICT FILTER: Standalone video ONLY (media_type == 2). Reject Carousel (8) and Photo (1)
+                    if media.get("media_type") != 2 and not media.get("is_video"):
+                        continue
+
+                    code = media.get("code")
+                    if not code or code in seen_codes:
+                        continue
+
+                    seen_codes.add(code)
+                    card = self._build_card_dict(media, username, "reel")
+                    self.card_ready.emit(card)
+
+                if not resp.get("more_available") or not resp.get("next_max_id"):
+                    break
+
+                max_id = resp.get("next_max_id")
+                feed_pages += 1
+                time.sleep(0.1)
+
+        # --- Tier 3: yt-dlp Flat Extraction Fallback ---
+        if len(seen_codes) == 0:
+            logger.warning(
+                f"Direct API scraping yielded 0 reels for @{username}. Falling back to yt-dlp Engine."
+            )
+            base_profile_url = f"https://www.instagram.com/{username}/"
+            ytdlp_found = self._inspect_with_ytdlp(
+                base_profile_url, filter_reels_only=True
+            )
+            return ytdlp_found
+
+        return len(seen_codes)
+
+    # -------------------------------------------------------------------------
+    # Multi-Tier Reels Engine
+    # -------------------------------------------------------------------------
+
+    def _inspect_reels_tab(self, username: str):
+        """Executes full pagination across clips, feeds, and yt-dlp fallback."""
+        if not username:
+            return
+
+        username = username.strip().lstrip("@")
+        self.status.emit(f"Resolving User ID for @{username}...")
+        user_id = self._get_user_id(username)
+
+        seen_shortcodes: Set[str] = set()
+
+        if user_id:
+            # Tier 1: Clips API Pagination (Dedicated Reels endpoint)
+            self._fetch_reels_clips_api(username, user_id, seen_shortcodes)
+
+            # Tier 2: Timeline Feed API (For Creator/Model accounts with feed-indexed reels)
+            self._fetch_reels_feed_api(username, user_id, seen_shortcodes)
+
+        # Tier 3: yt-dlp Flat Extraction Fallback
+        if len(seen_shortcodes) == 0 and yt_dlp:
+            self.status.emit(f"Falling back to yt-dlp extraction for @{username}...")
+            self._fetch_reels_ytdlp(username, seen_shortcodes)
+
+    def _fetch_reels_clips_api(
+        self, username: str, user_id: str, seen_shortcodes: Set[str]
+    ):
+        """Tier 1: Queries https://i.instagram.com/api/v1/clips/user/ with pagination."""
+        max_id: Optional[str] = None
+        self.status.emit(f"Paginating Reels clips for @{username}...")
+
+        while not self._is_cancelled:
+            payload = {
+                "target_user_id": user_id,
+                "page_size": "50",
+                "include_feed_video": "true",
+            }
+            if max_id:
+                payload["max_id"] = str(max_id)
+
+            encoded_data = urllib.parse.urlencode(payload).encode("utf-8")
+            headers = {
+                "User-Agent": MOBILE_USER_AGENT,
+                "X-IG-App-ID": IG_APP_ID,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            }
+
+            resp = self._make_request(
+                "https://i.instagram.com/api/v1/clips/user/",
+                headers=headers,
+                data=encoded_data,
+                method="POST",
+            )
+
+            if not resp:
+                break
+
+            items = resp.get("items", []) or resp.get("grid_items", [])
+            if not items:
+                break
+
+            new_found = 0
+            for item in items:
+                media = item.get("media", item)
+                m_type = media.get("media_type")
+
+                # Strictly drop carousels and images
+                if m_type in (1, 8):
+                    continue
+
+                card = self._parse_media_dict(
+                    media, username, default_badge="Video / Reel"
+                )
+                if card and card["shortcode"] not in seen_shortcodes:
+                    seen_shortcodes.add(card["shortcode"])
+                    self._emit_card(card, username)
+                    new_found += 1
+
+            paging_info = resp.get("paging_info", {})
+            more_available = paging_info.get("more_available", False)
+            next_max_id = paging_info.get("max_id")
+
+            if (
+                not more_available
+                or not next_max_id
+                or next_max_id == max_id
+                or new_found == 0
+            ):
+                break
+
+            max_id = next_max_id
+            time.sleep(0.25)
+
+    def _fetch_reels_feed_api(
+        self, username: str, user_id: str, seen_shortcodes: Set[str]
+    ):
+        """
+        Tier 2: Timeline feed pagination with strict standalone video filter.
+        Ensures creator accounts with timeline reels are indexed without leaking carousels.
+        """
+        max_id: Optional[str] = None
+        self.status.emit(f"Scanning timeline video feed for @{username}...")
+
+        while not self._is_cancelled:
+            url = f"https://i.instagram.com/api/v1/feed/user/{user_id}/"
+            if max_id:
+                url += f"?max_id={urllib.parse.quote(str(max_id))}"
+
+            headers = {
+                "User-Agent": MOBILE_USER_AGENT,
+                "X-IG-App-ID": IG_APP_ID,
+            }
+
+            resp = self._make_request(url, headers=headers)
+            if not resp:
+                break
+
+            items = resp.get("items", [])
+            if not items:
+                break
+
+            new_found = 0
+            for media in items:
+                m_type = media.get("media_type")
+
+                # Strict Filter Rule:
+                # ONLY standalone videos (media_type == 2 or is_video=True).
+                # Strictly reject carousels (media_type == 8) and photos (media_type == 1).
+                if m_type in (1, 8):
+                    continue
+
+                is_video = media.get("is_video", False) or (m_type == 2)
+                if not is_video:
+                    continue
+
+                card = self._parse_media_dict(
+                    media, username, default_badge="Video / Reel"
+                )
+                if card and card["shortcode"] not in seen_shortcodes:
+                    seen_shortcodes.add(card["shortcode"])
+                    self._emit_card(card, username)
+                    new_found += 1
+
+            more_available = resp.get("more_available", False)
+            next_max_id = resp.get("next_max_id")
+
+            if (
+                not more_available
+                or not next_max_id
+                or next_max_id == max_id
+                or new_found == 0
+            ):
+                break
+
+            max_id = next_max_id
+            time.sleep(0.25)
+
+    def _fetch_reels_ytdlp(self, username: str, seen_shortcodes: Set[str]):
+        """Tier 3: Passes clean profile URL to yt-dlp in flat extraction mode."""
+        base_url = f"https://www.instagram.com/{username}/"
+        ydl_opts = {
+            "extract_flat": True,
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            ydl_opts["cookiefile"] = self.cookie_file
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(base_url, download=False)
+                if not info:
+                    return
+
+                entries = info.get("entries", [])
+                for entry in entries:
+                    if not entry:
+                        continue
+
+                    e_url = entry.get("url") or entry.get("webpage_url") or ""
+                    code = entry.get("id")
+
+                    if "/reel/" in e_url or "/p/" in e_url:
+                        m = re.search(r"/(?:reel|p)/([A-Za-z0-9_-]+)", e_url)
+                        if m:
+                            code = m.group(1)
+
+                    if not code or code in seen_shortcodes:
+                        continue
+
+                    thumb_url = ""
+                    thumbs = entry.get("thumbnails", [])
+                    if thumbs:
+                        thumb_url = thumbs[-1].get("url", "")
+                    elif entry.get("thumbnail"):
+                        thumb_url = entry.get("thumbnail")
+
+                    card = {
+                        "id": code,
+                        "shortcode": code,
+                        "url": f"https://www.instagram.com/reel/{code}/",
+                        "media_type": "video",
+                        "badge_text": "Video / Reel",
+                        "title": entry.get("title")
+                        or entry.get("description")
+                        or f"Reel by @{username}",
+                        "thumbnail_url": thumb_url,
+                        "username": username,
+                        "duration": float(entry.get("duration") or 0.0),
+                        "view_count": int(entry.get("view_count") or 0),
+                        "like_count": int(entry.get("like_count") or 0),
+                        "comment_count": int(entry.get("comment_count") or 0),
+                        "timestamp": int(entry.get("timestamp") or 0),
+                        "is_video": True,
+                        "format_options": [
+                            "Best Video (Highest Quality)",
+                            "Audio Only (MP3/M4A)",
+                        ],
+                    }
+                    seen_shortcodes.add(code)
+                    self._emit_card(card, username)
+        except Exception as e:
+            logger.error(f"yt-dlp fallback failed for @{username}: {e}")
+
+    # -------------------------------------------------------------------------
+    # Single Post, Profile, and Story Inspectors
+    # -------------------------------------------------------------------------
+
+    def _inspect_single_post(self, code: str, url: str, target_type: str) -> int:
+        info_url = f"https://i.instagram.com/api/v1/media/{code}/info/"
+        data = self._http_request(info_url, is_mobile=True)
+
+        if data and "items" in data and len(data["items"]) > 0:
+            media = data["items"][0]
+            username = media.get("user", {}).get("username", "instagram_user")
+            card = self._build_card_dict(media, username, target_type)
+            self.card_ready.emit(card)
+            return 1
+
+        return self._inspect_with_ytdlp(url)
+
+    def _inspect_with_ytdlp(self, url: str, filter_reels_only: bool = False) -> int:
+        ydl_opts = {
+            "extract_flat": True,
+            "quiet": True,
+            "no_warnings": True,
+        }
+        if self.cookie_file:
+            ydl_opts["cookiefile"] = self.cookie_file
+
+        found_count = 0
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    return 0
+
+                entries = info.get("entries") if "entries" in info else [info]
+                for entry in entries:
+                    if not entry:
+                        continue
+
+                    e_url = entry.get("url") or entry.get("webpage_url") or url
+                    if filter_reels_only and "/reel/" not in e_url:
+                        continue
+
+                    code = entry.get("id") or (e_url.rstrip("/").split("/")[-1])
+                    uploader = (
+                        entry.get("uploader")
+                        or entry.get("channel")
+                        or "instagram_user"
+                    )
+
+                    card = {
+                        "id": code,
+                        "shortcode": code,
+                        "url": (
+                            e_url
+                            if e_url.startswith("http")
+                            else f"https://www.instagram.com/reel/{code}/"
+                        ),
+                        "title": f"@{uploader} Video / Reel",
+                        "uploader": uploader,
+                        "thumbnail": entry.get("thumbnail") or "",
+                        "duration": entry.get("duration") or 0,
+                        "type": "reel" if "/reel/" in e_url else "video",
+                        "view_count": entry.get("view_count") or 0,
+                        "status": "Ready",
+                    }
+                    self.card_ready.emit(card)
+                    found_count += 1
+        except Exception as e:
+            logger.debug(f"yt-dlp extraction failed for {url}: {e}")
 
         return found_count
 
-    # -------------------------------------------------------------------------
-    # Main Execution Flow
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Formatting Helpers
+    # =========================================================================
 
-    def run(self) -> None:
-        opener = get_cookie_opener(self.cookie_path)
-        total_found = 0
+    def _build_card_dict(
+        self, media: Dict[str, Any], username: str, item_type: str
+    ) -> Dict[str, Any]:
+        code = media.get("code") or media.get("id")
+        thumb = ""
 
-        for idx, target in enumerate(self.targets, 1):
-            if self._should_terminate():
-                break
+        # Extract best available thumbnail URL
+        if "image_versions2" in media:
+            candidates = media["image_versions2"].get("candidates", [])
+            if candidates:
+                thumb = candidates[0].get("url", "")
+        elif "display_url" in media:
+            thumb = media.get("display_url", "")
 
-            if isinstance(target, dict):
-                raw_url = target.get("url", "")
-                scope = target.get("scope", "all")
-            else:
-                raw_url = str(target)
-                scope = "all"
+        return {
+            "id": code,
+            "shortcode": code,
+            "url": (
+                f"https://www.instagram.com/reel/{code}/"
+                if item_type == "reel"
+                else f"https://www.instagram.com/p/{code}/"
+            ),
+            "title": f"@{username} Video / Reel",
+            "uploader": username,
+            "thumbnail": thumb,
+            "duration": media.get("video_duration") or 0,
+            "type": item_type,
+            "view_count": media.get("play_count") or media.get("view_count") or 0,
+            "like_count": media.get("like_count") or 0,
+            "comment_count": media.get("comment_count") or 0,
+            "status": "Ready",
+        }
 
-            parsed = parse_instagram_url(raw_url)
-            if not parsed:
-                continue
+    def _inspect_profile_all(self, username: str):
+        """Inspects all media under a user profile."""
+        self._inspect_reels_tab(username)
 
-            identifier = parsed["identifier"]
-            media_id = parsed.get("media_id", 0)
-            url_type = parsed["type"]
-            username = parsed.get("username", "Instagram")
-            clean_url = parsed["clean_url"]
-
-            self.progress_status.emit(
-                f"Inspecting [{idx}/{len(self.targets)}]: {identifier}"
-            )
-
-            # =========================================================================
-            # Tier 0: Batch Routing (Stories / Reels / Profile Feed)
-            # =========================================================================
-            if url_type == "story_user":
-                user_id = self._get_user_id(username, opener)
-                count = 0
-                if user_id:
-                    count = self._fetch_user_stories_web(username, user_id, opener)
-                total_found += count
-                if count == 0:
-                    self.progress_status.emit(
-                        f"⚠️ ไม่พบ Stories ใน @{username} (หรือไม่มี Story ที่ยังไม่หมดอายุ)"
-                    )
-                continue
-
-            elif url_type == "profile_reels":
-                count = self._fetch_all_reels_web(username, opener)
-
-                # Auto-Fallback to yt-dlp if scraping yielded 0 items
-                if count == 0 and not self._should_terminate():
-                    self.progress_status.emit(
-                        f"Scraping failed. Retrying @{username} reels via yt-dlp engine..."
-                    )
-                    try:
-                        ydl_opts = {
-                            "quiet": True,
-                            "extract_flat": True,
-                            "logger": SilentLogger(),
-                            "http_headers": {
-                                "User-Agent": DESKTOP_UA,
-                                "X-IG-App-ID": IG_APP_ID,
-                            },
+    def _inspect_story_or_highlight(self, target_dict: Dict[str, Any], url: str):
+        """Inspects stories or highlights."""
+        if yt_dlp:
+            try:
+                ydl_opts = {"quiet": True, "skip_download": True, "extract_flat": True}
+                if self.cookie_file and os.path.exists(self.cookie_file):
+                    ydl_opts["cookiefile"] = self.cookie_file
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    entries = info.get("entries", [info]) if info else []
+                    for entry in entries:
+                        if not entry:
+                            continue
+                        sid = entry.get("id", str(int(time.time())))
+                        card = {
+                            "id": sid,
+                            "shortcode": sid,
+                            "url": entry.get("webpage_url") or entry.get("url") or url,
+                            "media_type": "video",
+                            "badge_text": "Story",
+                            "title": entry.get("title")
+                            or f"Story by {entry.get('uploader', 'user')}",
+                            "thumbnail_url": entry.get("thumbnail", ""),
+                            "username": entry.get("uploader", "user"),
+                            "duration": float(entry.get("duration") or 0.0),
+                            "is_video": True,
+                            "format_options": [
+                                "Best Video (Highest Quality)",
+                                "Audio Only (MP3/M4A)",
+                            ],
                         }
-                        if self.cookie_path and os.path.exists(self.cookie_path):
-                            ydl_opts["cookiefile"] = self.cookie_path
+                        self._emit_card(card, card["username"])
+            except Exception as e:
+                logger.error(f"Story inspection failed for {url}: {e}")
 
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            info = ydl.extract_info(clean_url, download=False)
-                            entries = info.get("entries", []) if info else []
-                            for entry in entries:
-                                if not entry or self._should_terminate():
-                                    continue
-                                sc = (
-                                    entry.get("id")
-                                    or entry.get("url", "").split("/")[-2]
-                                )
-                                if not sc or sc in self.existing_shortcodes:
-                                    continue
-                                self.existing_shortcodes.add(sc)
+    def _inspect_generic_url(self, url: str):
+        """Generic fallback for unclassified Instagram links."""
+        m = re.search(r"/(?:reel|reels|p)/([A-Za-z0-9_-]+)", url)
+        if m:
+            self._inspect_single_post(m.group(1), url)
+        else:
+            username = self._extract_username_from_url(url)
+            if username:
+                self._inspect_reels_tab(username)
 
-                                single_item = {
-                                    "url": f"https://www.instagram.com/reel/{sc}/",
-                                    "shortcode": sc,
-                                    "uploader": username,
-                                    "thumb_url": entry.get(
-                                        "thumbnail",
-                                        (
-                                            entry.get("thumbnails", [{}])[0].get(
-                                                "url", ""
-                                            )
-                                            if entry.get("thumbnails")
-                                            else ""
-                                        ),
-                                    ),
-                                    "media_type": "video",
-                                    "slides_count": 1,
-                                    "format_options": [
-                                        {
-                                            "label": "🎬 Best Video (Highest Quality)",
-                                            "key": "video_best",
-                                        },
-                                        {
-                                            "label": "🎞️ H.264 Compatibility Mode",
-                                            "key": "video_h264",
-                                        },
-                                        {
-                                            "label": "🎵 Audio Only (MP3 192kbps)",
-                                            "key": "audio_mp3",
-                                        },
-                                    ],
-                                    "raw_media_items": [],
-                                }
-                                self.item_inspected.emit(single_item)
-                                count += 1
-                                self.progress_status.emit(
-                                    f"Found [{count}] reels from @{username}"
-                                )
-                                time.sleep(0.01)
-                    except Exception as e:
-                        print(f"[DEBUG] yt-dlp profile_reels fallback error: {e}")
+    # -------------------------------------------------------------------------
+    # Parsing Helpers & Signal Dispatcher
+    # -------------------------------------------------------------------------
 
-                total_found += count
-                if count == 0:
-                    self.progress_status.emit(f"⚠️ ไม่พบคลิป Reels ใน @{username}")
-                continue
+    def _parse_media_dict(
+        self,
+        media: Dict[str, Any],
+        default_username: str,
+        default_badge: str = "Video / Reel",
+    ) -> Optional[Dict[str, Any]]:
+        """Transforms Instagram API media JSON into a normalized card dictionary."""
+        shortcode = media.get("code") or media.get("shortcode")
+        if not shortcode:
+            shortcode = str(media.get("pk") or media.get("id") or "")
+        if not shortcode:
+            return None
 
-            elif url_type == "profile_posts":
-                count = self._fetch_profile_feed_web(username, opener, scope)
-                total_found += count
-                if count == 0:
-                    self.progress_status.emit(f"⚠️ ไม่พบโพสต์ใน @{username}")
-                continue
+        caption = ""
+        caption_obj = media.get("caption")
+        if isinstance(caption_obj, dict):
+            caption = caption_obj.get("text", "")
+        elif isinstance(caption_obj, str):
+            caption = caption_obj
 
-            # =========================================================================
-            # Tier 1: Single Media Item via Mobile REST API
-            # =========================================================================
-            if identifier in self.existing_shortcodes:
-                continue
+        thumb_url = ""
+        candidates = media.get("image_versions2", {}).get("candidates", [])
+        if candidates and isinstance(candidates, list):
+            thumb_url = candidates[0].get("url", "")
+        if not thumb_url:
+            thumb_url = media.get("display_url") or media.get("thumbnail_src") or ""
 
-            item_data = {
-                "url": clean_url,
-                "shortcode": identifier,
-                "uploader": username,
-                "thumb_url": "",
-                "media_type": url_type,
-                "slides_count": 1,
-                "format_options": [],
-                "raw_media_items": [],
-            }
+        user_info = media.get("user", {})
+        u_name = user_info.get("username") or default_username
 
-            api_data = None
-            if media_id > 0:
-                try:
-                    req_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
-                    req = urllib.request.Request(
-                        req_url,
-                        headers={
-                            "User-Agent": MOBILE_UA,
-                            "X-IG-App-ID": IG_APP_ID,
-                            "Accept": "*/*",
-                        },
-                    )
-                    api_data = self._safe_fetch_json(req, opener, timeout=9)
-                except Exception:
-                    pass
+        duration = float(media.get("video_duration", 0.0) or 0.0)
+        view_count = int(media.get("play_count") or media.get("view_count") or 0)
+        like_count = int(media.get("like_count") or 0)
+        comment_count = int(media.get("comment_count") or 0)
+        timestamp = int(media.get("taken_at") or media.get("device_timestamp") or 0)
 
-            if api_data and "items" in api_data and api_data["items"]:
-                post = api_data["items"][0]
-                user_info = post.get("user", {})
-                item_data["uploader"] = user_info.get("username", item_data["uploader"])
+        return {
+            "id": shortcode,
+            "shortcode": shortcode,
+            "url": f"https://www.instagram.com/reel/{shortcode}/",
+            "media_type": "video",
+            "badge_text": default_badge,
+            "title": caption if caption else f"Reel by @{u_name}",
+            "thumbnail_url": thumb_url,
+            "username": u_name,
+            "duration": duration,
+            "view_count": view_count,
+            "like_count": like_count,
+            "comment_count": comment_count,
+            "timestamp": timestamp,
+            "is_video": True,
+            "format_options": ["Best Video (Highest Quality)", "Audio Only (MP3/M4A)"],
+        }
 
-                if url_type in ("story", "highlight"):
-                    item_data["media_type"] = "story"
-                    v_list = post.get("video_versions", [])
-                    is_story_video = bool(
-                        v_list or post.get("is_video") or post.get("media_type") == 2
-                    )
-                    cands = post.get("image_versions2", {}).get("candidates", [])
-                    item_data["thumb_url"] = cands[0]["url"] if cands else ""
+    def _emit_card(self, card_data: Dict[str, Any], username: str):
+        """Appends result and notifies main GUI thread."""
+        self.results.append(card_data)
+        self.item_found.emit(card_data)
+        count = len(self.results)
+        self.progress.emit(count, 0, f"Found {count} items for @{username}...")
+        self.status.emit(f"Inspected @{username}: {count} items ready")
 
-                    if is_story_video:
-                        best_v = (
-                            max(v_list, key=lambda x: int(x.get("width", 0)))
-                            if v_list
-                            else {}
-                        )
-                        vw = best_v.get("width", 1080)
-                        vh = best_v.get("height", 1920)
-                        item_data["format_options"] = [
-                            {
-                                "label": f"🎬 Story Video ({vw}x{vh} - Best)",
-                                "key": "story_video",
-                            },
-                            {
-                                "label": "🎵 Audio Only (MP3 192kbps)",
-                                "key": "audio_mp3",
-                            },
-                        ]
-                        if best_v.get("url"):
-                            item_data["raw_media_items"].append(
-                                {
-                                    "url": best_v["url"],
-                                    "ext": "mp4",
-                                    "is_video": True,
-                                }
-                            )
-                    else:
-                        w = cands[0].get("width", 1080) if cands else 1080
-                        h = cands[0].get("height", 1920) if cands else 1920
-                        item_data["format_options"] = [
-                            {
-                                "label": f"🖼️ Story Photo ({w}x{h} - Original)",
-                                "key": "story_photo",
-                            }
-                        ]
-                        if cands:
-                            best_s = max(cands, key=lambda x: int(x.get("width", 0)))
-                            item_data["raw_media_items"].append(
-                                {
-                                    "url": best_s["url"],
-                                    "ext": "jpg",
-                                    "is_video": False,
-                                }
-                            )
-
-                elif "carousel_media" in post and isinstance(
-                    post["carousel_media"], list
-                ):
-                    item_data["media_type"] = "carousel"
-                    item_data["slides_count"] = len(post["carousel_media"])
-                    first_slide = post["carousel_media"][0]
-                    s_cands = first_slide.get("image_versions2", {}).get(
-                        "candidates", []
-                    )
-                    item_data["thumb_url"] = s_cands[0]["url"] if s_cands else ""
-                    best_first = (
-                        max(s_cands, key=lambda x: int(x.get("width", 0)))
-                        if s_cands
-                        else {}
-                    )
-                    w = best_first.get("width", 1080)
-                    h = best_first.get("height", 1080)
-
-                    item_data["format_options"] = [
-                        {
-                            "label": f"⚡ Best Quality ({w}x{h} Max) - All {item_data['slides_count']} Items",
-                            "key": "best_all",
-                        },
-                        {
-                            "label": "🖼️ Photos Only (Extract images only)",
-                            "key": "photos_only",
-                        },
-                    ]
-
-                    for s in post["carousel_media"]:
-                        v_list = s.get("video_versions", [])
-                        if v_list or s.get("is_video") or s.get("media_type") == 2:
-                            best_v = (
-                                max(v_list, key=lambda x: int(x.get("width", 0)))
-                                if v_list
-                                else {}
-                            )
-                            if best_v.get("url"):
-                                item_data["raw_media_items"].append(
-                                    {
-                                        "url": best_v["url"],
-                                        "ext": "mp4",
-                                        "is_video": True,
-                                    }
-                                )
-                        else:
-                            s_cands = s.get("image_versions2", {}).get("candidates", [])
-                            if s_cands:
-                                best_s = max(
-                                    s_cands, key=lambda x: int(x.get("width", 0))
-                                )
-                                item_data["raw_media_items"].append(
-                                    {
-                                        "url": best_s["url"],
-                                        "ext": "jpg",
-                                        "is_video": False,
-                                    }
-                                )
-
-                elif (
-                    post.get("video_versions")
-                    or post.get("is_video", False)
-                    or url_type == "video"
-                ):
-                    item_data["media_type"] = "video"
-                    cands = post.get("image_versions2", {}).get("candidates", [])
-                    item_data["thumb_url"] = cands[0]["url"] if cands else ""
-                    v_list = post.get("video_versions", [])
-                    best_v = (
-                        max(v_list, key=lambda x: int(x.get("width", 0)))
-                        if v_list
-                        else {}
-                    )
-                    vw = best_v.get("width", 1080)
-                    vh = best_v.get("height", 1920)
-
-                    item_data["format_options"] = [
-                        {
-                            "label": f"🎬 Best Video ({vw}x{vh} - Max Bitrate)",
-                            "key": "video_best",
-                        },
-                        {"label": "🎞️ H.264 Compatibility Mode", "key": "video_h264"},
-                        {"label": "🎵 Audio Only (MP3 192kbps)", "key": "audio_mp3"},
-                    ]
-                    if best_v.get("url"):
-                        item_data["raw_media_items"].append(
-                            {
-                                "url": best_v["url"],
-                                "ext": "mp4",
-                                "is_video": True,
-                            }
-                        )
-
-                else:
-                    item_data["media_type"] = "photo"
-                    cands = post.get("image_versions2", {}).get("candidates", [])
-                    item_data["thumb_url"] = cands[0]["url"] if cands else ""
-                    w = cands[0].get("width", 1080) if cands else 1080
-                    h = cands[0].get("height", 1080) if cands else 1080
-
-                    item_data["format_options"] = [
-                        {
-                            "label": f"🖼️ Original Resolution ({w}x{h})",
-                            "key": "best_single",
-                        },
-                        {"label": "🖼️ Compressed Web Size", "key": "720p_single"},
-                    ]
-                    if cands:
-                        best_s = max(cands, key=lambda x: int(x.get("width", 0)))
-                        item_data["raw_media_items"].append(
-                            {
-                                "url": best_s["url"],
-                                "ext": "jpg",
-                                "is_video": False,
-                            }
-                        )
-
-            # =========================================================================
-            # Tier 2: Single Fallback via yt-dlp
-            # =========================================================================
-            if not item_data["format_options"] and not self._should_terminate():
-                try:
-                    ydl_opts = {
-                        "quiet": True,
-                        "logger": SilentLogger(),
-                        "http_headers": {
-                            "User-Agent": DESKTOP_UA,
-                            "X-IG-App-ID": IG_APP_ID,
-                        },
-                    }
-                    if self.cookie_path and os.path.exists(self.cookie_path):
-                        ydl_opts["cookiefile"] = self.cookie_path
-
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(clean_url, download=False)
-                        if info:
-                            item_data["uploader"] = info.get(
-                                "uploader", item_data["uploader"]
-                            )
-                            item_data["thumb_url"] = info.get("thumbnail", "")
-                            is_vid = info.get("vcodec") != "none" or url_type in (
-                                "story",
-                                "video",
-                            )
-                            item_data["media_type"] = (
-                                "story"
-                                if url_type == "story"
-                                else ("video" if is_vid else "photo")
-                            )
-
-                            if is_vid:
-                                item_data["format_options"] = [
-                                    {
-                                        "label": "🎬 Best Video (Highest Quality)",
-                                        "key": "video_best",
-                                    },
-                                    {
-                                        "label": "🎞️ H.264 Compatibility Mode",
-                                        "key": "video_h264",
-                                    },
-                                    {
-                                        "label": "🎵 Audio Only (MP3 192kbps)",
-                                        "key": "audio_mp3",
-                                    },
-                                ]
-                            else:
-                                item_data["format_options"] = [
-                                    {
-                                        "label": "🖼️ Best Photo Resolution",
-                                        "key": "best_single",
-                                    },
-                                ]
-                except Exception as e:
-                    print(f"[DEBUG] yt-dlp Single Fallback Error: {e}")
-                    is_reel = url_type in ("video", "story") or "/reel/" in clean_url
-                    item_data["media_type"] = "video" if is_reel else "photo"
-                    if is_reel:
-                        item_data["format_options"] = [
-                            {
-                                "label": "🎬 Best Video (Auto-Engine)",
-                                "key": "video_best",
-                            },
-                            {"label": "🎞️ H.264 Mode", "key": "video_h264"},
-                            {"label": "🎵 Audio MP3", "key": "audio_mp3"},
-                        ]
-                    else:
-                        item_data["format_options"] = [
-                            {
-                                "label": "⚡ Best Quality (Auto-Engine)",
-                                "key": "best_single",
-                            }
-                        ]
-
-            if item_data["format_options"]:
-                self.item_inspected.emit(item_data)
-                total_found += 1
-
-            time.sleep(0.05)
-
-        self.finished_inspection.emit(total_found)
+    def _extract_username_from_url(self, url: str) -> str:
+        """Extracts username handle from clean profile URLs."""
+        m = re.search(r"instagram\.com/([A-Za-z0-9_.]+)", url)
+        if m:
+            candidate = m.group(1).lower()
+            if candidate not in ("p", "reel", "reels", "stories", "explore"):
+                return candidate
+        return "user"
