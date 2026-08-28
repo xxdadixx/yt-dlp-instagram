@@ -733,11 +733,41 @@ class MainWindow(QMainWindow):
         if not self.chk_clipboard.isChecked():
             return
         text = self.clipboard.text().strip()
-        if text and text != self._last_clipboard_text:
-            self._last_clipboard_text = text
-            if "instagram.com" in text.lower():
-                self.url_container.add_url_chip(text)
-                self.show_toast("Instagram link detected and added from clipboard")
+        if not text or text == self._last_clipboard_text:
+            return
+        self._last_clipboard_text = text
+
+        from core.parser import extract_instagram_urls, parse_instagram_url
+
+        valid_urls = extract_instagram_urls(text)
+        if not valid_urls:
+            return
+
+        for clean_u in valid_urls:
+            info = parse_instagram_url(clean_u)
+            ttype = info.get("type", "url").upper().replace("_", " ")
+            user = info.get("username")
+            code = info.get("shortcode")
+            tid = info.get("target_id")
+
+            self.url_container.add_url_chip(clean_u)
+
+            if "REELS" in ttype:
+                self.show_toast(f"[REELS] Added @{user} from clipboard")
+            elif ttype == "PROFILE":
+                self.show_toast(f"[PROFILE] Added @{user} from clipboard")
+            elif ttype == "REEL":
+                self.show_toast(f"[REEL] Added #{code} from clipboard")
+            elif ttype in ("POST", "TV"):
+                self.show_toast(f"[POST] Added #{code} from clipboard")
+            elif ttype == "STORY":
+                self.show_toast(f"[STORY] Added @{user} from clipboard")
+            elif ttype == "HIGHLIGHT":
+                self.show_toast(f"[HIGHLIGHT] Added #{tid} from clipboard")
+            elif ttype == "AUDIO":
+                self.show_toast(f"[AUDIO] Added #{tid} from clipboard")
+            else:
+                self.show_toast(f"[{ttype}] Added link from clipboard")
 
     def show_toast(
         self, message: str, is_error: bool = False, duration_ms: int = 4000
@@ -852,8 +882,24 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------
     def update_selection_counter(self) -> None:
         total = len(self.cards)
-        selected = sum(1 for c in self.cards if getattr(c, "is_selected", True))
-        self.lbl_selected_count.setText(f"Selected: {selected} / {total} items")
+        selected_cards = [c for c in self.cards if getattr(c, "is_selected", True)]
+        selected_count = len(selected_cards)
+        if selected_count == 1:
+            card_url = (
+                selected_cards[0].item_data.get("url")
+                or f"https://www.instagram.com/reel/{selected_cards[0].shortcode}/"
+            )
+            self.lbl_selected_count.setText(f"Selected: 1 / {total} items — {card_url}")
+        elif selected_count > 1:
+            last_url = (
+                selected_cards[-1].item_data.get("url")
+                or f"https://www.instagram.com/reel/{selected_cards[-1].shortcode}/"
+            )
+            self.lbl_selected_count.setText(
+                f"Selected: {selected_count} / {total} items (Last: {last_url})"
+            )
+        else:
+            self.lbl_selected_count.setText(f"Selected: 0 / {total} items")
 
     def select_all_cards(self) -> None:
         for card in self.cards:

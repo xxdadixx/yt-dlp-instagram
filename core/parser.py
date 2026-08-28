@@ -9,7 +9,9 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
 
 from config.constants import (
+    AUDIO_REGEX,
     HIGHLIGHTS_REGEX,
+    INSTAGRAM_DOMAINS,
     MEDIA_TYPE_CAROUSEL,
     MEDIA_TYPE_PHOTO,
     MEDIA_TYPE_VIDEO,
@@ -39,6 +41,9 @@ def shortcode_to_id(shortcode: str) -> int:
     """Converts an Instagram shortcode back to a numeric media ID (pk)."""
     if not shortcode:
         return 0
+    if isinstance(shortcode, int):
+        return shortcode
+    shortcode = str(shortcode).strip()
     media_id = 0
     for char in shortcode:
         idx = IG_ALPHABET.find(char)
@@ -58,7 +63,6 @@ def is_standalone_video(item: Dict[str, Any]) -> bool:
     if not item or not isinstance(item, dict):
         return False
 
-    # Unwrap if wrapped inside 'media' key
     media = item.get("media", item)
     if not isinstance(media, dict):
         return False
@@ -84,6 +88,8 @@ def is_standalone_video(item: Dict[str, Any]) -> bool:
         return True
     if media.get("product_type") == "clips":
         return True
+    if bool(media.get("video_versions")):
+        return True
 
     return False
 
@@ -91,7 +97,8 @@ def is_standalone_video(item: Dict[str, Any]) -> bool:
 def normalize_url(url: str) -> str:
     """
     Cleans and normalizes Instagram URLs into standard https://www.instagram.com/... format.
-    Handles user shorthands like '@username', 'username/reels', 'username', ddinstagram, kkinstagram, etc.
+    Validates against recognized Instagram domains, handles, and path patterns.
+    Rejects non-Instagram or arbitrary random strings.
     """
     if not url:
         return ""
@@ -100,17 +107,23 @@ def normalize_url(url: str) -> str:
     # Handle @username shorthand
     if url.startswith("@"):
         username = url.lstrip("@").strip()
-        return f"https://www.instagram.com/{username}/"
+        if USERNAME_PATTERN.match(username):
+            return f"https://www.instagram.com/{username}/"
+        return ""
 
-    # If it's a domain-less string (e.g., 'kanyxxon/reels', 'kanyxxon', 'p/C7xYz')
-    has_known_domain = any(
-        dom in url.lower()
-        for dom in ["instagram.com", "ddinstagram.com", "kkinstagram.com"]
-    )
-
-    if not has_known_domain and not url.startswith(("http://", "https://")):
-        path = url.strip("/")
-        return f"https://www.instagram.com/{path}/"
+    has_known_domain = any(dom in url.lower() for dom in INSTAGRAM_DOMAINS)
+    if not has_known_domain:
+        if not url.startswith(("http://", "https://")):
+            if PATH_PATTERN.match(url):
+                return f"https://www.instagram.com/{url.strip('/')}/"
+            if (
+                USERNAME_PATTERN.match(url)
+                and url.lower() not in RESERVED_USERNAMES
+                and " " not in url
+                and "." not in url
+            ):
+                return f"https://www.instagram.com/{url}/"
+        return ""
 
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -118,14 +131,10 @@ def normalize_url(url: str) -> str:
     parsed = urlparse(url)
     netloc = parsed.netloc.lower()
 
-    if (
-        "instagram.com" in netloc
-        or "ddinstagram.com" in netloc
-        or "kkinstagram.com" in netloc
-    ):
+    if any(dom in netloc for dom in INSTAGRAM_DOMAINS):
         netloc = "www.instagram.com"
-    elif not netloc:
-        netloc = "www.instagram.com"
+    else:
+        return ""
 
     path = parsed.path
     if not path.startswith("/"):
@@ -138,17 +147,47 @@ def normalize_url(url: str) -> str:
     return clean_url
 
 
+def extract_instagram_urls(text: str) -> list[str]:
+    """
+    Extracts all valid Instagram URLs from arbitrary text or clipboard input,
+    filtering out non-Instagram text, other websites, or blank lines.
+    """
+    if not text:
+        return []
+
+    patterns = [
+        r"https?:\/\/(?:[a-zA-Z0-9_\-]+\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am)\/[^\s,]+",
+        r"@[a-zA-Z0-9_\.]{1,30}",
+    ]
+    candidates: list[str] = []
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            candidates.append(m.group(0).strip())
+
+    for line in text.splitlines():
+        line = line.strip()
+        if line and line not in candidates:
+            candidates.append(line)
+
+    valid_targets: list[str] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        norm = normalize_url(cand)
+        if norm and norm not in seen:
+            info = parse_instagram_url(norm)
+            if info.get("valid") and info.get("type") != "unknown":
+                clean_u = info.get("clean_url") or norm
+                if clean_u not in seen:
+                    seen.add(clean_u)
+                    valid_targets.append(clean_u)
+
+    return valid_targets
+
+
 def parse_instagram_url(url: str) -> Dict[str, Any]:
     """
     Parses and categorizes an Instagram URL into supported target types:
-    - profile_reels
-    - reel
-    - post
-    - tv
-    - highlight
-    - story
-    - profile
-    - unknown
+    - profile_reels, reel, post, tv, highlight, story, audio, profile, unknown
     """
     if not url:
         return {"type": "unknown", "valid": False, "raw_url": url}
@@ -170,12 +209,26 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 "raw_url": url,
             }
 
-    # 2. Single Post / Reel / TV: https://www.instagram.com/reel/<shortcode>/
+    # 2. Audio Page: https://www.instagram.com/reels/audio/<audio_id>/ or /audio/<audio_id>/
+    audio_match = AUDIO_REGEX.match(clean_url)
+    if audio_match:
+        audio_id = audio_match.group(1)
+        return {
+            "type": "audio",
+            "valid": True,
+            "username": None,
+            "shortcode": None,
+            "target_id": audio_id,
+            "clean_url": clean_url,
+            "raw_url": url,
+        }
+
+    # 3. Single Post / Reel / TV / Share: https://www.instagram.com/reel/<shortcode>/
     post_match = POST_REEL_REGEX.match(clean_url)
     if post_match:
         shortcode = post_match.group(1)
         url_lower = clean_url.lower()
-        if "/reel/" in url_lower:
+        if "/reel/" in url_lower or "/reels/" in url_lower:
             media_type = "reel"
         elif "/tv/" in url_lower:
             media_type = "tv"
@@ -192,10 +245,10 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "raw_url": url,
         }
 
-    # 3. Highlights: https://www.instagram.com/stories/highlights/<highlight_id>/
+    # 4. Highlights: https://www.instagram.com/stories/highlights/<id>/ or /s/<shortcode>
     highlight_match = HIGHLIGHTS_REGEX.match(clean_url)
     if highlight_match:
-        highlight_id = highlight_match.group(1)
+        highlight_id = highlight_match.group(1) or highlight_match.group(2)
         return {
             "type": "highlight",
             "valid": True,
@@ -206,7 +259,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "raw_url": url,
         }
 
-    # 4. Stories: https://www.instagram.com/stories/<username>/<story_id>/
+    # 5. Stories: https://www.instagram.com/stories/<username>/<story_id>/
     story_match = STORIES_REGEX.match(clean_url)
     if story_match:
         username = story_match.group(1).lower()
@@ -222,7 +275,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 "raw_url": url,
             }
 
-    # 5. Base User Profile: https://www.instagram.com/<username>/
+    # 6. Base User Profile: https://www.instagram.com/<username>/
     profile_match = PROFILE_REGEX.match(clean_url)
     if profile_match:
         username = profile_match.group(1).lower()

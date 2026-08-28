@@ -60,30 +60,39 @@ from config.constants import (
     DEFAULT_MOBILE_HEADERS,
     DEFAULT_PAGE_SIZE,
     DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_USER_AGENT,
     IG_APP_ID,
     IG_BASE_URL,
     IG_CLIPS_USER_URL,
     IG_FEED_USER_URL,
     IG_USER_INFO_MOBILE_URL,
     IG_USER_LOOKUP_URL,
+    IG_USERS_SEARCH_URL,
+    IG_WEB_PROFILE_ALT_URL,
     IG_WEB_PROFILE_INFO_URL,
+    IG_WEB_SEARCH_URL,
     MAX_PAGINATION_PAGES,
-    MEDIA_TYPE_CAROUSEL,
-    MEDIA_TYPE_PHOTO,
-    MEDIA_TYPE_VIDEO,
     MOBILE_USER_AGENT,
+    QUALITY_PRESETS,
     REQUEST_DELAY_SECONDS,
-)
-from core.parser import (
-    id_to_shortcode,
-    is_standalone_video,
-    normalize_url,
-    parse_instagram_url,
-    shortcode_to_id,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class YTDLPQuietLogger:
+    """Suppresses raw stderr output from yt-dlp, redirecting to debug logger."""
+
+    def debug(self, msg: str) -> None:
+        logger.debug(f"[yt-dlp] {msg}")
+
+    def warning(self, msg: str) -> None:
+        logger.debug(f"[yt-dlp warning] {msg}")
+
+    def error(self, msg: str) -> None:
+        logger.debug(f"[yt-dlp error] {msg}")
+
+    def info(self, msg: str) -> None:
+        logger.debug(f"[yt-dlp info] {msg}")
 
 
 class InspectWorker(QThread):
@@ -205,13 +214,40 @@ class InspectWorker(QThread):
 
     def _get_user_id(self, username: str) -> Optional[str]:
         """
-        Resolves Instagram numeric User ID using 4 fallback strategies:
+        Resolves Instagram numeric User ID using a multi-tier fallback architecture:
         1. Web Profile Info endpoint (web_profile_info)
-        2. Mobile Username Info endpoint & user lookup
-        3. Direct HTML Regex scraping
-        4. yt-dlp metadata extraction
+        2. Mobile Username Info & User Lookup endpoints
+        3. Web Topsearch blended query (public search)
+        4. Mobile Users Search API
+        5. GraphQL / Web Profile Alt (__a=1&__d=dis)
+        6. Direct HTML Regex scraping (profile and reels tabs)
+        7. yt-dlp metadata extraction with quiet logging
         """
         username = username.lower().strip().lstrip("@")
+
+        def _extract_id_from_dict(d: Any) -> Optional[str]:
+            if not isinstance(d, dict):
+                return None
+            u = (
+                d.get("user")
+                or d.get("data", {}).get("user")
+                or d.get("graphql", {}).get("user")
+            )
+            if isinstance(u, dict):
+                uid = u.get("pk") or u.get("id") or u.get("pk_id")
+                if uid:
+                    return str(uid)
+            for entry in d.get("users", []):
+                if isinstance(entry, dict):
+                    eu = entry.get("user", entry)
+                    if isinstance(eu, dict):
+                        if eu.get("username", "").lower() == username or not eu.get(
+                            "username"
+                        ):
+                            uid = eu.get("pk") or eu.get("pk_id") or eu.get("id")
+                            if uid:
+                                return str(uid)
+            return None
 
         # Strategy 1: Web Profile Info
         try:
@@ -221,75 +257,109 @@ class InspectWorker(QThread):
                 "X-IG-App-ID": IG_APP_ID,
             }
             res1 = self._make_request(url1, headers=h1)
-            if res1 and isinstance(res1, dict):
-                uid = res1.get("data", {}).get("user", {}).get("id")
-                if uid:
-                    logger.info(
-                        f"Resolved User ID {uid} via Strategy 1 (web_profile_info)"
-                    )
-                    return str(uid)
+            uid = _extract_id_from_dict(res1)
+            if uid:
+                logger.info(f"Resolved User ID {uid} via Strategy 1 (web_profile_info)")
+                return uid
         except Exception:
             pass
 
         # Strategy 2: Mobile Username Info & Lookup
         try:
-            url2 = IG_USER_INFO_MOBILE_URL.format(username=username)
-            h2 = {"User-Agent": MOBILE_USER_AGENT, "X-IG-App-ID": IG_APP_ID}
-            res2 = self._make_request(url2, headers=h2)
-            if res2 and isinstance(res2, dict):
-                uid = (
-                    res2.get("user", {}).get("pk")
-                    or res2.get("user", {}).get("id")
-                    or res2.get("user", {}).get("pk_id")
+            h_mob = {"User-Agent": MOBILE_USER_AGENT, "X-IG-App-ID": IG_APP_ID}
+            url2_info = IG_USER_INFO_MOBILE_URL.format(username=username)
+            res2_info = self._make_request(url2_info, headers=h_mob)
+            uid = _extract_id_from_dict(res2_info)
+            if uid:
+                logger.info(
+                    f"Resolved User ID {uid} via Strategy 2 (mobile usernameinfo)"
                 )
-                if uid:
-                    logger.info(
-                        f"Resolved User ID {uid} via Strategy 2 (mobile usernameinfo)"
-                    )
-                    return str(uid)
+                return uid
 
             url2_lookup = f"{IG_USER_LOOKUP_URL}?q={username}"
-            res2_lookup = self._make_request(url2_lookup, headers=h2)
-            if res2_lookup and isinstance(res2_lookup, dict):
-                uid = res2_lookup.get("user", {}).get("pk") or res2_lookup.get(
-                    "user", {}
-                ).get("id")
-                if uid:
-                    logger.info(
-                        f"Resolved User ID {uid} via Strategy 2 (mobile lookup)"
-                    )
-                    return str(uid)
+            res2_lookup = self._make_request(url2_lookup, headers=h_mob)
+            uid = _extract_id_from_dict(res2_lookup)
+            if uid:
+                logger.info(f"Resolved User ID {uid} via Strategy 2 (mobile lookup)")
+                return uid
         except Exception:
             pass
 
-        # Strategy 3: HTML Scrape Regex
+        # Strategy 3: Web Topsearch blended query
         try:
-            url3 = f"{IG_BASE_URL}/{username}/"
-            html = self._fetch_html(url3)
-            if html:
-                patterns = [
-                    r'"user_id"\s*:\s*"(\d+)"',
-                    r'"profile_id"\s*:\s*"(\d+)"',
-                    r'"owner"\s*:\s*\{\s*"id"\s*:\s*"(\d+)"',
-                    r'"target_id"\s*:\s*"(\d+)"',
-                    r'"props"\s*:\s*\{\s*"id"\s*:\s*"(\d+)"',
-                    r'"id"\s*:\s*"(\d{6,})"',
-                    r"instagram://user\?id=(\d+)",
-                    r'content="instagram://user\?id=(\d+)"',
-                    r"users/(\d+)/",
-                ]
-                for pat in patterns:
-                    m = re.search(pat, html)
-                    if m:
-                        uid = m.group(1)
-                        logger.info(
-                            f"Resolved User ID {uid} via Strategy 3 (HTML regex)"
-                        )
-                        return uid
+            url3_search = IG_WEB_SEARCH_URL.format(username=username)
+            h3_search = {
+                "Referer": f"{IG_BASE_URL}/{username}/",
+                "X-IG-App-ID": IG_APP_ID,
+            }
+            res3_search = self._make_request(url3_search, headers=h3_search)
+            uid = _extract_id_from_dict(res3_search)
+            if uid:
+                logger.info(f"Resolved User ID {uid} via Strategy 3 (web topsearch)")
+                return uid
         except Exception:
             pass
 
-        # Strategy 4: yt-dlp fallback extraction
+        # Strategy 4: Mobile Users Search
+        try:
+            url4_search = IG_USERS_SEARCH_URL.format(username=username)
+            h4_mob = {"User-Agent": MOBILE_USER_AGENT, "X-IG-App-ID": IG_APP_ID}
+            res4_search = self._make_request(url4_search, headers=h4_mob)
+            uid = _extract_id_from_dict(res4_search)
+            if uid:
+                logger.info(
+                    f"Resolved User ID {uid} via Strategy 4 (mobile user search)"
+                )
+                return uid
+        except Exception:
+            pass
+
+        # Strategy 5: Web Profile Alt query (__a=1&__d=dis)
+        try:
+            url5 = IG_WEB_PROFILE_ALT_URL.format(username=username)
+            h5 = {"Referer": f"{IG_BASE_URL}/{username}/", "X-IG-App-ID": IG_APP_ID}
+            res5 = self._make_request(url5, headers=h5)
+            uid = _extract_id_from_dict(res5)
+            if uid:
+                logger.info(f"Resolved User ID {uid} via Strategy 5 (web alt __a=1)")
+                return uid
+        except Exception:
+            pass
+
+        # Strategy 6: Direct HTML Regex Scraping
+        try:
+            for url6 in (
+                f"{IG_BASE_URL}/{username}/",
+                f"{IG_BASE_URL}/{username}/reels/",
+            ):
+                html = self._fetch_html(url6)
+                if html:
+                    patterns = [
+                        r'"user_id"\s*:\s*"(\d+)"',
+                        r'"profile_id"\s*:\s*"(\d+)"',
+                        r'"owner"\s*:\s*\{\s*"id"\s*:\s*"(\d+)"',
+                        r'"target_id"\s*:\s*"(\d+)"',
+                        r'"props"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)"',
+                        r"profilePage_(\d+)",
+                        r'"logging_page_id"\s*:\s*"profilePage_(\d+)"',
+                        r'"author_id"\s*:\s*"(\d+)"',
+                        r'"id"\s*:\s*"(\d{6,})"',
+                        r"instagram://user\?id=(\d+)",
+                        r'content="instagram://user\?id=(\d+)"',
+                        r"users/(\d+)/",
+                    ]
+                    for pat in patterns:
+                        m = re.search(pat, html)
+                        if m:
+                            uid = m.group(1)
+                            logger.info(
+                                f"Resolved User ID {uid} via Strategy 6 (HTML regex)"
+                            )
+                            return str(uid)
+        except Exception:
+            pass
+
+        # Strategy 7: yt-dlp fallback extraction with quiet logging
         if yt_dlp is not None:
             try:
                 ydl_opts = {
@@ -298,6 +368,8 @@ class InspectWorker(QThread):
                     "no_warnings": True,
                     "ignoreerrors": True,
                     "skip_download": True,
+                    "logger": YTDLPQuietLogger(),
+                    "socket_timeout": DEFAULT_REQUEST_TIMEOUT,
                 }
                 if self.cookie_file and os.path.exists(self.cookie_file):
                     ydl_opts["cookiefile"] = self.cookie_file

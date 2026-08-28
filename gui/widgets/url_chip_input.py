@@ -116,67 +116,96 @@ except ImportError:
 
 
 class URLChip(QFrame):
-    """A compact, styled pill/chip displaying an Instagram URL with a remove button."""
+    """A compact, styled pill/chip displaying an Instagram URL with category badge and remove button."""
 
     removed = pyqtSignal(str) if "pyqtSignal" in globals() else MagicSignal()  # type: ignore
 
-    def __init__(self, url: str, parent=None):
+    def __init__(self, url: str, category: str = "", parent=None):
         super().__init__(parent)
         self.url = url
+        self.category = category
         self.setObjectName("URLChipPill")
         self.init_ui()
 
+    def _format_chip_details(self, u: str) -> tuple[str, str, str]:
+        """Returns (badge_text, display_label, badge_color)."""
+        try:
+            info = parse_instagram_url(u)
+            ttype = info.get("type", "url").upper().replace("_", " ")
+            user = info.get("username")
+            code = info.get("shortcode")
+            tid = info.get("target_id")
+
+            if "REELS" in ttype or ttype == "PROFILE REELS":
+                badge = "REELS"
+                color = "#4f46e5"
+                label = f"@{user} (Reels)" if user else u
+            elif ttype == "PROFILE":
+                badge = "PROFILE"
+                color = "#059669"
+                label = f"@{user} (Profile)" if user else u
+            elif ttype == "REEL":
+                badge = "REEL"
+                color = "#6366f1"
+                label = f"#{code} (Reel)" if code else u
+            elif ttype in ("POST", "TV"):
+                badge = "POST"
+                color = "#3b82f6"
+                label = f"#{code} (Post)" if code else u
+            elif ttype == "STORY":
+                badge = "STORY"
+                color = "#e11d48"
+                label = f"@{user} (Story)" if user else u
+            elif ttype == "HIGHLIGHT":
+                badge = "HIGHLIGHT"
+                color = "#d97706"
+                label = f"#{tid} (Highlight)" if tid else u
+            elif ttype == "AUDIO":
+                badge = "AUDIO"
+                color = "#0284c7"
+                label = f"#{tid} (Audio)" if tid else u
+            else:
+                badge = "URL"
+                color = "#64748b"
+                label = u
+
+            if len(label) > 42:
+                label = label[:22] + "..." + label[-16:]
+
+            return badge, label, color
+        except Exception:
+            return "URL", u[:30], "#64748b"
+
     def init_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 3, 6, 3)
+        layout.setContentsMargins(6, 3, 6, 3)
         layout.setSpacing(6)
 
-        display_text = self.url
-        if len(display_text) > 42:
-            display_text = display_text[:22] + "..." + display_text[-17:]
+        badge_text, display_text, badge_bg = self._format_chip_details(self.url)
+        if self.category:
+            badge_text = self.category.upper()
+
+        # Category Badge
+        self.lbl_badge = QLabel(badge_text, self)
+        self.lbl_badge.setStyleSheet(
+            f"""
+            background-color: {badge_bg};
+            color: #ffffff;
+            font-size: 9px;
+            font-weight: 700;
+            padding: 1px 5px;
+            border-radius: 4px;
+            letter-spacing: 0.3px;
+        """
+        )
+        layout.addWidget(self.lbl_badge)
 
         self.lbl_text = QLabel(display_text, self)
-        self.lbl_text.setToolTip(self.url)
+        self.lbl_text.setToolTip(f"[{badge_text}] {self.url}")
         self.lbl_text.setStyleSheet(
             "color: #e2e8f0; font-size: 11px; font-weight: 500;"
         )
         layout.addWidget(self.lbl_text)
-
-        self.btn_close = QPushButton("✕", self)
-        self.btn_close.setObjectName("ChipCloseButton")
-        if hasattr(self.btn_close, "setFixedSize"):
-            self.btn_close.setFixedSize(16, 16)
-        self.btn_close.setStyleSheet(
-            """
-            QPushButton#ChipCloseButton {
-                background: transparent;
-                color: #a0aec0;
-                border: none;
-                font-size: 10px;
-                font-weight: bold;
-                padding: 0;
-            }
-            QPushButton#ChipCloseButton:hover {
-                color: #ff6b6b;
-            }
-        """
-        )
-        self.btn_close.clicked.connect(lambda: self.removed.emit(self.url))
-        layout.addWidget(self.btn_close)
-
-        self.setStyleSheet(
-            """
-            QFrame#URLChipPill {
-                background: rgba(74, 134, 232, 0.18);
-                border: 1px solid rgba(74, 134, 232, 0.45);
-                border-radius: 12px;
-            }
-            QFrame#URLChipPill:hover {
-                background: rgba(74, 134, 232, 0.28);
-                border: 1px solid #4a86e8;
-            }
-        """
-        )
 
 
 class URLChipInput(QWidget):
@@ -230,36 +259,40 @@ class URLChipInput(QWidget):
         layout.addWidget(self.text_edit)
 
     def add_url_chip(self, url: str) -> None:
-        """Adds a URL to the input textbox and list."""
-        url = url.strip()
-        if not url:
+        """Adds a valid Instagram URL to the input textbox and categorizes it."""
+        from core.parser import extract_instagram_urls
+
+        valid_urls = extract_instagram_urls(url)
+        if not valid_urls:
             return
 
         current_text = self.text_edit.toPlainText().strip()
         lines = [line.strip() for line in current_text.splitlines() if line.strip()]
-        if url not in lines:
-            if current_text:
-                self.text_edit.setPlainText(current_text + "\n" + url)
-            else:
-                self.text_edit.setPlainText(url)
+        new_added = False
+        for u in valid_urls:
+            if u not in lines:
+                lines.append(u)
+                new_added = True
+
+        if new_added:
+            self._is_internal_updating = True
+            self.text_edit.setPlainText(chr(10).join(lines))
+            self._is_internal_updating = False
+            self._rebuild_chips()
+            self.urls_changed.emit()
 
     def get_targets(self) -> List[str]:
-        """Extracts all targets from the text input field."""
+        """
+        Extracts all valid Instagram targets from the text input field.
+        Filters out non-Instagram text, arbitrary comments, or invalid entries.
+        """
         raw_text = self.text_edit.toPlainText().strip()
         if not raw_text:
             return []
 
-        tokens = re.split(r"[\r\n\t,]+", raw_text)
-        targets: List[str] = []
-        seen: Set[str] = set()
+        from core.parser import extract_instagram_urls
 
-        for tok in tokens:
-            t = tok.strip()
-            if t and t not in seen:
-                seen.add(t)
-                targets.append(t)
-
-        return targets
+        return extract_instagram_urls(raw_text)
 
     def clear(self) -> None:
         """Clears the text input and resets state."""

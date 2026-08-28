@@ -207,6 +207,14 @@ class MediaCard(QFrame):
         self.item_data = dict(item_data)
         self.item_id = str(item_data.get("id") or item_data.get("shortcode") or "")
         self.shortcode = str(item_data.get("shortcode") or "")
+        self.item_url: str = str(
+            item_data.get("url")
+            or (
+                f"https://www.instagram.com/reel/{self.shortcode}/"
+                if self.shortcode
+                else ""
+            )
+        )
         self.is_selected: bool = bool(item_data.get("selected", True))
         self.status: str = item_data.get("status", "ready")
         self.is_finished: bool = False
@@ -366,7 +374,33 @@ class MediaCard(QFrame):
         meta_row.addStretch()
         info_layout.addLayout(meta_row)
 
-        # --- Line 3: Real-Time Status Lifecycle ---
+        # --- Line 3: Direct URL Link ---
+        url_row = QHBoxLayout()
+        url_row.setSpacing(6)
+
+        display_url = self.item_url
+        if len(display_url) > 60:
+            display_url = display_url[:35] + "..." + display_url[-18:]
+
+        self.lbl_url = QLabel(
+            f'<a href="{self.item_url}" style="color: #60a5fa; text-decoration: none;">🔗 {display_url}</a>',
+            self,
+        )
+        if hasattr(self.lbl_url, "setOpenExternalLinks"):
+            self.lbl_url.setOpenExternalLinks(True)
+        if hasattr(self.lbl_url, "setTextInteractionFlags") and "Qt" in globals():
+            self.lbl_url.setTextInteractionFlags(
+                getattr(Qt.TextInteractionFlag, "TextBrowserInteraction", 1)
+                | getattr(Qt.TextInteractionFlag, "TextSelectableByMouse", 1)
+            )
+        self.lbl_url.setToolTip(f"Instagram Link: {self.item_url}")
+        self.lbl_url.setStyleSheet("font-size: 11px; font-weight: 500;")
+        url_row.addWidget(self.lbl_url)
+        url_row.addStretch()
+        info_layout.addLayout(url_row)
+
+        # --- Line 4: Real-Time Status Lifecycle ---
+
         status_row = QHBoxLayout()
         status_row.setSpacing(8)
 
@@ -421,20 +455,50 @@ class MediaCard(QFrame):
         self.btn_delete.clicked.connect(lambda: self.deleted.emit())
         main_layout.addWidget(self.btn_delete)
 
-        # Card container styling
-        self.setStyleSheet(
+    def _update_selection_style(self) -> None:
+        """Updates border, glow, and background tint when card selection state changes."""
+        if self.is_selected:
+            self.setStyleSheet(
+                """
+                QFrame#MediaCardFrame {
+                    background-color: #171c2e;
+                    border: 1.5px solid #3b82f6;
+                    border-radius: 10px;
+                }
+                QFrame#MediaCardFrame:hover {
+                    background-color: #1c233a;
+                    border: 1.5px solid #60a5fa;
+                }
             """
-            QFrame#MediaCardFrame {
-                background-color: #14141e;
-                border: 1px solid #232332;
-                border-radius: 10px;
-            }
-            QFrame#MediaCardFrame:hover {
-                background-color: #181826;
-                border: 1px solid #3b82f6;
-            }
-        """
-        )
+            )
+        else:
+            self.setStyleSheet(
+                """
+                QFrame#MediaCardFrame {
+                    background-color: #14141e;
+                    border: 1px solid #232332;
+                    border-radius: 10px;
+                }
+                QFrame#MediaCardFrame:hover {
+                    background-color: #181826;
+                    border: 1px solid #3b82f6;
+                }
+            """
+            )
+
+    def mousePressEvent(self, event) -> None:
+        """Toggles selection when clicking anywhere on the card outside interactive controls."""
+        if (
+            hasattr(event, "button")
+            and "Qt" in globals()
+            and hasattr(Qt, "MouseButton")
+        ):
+            if event.button() != getattr(Qt.MouseButton, "LeftButton", 1):
+                super().mousePressEvent(event)
+                return
+        self.set_selected(not self.is_selected)
+        self.selection_changed.emit()
+        super().mousePressEvent(event)
 
     def _get_badge_style(self, badge_type: str) -> str:
         """Returns tailored badge background and text colors."""
@@ -558,6 +622,7 @@ class MediaCard(QFrame):
     def _on_check_changed(self, state: int) -> None:
         self.is_selected = state == 2 or state is True
         self.item_data["selected"] = self.is_selected
+        self._update_selection_style()
         self.selection_changed.emit()
 
     def set_selected(self, selected: bool) -> None:
@@ -565,6 +630,7 @@ class MediaCard(QFrame):
         self.item_data["selected"] = selected
         if hasattr(self.chk_select, "setChecked"):
             self.chk_select.setChecked(selected)
+        self._update_selection_style()
 
     def set_status(self, status: str) -> None:
         self.status = status
@@ -592,3 +658,30 @@ class MediaCard(QFrame):
 
     def get_item_data(self) -> Dict[str, Any]:
         return dict(self.item_data)
+
+    def cleanup(self) -> None:
+        """Safely stops background thumbnail loaders and disconnects slots to prevent memory leaks."""
+        if self._is_cleaned_up:
+            return
+        self._is_cleaned_up = True
+
+        if self.thumb_loader:
+            try:
+                if hasattr(self.thumb_loader, "loaded") and self.thumb_loader.loaded:
+                    self.thumb_loader.loaded.disconnect(self._on_thumbnail_loaded)
+            except Exception:
+                pass
+            if hasattr(self.thumb_loader, "cancel"):
+                self.thumb_loader.cancel()
+            if hasattr(self.thumb_loader, "wait"):
+                try:
+                    self.thumb_loader.wait(200)
+                except Exception:
+                    pass
+            self.thumb_loader = None
+
+        if hasattr(self, "lbl_thumb") and hasattr(self.lbl_thumb, "clear"):
+            try:
+                self.lbl_thumb.clear()
+            except Exception:
+                pass
