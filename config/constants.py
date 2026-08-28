@@ -2,16 +2,8 @@
 config/constants.py - Global constants and configuration values.
 """
 
-INSTAGRAM_URL_REGEX = (
-    r"https?://(?:www\.)?instagram\.com/"
-    r"(?:stories/highlights/[0-9]+|"
-    r"stories/[A-Za-z0-9_\-\.]+(?:/[0-9]+)?|"
-    r"reel/[A-Za-z0-9_\-\.]+|"
-    r"reels/[A-Za-z0-9_\-\.]+|"
-    r"p/[A-Za-z0-9_\-\.]+|"
-    r"tv/[A-Za-z0-9_\-\.]+|"
-    r"(?!explore|accounts|direct|api)[A-Za-z0-9_\-\.]+(?:/(?:reels|tagged))?)/?"
-)
+# Updated regex to securely capture standard URLs as well as /reels/ and /stories/ subpaths
+INSTAGRAM_URL_REGEX = r"https?://(?:www\.)?instagram\.com/(?:p/[A-Za-z0-9_\-\.]+|reel/[A-Za-z0-9_\-\.]+|stories/[A-Za-z0-9_\-\.]+/[0-9]+|[A-Za-z0-9_\-\.]+/?(?:reels/?|live/?)?)"
 
 MOBILE_UA = (
     "Instagram 278.0.0.19.115 Android "

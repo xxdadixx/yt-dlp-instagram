@@ -543,42 +543,65 @@ class MainWindow(QMainWindow):
             self.lbl_footer.setText(self.t("footer_clip_detected"))
             self.lbl_footer.setStyleSheet("color: #28a745; font-size: 10px;")
 
+    def clear_media_grid(self) -> None:
+        """Removes all existing media card widgets from the grid/layout."""
+        while self.cards_layout.count():
+            item = self.cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.cards.clear()
+        self.update_selection_ui()
+
     def start_inspection(self) -> None:
         targets = self.url_container.get_targets()
         if not targets:
-            QMessageBox.warning(self, "Warning", self.t("warn_no_url"))
-            return
-
-        has_story = any(
-            t["type"] in ("story", "highlight", "story_user") for t in targets
-        )
-
-        if has_story and not os.path.exists(self.cookie_path):
             QMessageBox.warning(
-                self, "Cookie Required", self.t("warn_story_need_cookie")
+                self, "Warning", "Please add at least one Instagram URL."
             )
             return
 
+        # 1. Clear previous media cards
+        self.clear_media_grid()
+
+        # 2. Update UI Controls and Progress Bar
         self.btn_inspect.setEnabled(False)
         self.btn_download_all.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.lbl_status.setText(self.t("status_inspecting"))
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)  # Reset progress bar
+        self.lbl_status.setText("Starting inspection...")
 
-        existing_shortcodes = {
-            card.data.get("shortcode")
-            for card in self.cards
-            if card.data.get("shortcode")
+        # 3. Extract existing shortcodes from current cards
+        existing_codes = {
+            c.data.get("shortcode") for c in self.cards if c.data.get("shortcode")
         }
 
+        # 4. Start worker using self.inspect_worker
         self.inspect_worker = InspectionWorker(
-            targets, self.cookie_path, existing_shortcodes=existing_shortcodes
+            targets=targets,
+            cookie_path=self.cookie_path,
+            existing_shortcodes=existing_codes,
         )
-        self.inspect_worker.item_inspected.connect(self.add_card)
-        self.inspect_worker.progress_status.connect(
-            lambda msg: self.lbl_status.setText(msg)
-        )
+        self.inspect_worker.item_inspected.connect(self.on_item_inspected)
+        self.inspect_worker.progress_status.connect(self.on_inspect_status)
         self.inspect_worker.finished_inspection.connect(self.on_inspection_finished)
         self.inspect_worker.start()
+
+    def on_inspect_status(self, message: str) -> None:
+        self.lbl_status.setText(message)
+
+    def on_item_inspected(self, item_data: dict) -> None:
+        self.add_card(item_data)
+
+    def on_inspection_finished(self, count: int) -> None:
+        self.progress_bar.setValue(100)  # Mark inspection complete
+        self.btn_inspect.setEnabled(True)
+        self.btn_download_all.setEnabled(len(self.cards) > 0)
+        self.btn_cancel.setEnabled(False)
+        self.lbl_status.setText(self.t("inspect_done").format(count=len(self.cards)))
+        self.url_container.clear()
+        self.update_selection_ui()
 
     def add_card(self, data: dict) -> None:
         shortcode = data.get("shortcode")
