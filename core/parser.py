@@ -160,10 +160,51 @@ def normalize_url(url: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
 
-    # Normalize mobile share links to canonical paths
-    path = re.sub(r"^/share/(p|reel|reels|tv)/", r"/\g<1>/", path, flags=re.IGNORECASE)
+    # Normalize share paths, shorthand, and in-profile media paths
+    path = re.sub(r"^/share/(?:p|post)/", r"/p/", path, flags=re.IGNORECASE)
+    path = re.sub(r"^/share/(?:reel|reels|r)/", r"/reel/", path, flags=re.IGNORECASE)
+    path = re.sub(r"^/share/tv/", r"/tv/", path, flags=re.IGNORECASE)
+    path = re.sub(r"^/post/", r"/p/", path, flags=re.IGNORECASE)
+    path = re.sub(r"^/r/", r"/reel/", path, flags=re.IGNORECASE)
 
-    if not path.endswith("/") and not path.endswith((".jpg", ".png", ".mp4")):
+    path = re.sub(
+        r"^/[a-zA-Z0-9_.]+/p/([a-zA-Z0-9_\-]+)/?",
+        r"/p/\g<1>/",
+        path,
+        flags=re.IGNORECASE,
+    )
+    path = re.sub(
+        r"^/[a-zA-Z0-9_.]+/reel/([a-zA-Z0-9_\-]+)/?",
+        r"/reel/\g<1>/",
+        path,
+        flags=re.IGNORECASE,
+    )
+    path = re.sub(
+        r"^/[a-zA-Z0-9_.]+/reels/([a-zA-Z0-9_\-]+)/?",
+        r"/reel/\g<1>/",
+        path,
+        flags=re.IGNORECASE,
+    )
+    path = re.sub(
+        r"^/[a-zA-Z0-9_.]+/post/([a-zA-Z0-9_\-]+)/?",
+        r"/p/\g<1>/",
+        path,
+        flags=re.IGNORECASE,
+    )
+    path = re.sub(
+        r"^/[a-zA-Z0-9_.]+/tv/([a-zA-Z0-9_\-]+)/?",
+        r"/tv/\g<1>/",
+        path,
+        flags=re.IGNORECASE,
+    )
+    path = re.sub(
+        r"^/[a-zA-Z0-9_.]+/r/([a-zA-Z0-9_\-]+)/?",
+        r"/reel/\g<1>/",
+        path,
+        flags=re.IGNORECASE,
+    )
+
+    if not path.endswith("/") and not path.endswith((".jpg", ".png", ".mp4", ".webp")):
         path += "/"
 
     clean_url = urlunparse(("https", netloc, path, "", "", ""))

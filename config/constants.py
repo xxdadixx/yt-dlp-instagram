@@ -84,28 +84,33 @@ REQUEST_DELAY_SECONDS: float = 0.5
 DEFAULT_REQUEST_TIMEOUT: int = 15
 
 # URL Regular Expressions
+# URL Regular Expressions
 REELS_TAB_REGEX = re.compile(
-    r"^https?:\/\/(?:www\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am)\/([a-zA-Z0-9_\.]+)\/reels\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/([a-zA-Z0-9_\.]+)\/reels\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 POST_REEL_REGEX = re.compile(
-    r"^https?:\/\/(?:www\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am)\/(?:share\/)?(?:p|reel|reels|tv)\/([a-zA-Z0-9_\-]+)\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:(?:[a-zA-Z0-9_.]+\/)?(?:share\/)?(?:p|post|reel|reels|tv|r)\/([a-zA-Z0-9_\-]+)|(?:share\/(?:p|post|reel|reels|tv|r)\/([a-zA-Z0-9_\-]+)))\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 STORIES_REGEX = re.compile(
-    r"^https?:\/\/(?:www\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com)\/stories\/([a-zA-Z0-9_\.]+)(?:\/(\d+))?\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/stories\/([a-zA-Z0-9_\.]+)(?:\/([a-zA-Z0-9_\-]+))?\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 HIGHLIGHTS_REGEX = re.compile(
-    r"^https?:\/\/(?:www\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com)\/(?:stories\/highlights\/([a-zA-Z0-9_\-]+)|s\/([a-zA-Z0-9_\-]+))\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:stories\/highlights\/([a-zA-Z0-9_\-]+)|s\/([a-zA-Z0-9_\-]+))\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 AUDIO_REGEX = re.compile(
-    r"^https?:\/\/(?:www\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com)\/(?:reels\/audio|audio)\/([a-zA-Z0-9_\-]+)\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:reels\/audio|audio)\/([a-zA-Z0-9_\-]+)\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 PROFILE_REGEX = re.compile(
-    r"^https?:\/\/(?:www\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am)\/([a-zA-Z0-9_\.]+)\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/([a-zA-Z0-9_\.]+)\/?(?:\?.*)?$",
+    re.IGNORECASE,
+)
+DIRECT_CDN_REGEX = re.compile(
+    r"^https?:\/\/[a-zA-Z0-9_\-.]*(?:cdninstagram\.com|fbcdn\.net)\/[^\s]+$",
     re.IGNORECASE,
 )
 
