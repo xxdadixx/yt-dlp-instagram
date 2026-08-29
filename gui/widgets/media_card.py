@@ -1,8 +1,3 @@
-"""
-gui/widgets/media_card.py - High-end modern Media Card widget for inspected Instagram media items.
-Features aspect-ratio-preserving vertical thumbnails, badges, rich metadata, safe lifecycle cleanup, and queue controls.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -23,6 +18,11 @@ except ImportError:
         "HIGHLIGHT": {"bg": "#F59E0B", "fg": "#000000"},
         "AUDIO": {"bg": "#10B981", "fg": "#FFFFFF"},
     }
+
+"""
+gui/widgets/media_card.py - High-end modern Media Card widget for inspected Instagram media items.
+Features aspect-ratio-preserving vertical thumbnails, badges, rich metadata, safe lifecycle cleanup, and queue controls.
+"""
 
 try:
     from core.parser import parse_instagram_url

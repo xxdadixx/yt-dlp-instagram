@@ -28,8 +28,9 @@ class CookieManager:
         self.storage_dir = storage_dir
         os.makedirs(self.storage_dir, exist_ok=True)
         self.cookie_file_path = os.path.join(self.storage_dir, "instagram_cookies.txt")
+        self.cookies: Dict[str, str] = {}
         self._cookie_string: str = ""
-        self._load_stored_cookie()
+        self.load_saved_cookies()
 
     def _load_stored_cookie(self) -> None:
         """Loads and parses existing cookie file if available."""
@@ -373,84 +374,144 @@ class CookieManager:
 
         return header_str, netscape_content
 
-    def import_cookie_file(self, src_path: str) -> bool:
+    def import_cookie_file(self, file_path: str) -> bool:
         """
-        Imports cookie from a file (Netscape .txt, JSON, or text),
-        parses into standard formats, and writes to config storage.
+        Parses Netscape cookies.txt or raw header strings robustly.
         """
-        if not src_path or not os.path.exists(src_path):
+        if not os.path.exists(file_path):
             return False
+
         try:
-            content = self._read_file_content(src_path)
-            header_str, netscape_content = self._parse_cookie_data(content)
-            if not header_str:
-                return False
-
-            with open(self.cookie_file_path, "w", encoding="utf-8") as f:
-                f.write(netscape_content)
-
-            self._cookie_string = header_str
-            return True
-        except Exception as e:
-            logger.debug(f"Cookie import failed: {e}")
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            return self.import_cookie_string(content)
+        except Exception:
             return False
 
-    def import_cookie_string(self, raw_str: str) -> bool:
-        """Imports raw cookie string or JSON string directly."""
-        if not raw_str:
+    def import_cookie_string(self, raw_data: str) -> bool:
+        """
+        Parses Netscape format or standard HTTP 'Cookie: name=value' strings.
+        """
+        if not raw_data or not raw_data.strip():
             return False
-        try:
-            header_str, netscape_content = self._parse_cookie_data(raw_str)
-            if not header_str:
-                return False
-            with open(self.cookie_file_path, "w", encoding="utf-8") as f:
-                f.write(netscape_content)
-            self._cookie_string = header_str
-            return True
-        except Exception as e:
-            logger.debug(f"Cookie string import failed: {e}")
+
+        parsed: Dict[str, str] = {}
+        lines = raw_data.strip().splitlines()
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Case 1: Netscape HTTP Cookie format (tab-delimited)
+            if "\t" in line:
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    name = parts[5].strip()
+                    val = parts[6].strip().strip('"')  # Strip outer quotes (e.g. rur)
+                    if name and val:
+                        parsed[name] = val
+                elif len(parts) >= 2:
+                    name = parts[0].strip()
+                    val = parts[1].strip().strip('"')
+                    if name and val:
+                        parsed[name] = val
+
+            # Case 2: Raw HTTP Cookie Header format (name=value; name2=value2)
+            elif "=" in line:
+                tokens = line.split(";")
+                for token in tokens:
+                    if "=" in token:
+                        k, v = token.split("=", 1)
+                        name = k.strip().lstrip("Cookie:").strip()
+                        val = v.strip().strip('"')
+                        if name and val:
+                            parsed[name] = val
+
+        if not parsed:
             return False
+
+        self.cookies.update(parsed)
+        self._cookie_string = self.get_cookie_string()
+        self.save_to_netscape_file()
+        return self.is_authenticated()
 
     def get_cookie_string(self) -> str:
-        """Returns the cookie header string (k1=v1; k2=v2)."""
-        return self._cookie_string
+        """Returns standard 'name=value; name2=value2' string for urllib/requests headers."""
+        if not self.cookies:
+            return ""
+        return "; ".join([f"{k}={v}" for k, v in self.cookies.items()])
 
-    def get_cookie_file_path(self) -> str:
-        """Returns the path to the valid Netscape cookie file if it exists."""
-        return (
-            self.cookie_file_path
-            if (os.path.exists(self.cookie_file_path) and self._cookie_string)
-            else ""
-        )
+    def get_cookie_file_path(self) -> Optional[str]:
+        """Returns the path to a valid Netscape cookie file on disk for yt-dlp."""
+        if self.save_to_netscape_file():
+            return self.cookie_file_path
+        return None
+
+    def save_to_netscape_file(self) -> bool:
+        """
+        Saves currently stored cookies in strict Netscape tab-separated format
+        for yt-dlp compatibility.
+        """
+        if not self.cookies:
+            return False
+
+        try:
+            # 1 year expiration timestamp from current time
+            expiry = str(int(time.time()) + 31536000)
+            lines = [
+                "# Netscape HTTP Cookie File",
+                "# https://curl.haxx.se/rfc/cookie_spec.html",
+                "# This is a generated file! Do not edit.",
+                "",
+            ]
+
+            for name, val in self.cookies.items():
+                # Format: domain \t flag \t path \t secure \t expiry \t name \t value
+                line = f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\t{name}\t{val}"
+                lines.append(line)
+
+            with open(self.cookie_file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+
+            return True
+        except Exception:
+            return False
+
+    def load_saved_cookies(self) -> None:
+        """Loads previously saved cookies on startup."""
+        if os.path.exists(self.cookie_file_path):
+            self.import_cookie_file(self.cookie_file_path)
 
     def has_cookies(self) -> bool:
         """Checks if any cookies are currently loaded."""
-        return bool(self._cookie_string)
+        return bool(self.cookies) or bool(self._cookie_string)
 
     def has_authenticated_cookies(self) -> bool:
         """Checks if authenticated session cookies (sessionid) are loaded."""
         return bool(self.get_session_id())
 
     def get_csrf_token(self) -> Optional[str]:
-        """Extracts csrftoken from current cookie string."""
-        if not self._cookie_string:
-            return None
-        m = re.search(r"(?:^|;\s*|\b)csrftoken=([^;]+)", self._cookie_string)
-        return m.group(1) if m else None
+        """Extracts csrftoken from parsed cookies."""
+        return self.cookies.get("csrftoken")
 
     def get_user_id(self) -> Optional[str]:
-        """Extracts ds_user_id from current cookie string."""
-        if not self._cookie_string:
-            return None
-        m = re.search(r"(?:^|;\s*|\b)ds_user_id=([^;]+)", self._cookie_string)
-        return m.group(1) if m else None
+        """Extracts ds_user_id from parsed cookies."""
+        return self.cookies.get("ds_user_id")
 
     def get_session_id(self) -> Optional[str]:
-        """Extracts sessionid from current cookie string."""
-        if not self._cookie_string:
+        """Extracts sessionid from parsed cookies or raw string."""
+        if "sessionid" in self.cookies:
+            return self.cookies["sessionid"]
+        c_str = self.get_cookie_string() or self._cookie_string
+        if not c_str:
             return None
-        m = re.search(r"(?:^|;\s*|\b)sessionid=([^;]+)", self._cookie_string)
+        m = re.search(r"(?:^|;\s*|\b)sessionid=([^;]+)", c_str)
         return m.group(1) if m else None
+
+    def is_authenticated(self) -> bool:
+        """Validates if essential Instagram authentication tokens exist."""
+        return bool(self.cookies.get("sessionid") or self.cookies.get("ds_user_id"))
 
     def clear_cookies(self) -> None:
         """Deletes stored cookie file and resets state."""
@@ -459,4 +520,5 @@ class CookieManager:
                 os.remove(self.cookie_file_path)
             except Exception:
                 pass
+        self.cookies.clear()
         self._cookie_string = ""

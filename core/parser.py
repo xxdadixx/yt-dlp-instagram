@@ -438,34 +438,6 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 ),
             }
 
-    profile_match = PROFILE_REGEX.match(clean_url)
-    if profile_match:
-        username = profile_match.group(1).lower()
-        if username not in RESERVED_USERNAMES:
-            return {
-                "type": "profile",
-                "valid": True,
-                "username": username,
-                "shortcode": None,
-                "target_id": None,
-                "img_index": None,
-                "clean_url": clean_url,
-                "raw_url": url,
-                "description": f"@{username} Profile",
-            }
-
-    return {
-        "type": "unknown",
-        "valid": False,
-        "username": None,
-        "shortcode": None,
-        "target_id": None,
-        "img_index": None,
-        "clean_url": clean_url,
-        "raw_url": url,
-        "description": "Unknown Target",
-    }
-
 
 parse_url = parse_instagram_url
 

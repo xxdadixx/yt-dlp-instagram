@@ -145,12 +145,20 @@ class InspectWorker(QThread):
         self._csrf_token: Optional[str] = self._extract_csrf_token()
         self._ssl_ctx = ssl._create_unverified_context()
 
-        if (
-            not self.cookie_str
-            and self.cookie_file
-            and os.path.exists(self.cookie_file)
-        ):
-            self._load_cookie_file(self.cookie_file)
+        if not self.cookie_str and not self.cookie_file:
+            try:
+                from core.cookie_manager import CookieManager
+
+                cm = CookieManager(storage_dir="config")
+                c_str = cm.get_cookie_string()
+                if c_str:
+                    self.cookie_str = c_str
+                    self._csrf_token = cm.get_csrf_token()
+                fpath = cm.get_cookie_file_path()
+                if fpath and os.path.exists(fpath):
+                    self.cookie_file = fpath
+            except Exception:
+                pass
 
     def cancel(self) -> None:
         """Gracefully flags the worker to cancel processing."""
@@ -950,10 +958,6 @@ class InspectWorker(QThread):
             if cfile and os.path.exists(cfile):
                 ydl_opts["cookiefile"] = cfile
 
-            clean_url = url
-            if REELS_TAB_REGEX.match(clean_url):
-                clean_url = re.sub(r"/reels/?.*$", "/", clean_url)
-
             clean_url = normalize_url(url) or url
             if REELS_TAB_REGEX.match(clean_url):
                 clean_url = re.sub(r"/reels/?.*$", "/", clean_url)
@@ -1014,7 +1018,6 @@ class InspectWorker(QThread):
                         or (entry.get("ext") == "mp4")
                     )
 
-                    # Context-aware type detection
                     is_story = (
                         "/stories/" in url.lower() and "/highlights/" not in url.lower()
                     )
@@ -1047,7 +1050,6 @@ class InspectWorker(QThread):
                     else:
                         badge_media_type = "VIDEO" if has_video else "IMAGE"
 
-                    # Select highest quality direct stream
                     direct_url = ""
                     entry_raw_url = entry.get("url")
                     if isinstance(entry_raw_url, str) and entry_raw_url.startswith(
@@ -1124,7 +1126,6 @@ class InspectWorker(QThread):
                     if card_id in self.seen_ids:
                         continue
 
-                    # Canonical URLs and Titles per type
                     if is_story:
                         slide_title = (
                             f"@{uploader} Story ({idx}/{total_entries})"
