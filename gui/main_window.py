@@ -1,6 +1,5 @@
 """
-gui/main_window.py - Main GUI Window for Instagram Pro Downloader & Studio Inspector.
-Handles worker coordination, persistent settings, cookie management, and media card grid lifecycle.
+gui/main_window.py - Instagram Pro Studio Main Window with Profile Mode Selector.
 """
 
 from __future__ import annotations
@@ -12,830 +11,441 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional
 
-try:
-    from PyQt6.QtCore import (
-        QSize,
-        Qt,
-        QThread,
-        QTimer,
-        QUrl,
-        pyqtSignal,
-    )
-    from PyQt6.QtGui import (
-        QClipboard,
-        QColor,
-        QDesktopServices,
-        QFont,
-        QIcon,
-        QKeySequence,
-        QShortcut,
-    )
-    from PyQt6.QtWidgets import (
-        QApplication,
-        QCheckBox,
-        QComboBox,
-        QFileDialog,
-        QFrame,
-        QGridLayout,
-        QHBoxLayout,
-        QLabel,
-        QLineEdit,
-        QMainWindow,
-        QMessageBox,
-        QPushButton,
-        QScrollArea,
-        QSizePolicy,
-        QSpacerItem,
-        QVBoxLayout,
-        QWidget,
-    )
-except ImportError:
+# Suppress Windows OLE clipboard mutex retry logs
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime=false;qt.qpa.*=false"
 
-    class MagicSignal:
-        def __init__(self):
-            self._slots = []
-
-        def connect(self, f):
-            self._slots.append(f)
-
-        def emit(self, *a, **kw):
-            for s in self._slots:
-                try:
-                    s(*a, **kw)
-                except Exception:
-                    pass
-
-    class QSize:
-        def __init__(self, w=0, h=0):
-            self.w, self.h = w, h
-
-    class QWidget:  # type: ignore
-        def __init__(self, parent=None):
-            pass
-
-        def setStyleSheet(self, *a):
-            pass
-
-        def setObjectName(self, *a):
-            pass
-
-        def resize(self, *a):
-            pass
-
-        def setMinimumSize(self, *a):
-            pass
-
-    class QMainWindow(QWidget):
-        def setCentralWidget(self, *a):
-            pass
-
-        def setWindowTitle(self, *a):
-            pass
-
-    class QVBoxLayout:
-        def __init__(self, parent=None):
-            pass
-
-        def setContentsMargins(self, *a):
-            pass
-
-        def setSpacing(self, *a):
-            pass
-
-        def addWidget(self, *a, **kw):
-            pass
-
-        def addLayout(self, *a, **kw):
-            pass
-
-        def addStretch(self, *a):
-            pass
-
-        def addSpacing(self, *a):
-            pass
-
-        def insertWidget(self, *a):
-            pass
-
-        def removeWidget(self, *a):
-            pass
-
-        def count(self):
-            return 0
-
-    class QHBoxLayout(QVBoxLayout):
-        pass
-
-    class QLabel(QWidget):
-        def __init__(self, text="", parent=None):
-            super().__init__(parent)
-
-        def setText(self, *a):
-            pass
-
-        def text(self):
-            return ""
-
-        def setToolTip(self, *a):
-            pass
-
-        def setStyleSheet(self, *a):
-            pass
-
-    class QPushButton(QWidget):
-        def __init__(self, text="", parent=None):
-            super().__init__(parent)
-            self.clicked = MagicSignal()
-
-        def setText(self, *a):
-            pass
-
-        def text(self):
-            return ""
-
-        def setIcon(self, *a):
-            pass
-
-        def setIconSize(self, *a):
-            pass
-
-        def setEnabled(self, *a):
-            pass
-
-        def setToolTip(self, *a):
-            pass
-
-        def setStyleSheet(self, *a):
-            pass
-
-    class QCheckBox(QWidget):
-        def __init__(self, text="", parent=None):
-            super().__init__(parent)
-            self._checked = False
-            self.stateChanged = MagicSignal()
-
-        def setChecked(self, c: bool):
-            self._checked = c
-            self.stateChanged.emit(c)
-
-        def isChecked(self) -> bool:
-            return self._checked
-
-        def setText(self, *a):
-            pass
-
-        def text(self):
-            return ""
-
-    class QScrollArea(QWidget):
-        def __init__(self, parent=None):
-            super().__init__(parent)
-
-        def setWidgetResizable(self, *a):
-            pass
-
-        def setFrameShape(self, *a):
-            pass
-
-        def setWidget(self, *a):
-            pass
-
-    class QFrame(QWidget):
-        class Shape:
-            NoFrame = 0
-
-    class QKeySequence:
-        def __init__(self, s=""):
-            pass
-
-    class QShortcut:
-        def __init__(self, seq, parent, callback=None):
-            pass
-
-    class QFileDialog:
-        @staticmethod
-        def getOpenFileName(*a, **kw):
-            return ("", "")
-
-        @staticmethod
-        def getExistingDirectory(*a, **kw):
-            return ""
-
-    class QApplication:
-        @staticmethod
-        def clipboard():
-            class Clip:
-                dataChanged = MagicSignal()
-
-                def text(self):
-                    return ""
-
-            return Clip()
-
-    class QTimer:
-        @staticmethod
-        def singleShot(ms, f):
-            pass
-
-
-from config.constants import (
-    APP_NAME,
-    APP_USER_MODEL_ID,
-    APP_VERSION,
-    DEFAULT_HEADERS,
-    QUALITY_PRESETS,
+from PyQt6.QtCore import (
+    QByteArray,
+    QEasingCurve,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTimer,
 )
+from PyQt6.QtGui import QFont, QKeySequence, QShortcut
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QScrollArea,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from config.constants import APP_NAME
+from config.translations import TRANSLATIONS
 from core.cookie_manager import CookieManager
+from core.download_worker import DownloadWorker
 from core.inspect_worker import InspectWorker
-
-try:
-    from config.translations import TRANSLATIONS
-except ImportError:
-    TRANSLATIONS = {}
-
-try:
-    from gui.icons import get_icon
-except ImportError:
-
-    def get_icon(name: str, color: str = "#ffffff", size: int = 18):
-        return None
-
-
-try:
-    from core.download_worker import DownloadWorker
-except ImportError:
-
-    class DownloadWorker:  # type: ignore
-        def __init__(self, *a, **kw):
-            pass
-
-        def isRunning(self):
-            return False
-
-        def start(self):
-            pass
-
-        def cancel(self):
-            pass
-
-
-try:
-    from gui.widgets.url_chip_input import URLChipInput
-except ImportError:
-
-    class URLChipInput(QWidget):  # type: ignore
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self._urls: List[str] = []
-
-        def get_targets(self) -> List[str]:
-            return list(self._urls)
-
-        def add_url_chip(self, u: str) -> None:
-            self._urls.append(u)
-
-        def clear(self) -> None:
-            self._urls.clear()
-
-
-try:
-    from gui.widgets.media_card import MediaCard
-except ImportError:
-
-    class MediaCard(QWidget):  # type: ignore
-        def __init__(self, item_data, parent=None):
-            super().__init__(parent)
-            self.item_data = item_data
-            self.is_selected = True
-            self.deleted = MagicSignal()
-            self.selection_changed = MagicSignal()
-
-        def set_selected(self, s: bool):
-            self.is_selected = s
-
-        def deleteLater(self):
-            pass
-
-        def setParent(self, p):
-            pass
-
-
-try:
-    from gui.widgets.modern_progress_bar import ModernProgressBar
-except ImportError:
-
-    class ModernProgressBar(QWidget):  # type: ignore
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self._val = 0
-
-        def setValue(self, val: int) -> None:
-            self._val = val
-
-        def value(self) -> int:
-            return self._val
-
-
-try:
-    from gui.widgets.no_scroll_combo import NoScrollComboBox
-except ImportError:
-
-    class NoScrollComboBox(QWidget):  # type: ignore
-        def __init__(self, parent=None):
-            super().__init__(parent)
-
-        def addItems(self, *a):
-            pass
-
-        def setCurrentIndex(self, *a):
-            pass
-
-        def currentIndex(self):
-            return 0
-
-        def currentText(self):
-            return ""
-
-
-try:
-    from gui.styles import DARK_STYLESHEET
-except ImportError:
-    DARK_STYLESHEET = ""
+from core.parser import extract_instagram_urls
+from gui.icons import get_icon
+from gui.styles import DARK_STYLESHEET
+from gui.widgets.media_card import MediaCard
+from gui.widgets.modern_progress_bar import ModernProgressBar
+from gui.widgets.no_scroll_combo import NoScrollComboBox
+from gui.widgets.url_chip_input import URLChipInput
 
 logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    """
-    Main Application Window for Instagram Pro Downloader - Studio Inspector.
-    Provides complete URL entry, progress visualization, media card grid management,
-    persistent link settings, and seamless cookie importing.
-    """
-
     SETTINGS_FILE = os.path.join("config", "settings.json")
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.cards: List[MediaCard] = []
         self.inspect_worker: Optional[InspectWorker] = None
         self.download_worker: Optional[DownloadWorker] = None
 
-        # Cookie Management
+        # Cookie Manager
         self.cookie_manager = CookieManager()
         self.cookie_str: str = self.cookie_manager.get_cookie_string()
-        self.cookie_file: str = self.cookie_manager.get_cookie_file_path()
+        self.cookie_file: str = self.cookie_manager.get_cookie_file_path() or ""
 
-        # Defaults before settings load
+        # Defaults
         self.save_folder: str = os.path.abspath("downloads")
         self.current_lang: str = "en"
         self.auto_clipboard: bool = True
+        self.profile_mode: str = "all"  # "all", "reels", "photos"
         self.quality_preset: str = "best_video"
         self._last_clipboard_text: str = ""
+        self._queue_scroll_anim: Optional[QPropertyAnimation] = None
 
-        # Load persistent settings
+        # Window Position & Geometry State
+        self._saved_geometry_hex: str = ""
+        self._is_maximized: bool = False
+
         self.load_settings()
         os.makedirs(self.save_folder, exist_ok=True)
 
         self.init_ui()
-        self.apply_loaded_settings()
+        self.apply_translations()
         self.setup_clipboard_monitor()
         self.update_cookie_status()
 
-    # --------------------------------------------------------
-    # Settings Persistence
-    # --------------------------------------------------------
-    def load_settings(self) -> None:
-        """Loads user preferences and link settings from settings.json."""
-        if os.path.exists(self.SETTINGS_FILE):
-            try:
-                with open(self.SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    self.save_folder = data.get("save_folder", self.save_folder)
-                    self.current_lang = data.get("language", self.current_lang)
-                    self.auto_clipboard = bool(
-                        data.get("auto_clipboard", self.auto_clipboard)
-                    )
-                    self.quality_preset = data.get(
-                        "quality_preset", self.quality_preset
-                    )
-            except Exception as e:
-                logger.debug(f"Failed to load settings: {e}")
+    def tr_text(self, key: str, **kwargs) -> str:
+        lang_dict = TRANSLATIONS.get(self.current_lang, TRANSLATIONS["en"])
+        val = lang_dict.get(key, TRANSLATIONS["en"].get(key, key))
+        return val.format(**kwargs) if kwargs else val
 
-    def save_settings(self) -> None:
-        """Persists current link settings and user preferences to settings.json."""
-        try:
-            os.makedirs(os.path.dirname(self.SETTINGS_FILE), exist_ok=True)
-            if hasattr(self, "chk_clipboard") and hasattr(
-                self.chk_clipboard, "isChecked"
-            ):
-                self.auto_clipboard = self.chk_clipboard.isChecked()
-
-            settings_payload = {
-                "save_folder": self.save_folder,
-                "language": self.current_lang,
-                "auto_clipboard": self.auto_clipboard,
-                "quality_preset": self.quality_preset,
-            }
-            with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(settings_payload, f, indent=2)
-        except Exception as e:
-            logger.debug(f"Failed to save settings: {e}")
-
-    def apply_loaded_settings(self) -> None:
-        """Applies loaded settings into UI widgets."""
-        if hasattr(self, "chk_clipboard"):
-            self.chk_clipboard.setChecked(self.auto_clipboard)
-        if hasattr(self, "lbl_save_folder"):
-            self.lbl_save_folder.setText(f"Save Folder: {self.save_folder}")
-        if hasattr(self, "combo_lang"):
-            lang_idx = 1 if self.current_lang == "th" else 0
-            self.combo_lang.setCurrentIndex(lang_idx)
-            self.on_language_changed(lang_idx)
-
-    def closeEvent(self, event) -> None:
-        """Saves settings on window close."""
-        self.save_settings()
-        super().closeEvent(event) if hasattr(super(), "closeEvent") else None
-
-    # --------------------------------------------------------
-    # UI Initialization
-    # --------------------------------------------------------
     def init_ui(self) -> None:
-        self.setWindowTitle(f"{APP_NAME}")
-        self.resize(1040, 860)
-        self.setMinimumSize(920, 700)
+        self.setWindowTitle(APP_NAME)
+        self.setMinimumSize(780, 540)
         self.setStyleSheet(DARK_STYLESHEET)
+
+        if self._saved_geometry_hex:
+            try:
+                self.restoreGeometry(
+                    QByteArray.fromHex(self._saved_geometry_hex.encode("utf-8"))
+                )
+            except Exception as e:
+                logger.debug(f"Failed to restore window geometry: {e}")
+                self.resize(880, 680)
+        else:
+            self.resize(880, 680)
+
+        if self._is_maximized:
+            self.showMaximized()
 
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(14, 12, 14, 12)
+        main_layout.setSpacing(10)
 
-        # ----------------------------------------------------
-        # TOP SECTION: URL Input & Controls
-        # ----------------------------------------------------
-        top_group = QFrame(self)
-        top_group.setObjectName("TopGroupFrame")
-        top_layout = QVBoxLayout(top_group)
-        top_layout.setContentsMargins(14, 14, 14, 14)
-        top_layout.setSpacing(10)
+        # 1. Top Bar: App Brand + Cookie Status + Language
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(2, 0, 2, 0)
 
-        # 1. Header Row
-        header_row = QHBoxLayout()
-        self.lbl_group_title = QLabel(
-            "Instagram URLs (Supports Posts, Reels, Carousels, Stories Highlights)",
-            self,
-        )
-        self.lbl_group_title.setObjectName("GroupTitleLabel")
-        header_row.addWidget(self.lbl_group_title)
-        header_row.addStretch()
+        self.lbl_app_brand = QLabel("✨ Instagram Pro Studio", self)
+        self.lbl_app_brand.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.lbl_app_brand.setStyleSheet("color: #FFFFFF; letter-spacing: 0.3px;")
+        top_bar.addWidget(self.lbl_app_brand)
+
+        top_bar.addStretch()
+
+        self.lbl_cookie_status = QLabel(self)
+        self.lbl_cookie_status.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        top_bar.addWidget(self.lbl_cookie_status)
+
+        self.btn_import_cookie = QPushButton(self)
+        self._set_button_icon(self.btn_import_cookie, "key", "#FCAF45", 12)
+        self.btn_import_cookie.setFixedHeight(28)
+        self.btn_import_cookie.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_import_cookie.clicked.connect(self.import_cookie)
+        top_bar.addWidget(self.btn_import_cookie)
 
         self.combo_lang = NoScrollComboBox(self)
-        self.combo_lang.addItems(["English (US)", "ไทย (TH)"])
-        self.combo_lang.setCurrentIndex(0)
-        if hasattr(self.combo_lang, "currentIndexChanged"):
-            self.combo_lang.currentIndexChanged.connect(self.on_language_changed)
-        header_row.addWidget(self.combo_lang)
-        top_layout.addLayout(header_row)
+        self.combo_lang.addItems(["English (EN)", "ภาษาไทย (TH)"])
+        self.combo_lang.setFixedHeight(28)
+        self.combo_lang.setCurrentIndex(1 if self.current_lang == "th" else 0)
+        self.combo_lang.currentIndexChanged.connect(self._on_lang_changed)
+        top_bar.addWidget(self.combo_lang)
 
-        # 2. URL Input Field (Prominent Multi-line / Chip Input)
+        main_layout.addLayout(top_bar)
+
+        # 2. URL Input Bar
         self.url_container = URLChipInput(self)
-        top_layout.addWidget(self.url_container)
+        self.url_container.urls_changed.connect(self._on_urls_list_updated)
+        main_layout.addWidget(self.url_container.input_widget)
 
-        # 3. Action & Monitor Row
-        action_row = QHBoxLayout()
-        self.chk_clipboard = QCheckBox(
-            "Auto Clipboard Monitor (Auto-paste when IG link is copied)", self
-        )
+        # 3. Action Strip: Auto-Paste + Profile Mode Filter + Inspect Action
+        action_strip = QHBoxLayout()
+        action_strip.setContentsMargins(2, 0, 2, 0)
+        action_strip.setSpacing(8)
+
+        self.chk_clipboard = QCheckBox(self)
         self.chk_clipboard.setChecked(self.auto_clipboard)
-        if hasattr(self.chk_clipboard, "stateChanged") and hasattr(
-            self.chk_clipboard.stateChanged, "connect"
-        ):
-            self.chk_clipboard.stateChanged.connect(self._on_clipboard_check_changed)
-        action_row.addWidget(self.chk_clipboard)
-        action_row.addStretch()
+        self.chk_clipboard.stateChanged.connect(self._on_clipboard_toggle)
+        action_strip.addWidget(self.chk_clipboard)
 
-        self.btn_inspect = QPushButton("Inspect Media", self)
+        action_strip.addStretch()
+
+        # Profile Crawl Filter Dropdown
+        self.lbl_profile_filter = QLabel(self)
+        self.lbl_profile_filter.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        self.lbl_profile_filter.setStyleSheet("color: #A0A0B2;")
+        action_strip.addWidget(self.lbl_profile_filter)
+
+        self.combo_profile_mode = NoScrollComboBox(self)
+        self.combo_profile_mode.setFixedHeight(32)
+        mode_idx = (
+            0
+            if self.profile_mode == "all"
+            else (1 if self.profile_mode == "reels" else 2)
+        )
+        self.combo_profile_mode.addItems(["All Media", "Reels Only", "Photos Only"])
+        self.combo_profile_mode.setCurrentIndex(mode_idx)
+        self.combo_profile_mode.currentIndexChanged.connect(
+            self._on_profile_mode_changed
+        )
+        action_strip.addWidget(self.combo_profile_mode)
+
+        self.btn_inspect = QPushButton(self)
         self.btn_inspect.setObjectName("PrimaryActionButton")
-        self._set_button_icon(self.btn_inspect, "search", "#ffffff", 16)
+        self.btn_inspect.setFixedHeight(34)
+        self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 13)
         self.btn_inspect.clicked.connect(self.start_inspection)
-        action_row.addWidget(self.btn_inspect)
+        action_strip.addWidget(self.btn_inspect)
 
-        self.btn_clear_text = QPushButton("Clear Textbox", self)
-        self.btn_clear_text.setObjectName("SecondaryActionButton")
-        self._set_button_icon(self.btn_clear_text, "clear", "#cbd5e1", 14)
-        self.btn_clear_text.clicked.connect(self.url_container.clear)
-        action_row.addWidget(self.btn_clear_text)
+        main_layout.addLayout(action_strip)
 
-        top_layout.addLayout(action_row)
-
-        # 4. Progress Bar (ModernProgressBar implements setValue)
+        # 4. Progress Bar
         self.progress_bar = ModernProgressBar(self)
+        self.progress_bar.setFixedHeight(4)
         self.progress_bar.setValue(0)
-        top_layout.addWidget(self.progress_bar)
+        main_layout.addWidget(self.progress_bar)
 
-        main_layout.addWidget(top_group)
+        # 5. Switchable Tab Widget: Media Queue vs. URL Links
+        self.tab_widget = QTabWidget(self)
 
-        # ----------------------------------------------------
-        # MIDDLE SECTION: Media Queue Cards Grid
-        # ----------------------------------------------------
-        mid_group = QFrame(self)
-        mid_group.setObjectName("MidGroupFrame")
-        mid_layout = QVBoxLayout(mid_group)
-        mid_layout.setContentsMargins(14, 14, 14, 14)
-        mid_layout.setSpacing(10)
+        # Tab 0: Media Queue Panel
+        queue_tab = QWidget()
+        queue_layout = QVBoxLayout(queue_tab)
+        queue_layout.setContentsMargins(10, 8, 10, 8)
+        queue_layout.setSpacing(6)
 
-        # Queue Header Row
-        queue_header_row = QHBoxLayout()
-        self.lbl_queue_title = QLabel("Media Queue Cards (Media Grid Inspector)", self)
-        self.lbl_queue_title.setObjectName("GroupTitleLabel")
-        queue_header_row.addWidget(self.lbl_queue_title)
+        queue_bar = QHBoxLayout()
+        self.lbl_queue_count = QLabel(self)
+        self.lbl_queue_count.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.lbl_queue_count.setStyleSheet("color: #FFFFFF;")
+        queue_bar.addWidget(self.lbl_queue_count)
 
-        self.btn_select_all = QPushButton("Select All (Ctrl+A)", self)
-        self._set_button_icon(self.btn_select_all, "select_all", "#4ade80", 15)
+        queue_bar.addStretch()
+
+        self.btn_select_all = QPushButton(self)
+        self._set_button_icon(self.btn_select_all, "select_all", "#10B981", 12)
         self.btn_select_all.clicked.connect(self.select_all_cards)
-        queue_header_row.addWidget(self.btn_select_all)
+        queue_bar.addWidget(self.btn_select_all)
 
-        self.btn_delete_selected = QPushButton("Delete Selected (Del)", self)
-        self.btn_delete_selected.setObjectName("DeleteButton")
-        self._set_button_icon(self.btn_delete_selected, "trash", "#f87171", 15)
+        self.btn_delete_selected = QPushButton(self)
+        self.btn_delete_selected.setObjectName("DestructiveButton")
+        self._set_button_icon(self.btn_delete_selected, "trash", "#FF6B6B", 12)
         self.btn_delete_selected.clicked.connect(self.delete_selected_cards)
-        queue_header_row.addWidget(self.btn_delete_selected)
+        queue_bar.addWidget(self.btn_delete_selected)
 
-        self.btn_clear_completed = QPushButton("Clear Completed", self)
-        self._set_button_icon(self.btn_clear_completed, "check_double", "#93c5fd", 15)
+        self.btn_clear_completed = QPushButton(self)
+        self._set_button_icon(self.btn_clear_completed, "check_double", "#70C5FF", 12)
         self.btn_clear_completed.clicked.connect(self.clear_completed_cards)
-        queue_header_row.addWidget(self.btn_clear_completed)
+        queue_bar.addWidget(self.btn_clear_completed)
 
-        queue_header_row.addStretch()
+        queue_layout.addLayout(queue_bar)
 
-        self.lbl_selected_count = QLabel("Selected: 0 / 0 items", self)
-        self.lbl_selected_count.setObjectName("CounterLabel")
-        queue_header_row.addWidget(self.lbl_selected_count)
-        mid_layout.addLayout(queue_header_row)
-
-        # Scroll Area for Cards
-        self.scroll_area = QScrollArea(self)
+        self.scroll_area = QScrollArea(queue_tab)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll_widget = QWidget()
         self.media_grid_layout = QVBoxLayout(self.scroll_widget)
-        self.media_grid_layout.setContentsMargins(4, 4, 4, 4)
-        self.media_grid_layout.setSpacing(8)
+        self.media_grid_layout.setContentsMargins(2, 2, 2, 2)
+        self.media_grid_layout.setSpacing(6)
         self.media_grid_layout.addStretch()
         self.scroll_area.setWidget(self.scroll_widget)
-        mid_layout.addWidget(self.scroll_area)
+        queue_layout.addWidget(self.scroll_area, stretch=1)
 
-        main_layout.addWidget(mid_group, stretch=1)
+        self.tab_widget.addTab(queue_tab, "Media Queue (0)")
 
-        # ----------------------------------------------------
-        # BOTTOM SECTION: Controls & Status Bar
-        # ----------------------------------------------------
-        bot_group = QFrame(self)
-        bot_group.setObjectName("BottomGroupFrame")
-        bot_layout = QVBoxLayout(bot_group)
-        bot_layout.setContentsMargins(14, 14, 14, 14)
-        bot_layout.setSpacing(10)
+        # Tab 1: URL Links List
+        self.tab_widget.addTab(self.url_container.list_widget, "URL Links (0)")
 
-        # Config Row
-        config_row = QHBoxLayout()
-        self.lbl_save_folder = QLabel(f"Save Folder: {self.save_folder}", self)
-        config_row.addWidget(self.lbl_save_folder)
+        main_layout.addWidget(self.tab_widget, stretch=1)
 
-        self.btn_browse = QPushButton("Browse", self)
-        self._set_button_icon(self.btn_browse, "folder", "#fcd34d", 15)
-        self.btn_browse.clicked.connect(self.browse_save_folder)
-        config_row.addWidget(self.btn_browse)
+        # 6. Bottom Bento Bar: Folder Controls + Status + Download Action
+        bot_bar = QHBoxLayout()
+        bot_bar.setContentsMargins(2, 0, 2, 0)
+        bot_bar.setSpacing(8)
 
-        self.btn_open_folder = QPushButton("Open Folder", self)
-        self._set_button_icon(self.btn_open_folder, "folder_open", "#fcd34d", 15)
+        self.btn_change_folder = QPushButton(self)
+        self._set_button_icon(self.btn_change_folder, "folder", "#FCAF45", 13)
+        self.btn_change_folder.clicked.connect(self.browse_save_folder)
+        bot_bar.addWidget(self.btn_change_folder)
+
+        self.btn_open_folder = QPushButton(self)
+        self._set_button_icon(self.btn_open_folder, "folder_open", "#F56040", 13)
         self.btn_open_folder.clicked.connect(self.open_save_folder)
-        config_row.addWidget(self.btn_open_folder)
+        bot_bar.addWidget(self.btn_open_folder)
 
-        config_row.addSpacing(20)
-        self.lbl_cookie_status = QLabel("Cookie: Not Connected", self)
-        config_row.addWidget(self.lbl_cookie_status)
-
-        self.btn_import_cookie = QPushButton("Import Cookie", self)
-        self._set_button_icon(self.btn_import_cookie, "key", "#fbbf24", 15)
-        self.btn_import_cookie.clicked.connect(self.import_cookie)
-        config_row.addWidget(self.btn_import_cookie)
-
-        self.btn_clear_cookie = QPushButton("Clear Cookie", self)
-        self._set_button_icon(self.btn_clear_cookie, "trash", "#fb7185", 15)
-        self.btn_clear_cookie.clicked.connect(self.clear_cookie)
-        config_row.addWidget(self.btn_clear_cookie)
-
-        bot_layout.addLayout(config_row)
-
-        # Download Buttons Row
-        dl_row = QHBoxLayout()
-        self.btn_download_all = QPushButton("Download All", self)
-        self.btn_download_all.setObjectName("DownloadAllButton")
-        self._set_button_icon(self.btn_download_all, "download", "#ffffff", 16)
-        self.btn_download_all.clicked.connect(self.start_download)
-        dl_row.addWidget(self.btn_download_all, stretch=1)
-
-        self.btn_cancel_dl = QPushButton("Cancel", self)
-        self._set_button_icon(self.btn_cancel_dl, "cancel", "#e2e8f0", 14)
-        self.btn_cancel_dl.clicked.connect(self.cancel_download)
-        dl_row.addWidget(self.btn_cancel_dl)
-        bot_layout.addLayout(dl_row)
-
-        # Status & Toast Row
-        status_row = QHBoxLayout()
-        self.lbl_status = QLabel("Ready", self)
-        self.lbl_status.setObjectName("StatusMessageLabel")
-        status_row.addWidget(self.lbl_status)
-
-        status_row.addStretch()
+        self.lbl_status = QLabel(self)
+        self.lbl_status.setFont(QFont("Segoe UI", 8))
+        self.lbl_status.setStyleSheet("color: #A0A0B2;")
+        bot_bar.addWidget(self.lbl_status, 1)
 
         self.lbl_toast = QLabel("", self)
-        self.lbl_toast.setObjectName("ToastLabel")
-        status_row.addWidget(self.lbl_toast)
-        bot_layout.addLayout(status_row)
+        self.lbl_toast.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        bot_bar.addWidget(self.lbl_toast)
 
-        main_layout.addWidget(bot_group)
+        self.btn_download_all = QPushButton(self)
+        self.btn_download_all.setObjectName("DownloadAllButton")
+        self.btn_download_all.setFixedHeight(34)
+        self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 13)
+        self.btn_download_all.clicked.connect(self.start_download)
+        bot_bar.addWidget(self.btn_download_all)
 
-        # Keyboard shortcuts
+        main_layout.addLayout(bot_bar)
+
         QShortcut(QKeySequence("Ctrl+A"), self, self.select_all_cards)
         QShortcut(QKeySequence("Delete"), self, self.delete_selected_cards)
 
-    def _set_button_icon(
-        self,
-        button: QPushButton,
-        icon_name: str,
-        color: str = "#ffffff",
-        size: int = 16,
-    ) -> None:
-        """Helper to safely set vector QIcon on QPushButton."""
-        icon = get_icon(icon_name, color=color, size=size)
-        if icon and hasattr(button, "setIcon"):
-            button.setIcon(icon)
-            if hasattr(button, "setIconSize"):
-                button.setIconSize(QSize(size, size))
+    def apply_translations(self) -> None:
+        self.lbl_app_brand.setText(self.tr_text("app_title"))
+        self.btn_import_cookie.setText(self.tr_text("btn_cookie"))
+        self.url_container.input_edit.setPlaceholderText(
+            self.tr_text("input_placeholder")
+        )
+        self.url_container.btn_add.setText(self.tr_text("btn_add"))
+        self.url_container.btn_clear_all.setText(self.tr_text("btn_clear_urls"))
+        self.chk_clipboard.setText(self.tr_text("auto_clipboard"))
+        self.lbl_profile_filter.setText(self.tr_text("profile_filter_label"))
 
-    def _on_clipboard_check_changed(self, state: Any = None) -> None:
-        """Handles changes to clipboard monitor checkbox with dynamic listener toggling."""
-        if hasattr(self, "chk_clipboard") and hasattr(self.chk_clipboard, "isChecked"):
-            self.auto_clipboard = self.chk_clipboard.isChecked()
-            self._toggle_clipboard_listener(self.auto_clipboard)
-        self.save_settings()
+        # Update Profile Mode combo items without resetting selection
+        curr_mode_idx = self.combo_profile_mode.currentIndex()
+        self.combo_profile_mode.blockSignals(True)
+        self.combo_profile_mode.clear()
+        self.combo_profile_mode.addItems(
+            [
+                self.tr_text("filter_all"),
+                self.tr_text("filter_reels"),
+                self.tr_text("filter_photos"),
+            ]
+        )
+        self.combo_profile_mode.setCurrentIndex(
+            curr_mode_idx if curr_mode_idx >= 0 else 0
+        )
+        self.combo_profile_mode.blockSignals(False)
 
-    # --------------------------------------------------------
-    # Language Localization
-    # --------------------------------------------------------
-    def on_language_changed(self, index: int) -> None:
-        lang = "th" if index == 1 else "en"
-        self.current_lang = lang
-        self.save_settings()
+        is_inspecting = self.inspect_worker and self.inspect_worker.isRunning()
+        self.btn_inspect.setText(
+            self.tr_text("inspect_cancel" if is_inspecting else "inspect_media")
+        )
 
-        tr = TRANSLATIONS.get(lang, {})
-        if not tr:
-            return
+        self.btn_select_all.setText(self.tr_text("btn_select_all"))
+        self.btn_delete_selected.setText(self.tr_text("btn_delete"))
+        self.btn_clear_completed.setText(self.tr_text("btn_clear_completed"))
+        self.btn_change_folder.setText(self.tr_text("btn_change_folder"))
+        self.btn_open_folder.setText(self.tr_text("btn_open_folder"))
+        self.btn_download_all.setText(self.tr_text("btn_download_selected"))
 
-        self.lbl_group_title.setText(tr.get("title", self.lbl_group_title.text()))
-        self.chk_clipboard.setText(tr.get("auto_clipboard", self.chk_clipboard.text()))
-        self.btn_inspect.setText(tr.get("inspect_media", self.btn_inspect.text()))
-        self.btn_clear_text.setText(tr.get("clear_textbox", self.btn_clear_text.text()))
-        self.lbl_queue_title.setText(tr.get("queue_title", self.lbl_queue_title.text()))
-        self.btn_select_all.setText(tr.get("select_all", self.btn_select_all.text()))
-        self.btn_delete_selected.setText(
-            tr.get("delete_selected", self.btn_delete_selected.text())
-        )
-        self.btn_clear_completed.setText(
-            tr.get("clear_completed", self.btn_clear_completed.text())
-        )
-        self.btn_browse.setText(tr.get("browse", self.btn_browse.text()))
-        self.btn_open_folder.setText(tr.get("open_folder", self.btn_open_folder.text()))
-        self.btn_import_cookie.setText(
-            tr.get("import_cookie", self.btn_import_cookie.text())
-        )
-        self.btn_clear_cookie.setText(
-            tr.get("clear_cookie", self.btn_clear_cookie.text())
-        )
-        self.btn_download_all.setText(
-            tr.get("download_all", self.btn_download_all.text())
-        )
-        self.btn_cancel_dl.setText(tr.get("cancel", self.btn_cancel_dl.text()))
+        if not hasattr(self, "_custom_status") or not self._custom_status:
+            self.lbl_status.setText(self.tr_text("status_ready"))
+
         self.update_selection_counter()
+        self._on_urls_list_updated()
         self.update_cookie_status()
 
-    # --------------------------------------------------------
-    # Clipboard & Toast Helpers
-    # --------------------------------------------------------
+    def _set_button_icon(
+        self, button: QPushButton, name: str, color: str = "#FFFFFF", size: int = 13
+    ) -> None:
+        icon = get_icon(name, color=color, size=size)
+        if icon:
+            button.setIcon(icon)
+            button.setIconSize(QSize(size, size))
+
     def setup_clipboard_monitor(self) -> None:
-        """Connects clipboard listener only when auto-monitoring is active."""
-        if self.auto_clipboard:
-            self._toggle_clipboard_listener(True)
+        cb = QApplication.clipboard()
+        if cb and hasattr(cb, "dataChanged"):
+            cb.dataChanged.connect(self._on_clipboard_data_changed)
 
-    def _toggle_clipboard_listener(self, enable: bool) -> None:
-        try:
-            cb = QApplication.clipboard()
-            if not hasattr(cb, "dataChanged"):
-                return
-            if enable:
-                cb.dataChanged.connect(self.on_clipboard_changed)
-            else:
-                cb.dataChanged.disconnect(self.on_clipboard_changed)
-        except Exception:
-            pass
+    def _on_clipboard_toggle(self, state: int) -> None:
+        self.auto_clipboard = state == 2 or state is True
+        self.save_settings()
 
-    def on_clipboard_changed(self) -> None:
+    def _on_clipboard_data_changed(self) -> None:
         if not self.auto_clipboard:
             return
-        # Debounce by 250ms to ensure Windows OLE clipboard lock is released before read
-        QTimer.singleShot(250, self._process_clipboard_data)
+        QTimer.singleShot(350, self._process_clipboard)
 
-    def _process_clipboard_data(self) -> None:
+    def _process_clipboard(self) -> None:
         if not self.auto_clipboard:
             return
         try:
             cb = QApplication.clipboard()
-            if not hasattr(cb, "text"):
+            if not cb:
                 return
             text = cb.text().strip()
             if not text or text == self._last_clipboard_text:
                 return
 
             self._last_clipboard_text = text
-            from core.parser import extract_instagram_urls
-
             urls = extract_instagram_urls(text)
             if urls:
                 for u in urls:
                     self.url_container.add_url_chip(u)
-                self.show_toast(f"Pasted {len(urls)} link(s)")
+                self.show_toast(self.tr_text("toast_pasted", count=len(urls)))
+                self.tab_widget.setCurrentIndex(1)
         except Exception:
             pass
 
-    def _cleanup_worker(self, worker: Any) -> None:
-        if hasattr(self, "_active_workers"):
-            self._active_workers.discard(worker)
-        if hasattr(worker, "deleteLater"):
-            worker.deleteLater()
+    def _on_urls_list_updated(self) -> None:
+        count = self.url_container.count()
+        self.tab_widget.setTabText(1, self.tr_text("tab_url_list", count=count))
+        self.url_container.lbl_list_count.setText(
+            self.tr_text("tab_url_list", count=count)
+        )
 
-    def show_toast(
-        self, message: str, is_error: bool = False, duration_ms: int = 4000
-    ) -> None:
-        color = "#f87171" if is_error else "#4ade80"
-        self.lbl_toast.setStyleSheet(f"color: {color}; font-weight: bold;")
-        self.lbl_toast.setText(message)
-        QTimer.singleShot(duration_ms, lambda: self.lbl_toast.setText(""))
+    def _on_profile_mode_changed(self, idx: int) -> None:
+        modes = ["all", "reels", "photos"]
+        self.profile_mode = modes[idx] if idx < len(modes) else "all"
+        self.save_settings()
 
-    # --------------------------------------------------------
-    # Media Inspection Workflow
-    # --------------------------------------------------------
     def start_inspection(self) -> None:
-        """Starts the media inspection worker thread and clears previous inputs."""
         if self.inspect_worker and self.inspect_worker.isRunning():
             self.inspect_worker.cancel()
-            self._set_button_icon(self.btn_inspect, "search", "#ffffff", 16)
-            self.btn_inspect.setText("Inspect Media")
-            self.lbl_status.setText("Inspection cancelled by user.")
+            self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 13)
+            self.btn_inspect.setText(self.tr_text("inspect_media"))
+            self.lbl_status.setText(self.tr_text("status_ready"))
             return
 
         targets = self.url_container.get_targets()
         if not targets:
-            self.show_toast("Please add at least one Instagram URL.", is_error=True)
-            self.lbl_status.setText("No URLs in queue.")
+            self.show_toast(self.tr_text("toast_no_urls"), is_error=True)
             return
 
-        # Automatically clear previously entered / inspected links from input field
         self.url_container.clear()
-
-        # Reset progress bar to 0 and clear prior media grid cards
         self.progress_bar.setValue(0)
-        self.clear_media_grid()
+        self._set_button_icon(self.btn_inspect, "stop", "#FFFFFF", 13)
+        self.btn_inspect.setText(self.tr_text("inspect_cancel"))
+        self.lbl_status.setText(self.tr_text("status_inspecting"))
 
-        self._set_button_icon(self.btn_inspect, "stop", "#ffffff", 16)
-        self.btn_inspect.setText("Cancel")
-        self.lbl_status.setText("Starting inspection...")
+        # Switch to Media Queue tab on inspection
+        self.tab_widget.setCurrentIndex(0)
 
         self.inspect_worker = InspectWorker(
             targets=targets,
-            cookie_str=self.cookie_str,
-            cookie_file=self.cookie_file,
+            cookie_str=self.cookie_manager.get_cookie_string(),
+            cookie_file=self.cookie_manager.get_cookie_file_path(),
+            profile_mode=self.profile_mode,
             quality_preset=self.quality_preset,
             parent=self,
         )
-
         self.inspect_worker.item_found.connect(self.add_card)
-        self.inspect_worker.progress.connect(self.on_inspection_progress)
-        self.inspect_worker.status_message.connect(self.on_status_message)
+        self.inspect_worker.progress.connect(self.progress_bar.setValue)
+        self.inspect_worker.status_message.connect(self.lbl_status.setText)
         self.inspect_worker.finished.connect(self.on_inspection_finished)
-        self.inspect_worker.error.connect(self.on_inspection_error)
         self.inspect_worker.start()
 
     def add_card(self, item_data: Dict[str, Any]) -> None:
-        """Instantiates and adds a new MediaCard to the grid."""
+        new_id = str(
+            item_data.get("id")
+            or item_data.get("shortcode")
+            or item_data.get("url")
+            or ""
+        )
+        new_c_idx = item_data.get("carousel_index")
+
+        for existing in self.cards:
+            ed = getattr(existing, "item_data", {})
+            eid = str(ed.get("id") or ed.get("shortcode") or ed.get("url") or "")
+            if new_id and eid == new_id and ed.get("carousel_index") == new_c_idx:
+                return
+
         card = MediaCard(item_data, parent=self)
-        if hasattr(card, "deleted"):
-            card.deleted.connect(lambda: self.remove_card(card))
-        if hasattr(card, "selection_changed"):
-            card.selection_changed.connect(self.update_selection_counter)
+        card.deleted.connect(lambda: self.remove_card(card))
+        card.selection_changed.connect(self.update_selection_counter)
 
         count = self.media_grid_layout.count()
         if count > 0:
@@ -845,241 +455,208 @@ class MainWindow(QMainWindow):
 
         self.cards.append(card)
         self.update_selection_counter()
+        self.smooth_scroll_queue_to_bottom()
+
+    def smooth_scroll_queue_to_bottom(self) -> None:
+        v_bar = self.scroll_area.verticalScrollBar()
+        if not v_bar:
+            return
+        target_val = v_bar.maximum()
+        self._queue_scroll_anim = QPropertyAnimation(v_bar, b"value", self)
+        self._queue_scroll_anim.setDuration(350)
+        self._queue_scroll_anim.setStartValue(v_bar.value())
+        self._queue_scroll_anim.setEndValue(target_val)
+        self._queue_scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._queue_scroll_anim.start()
 
     def remove_card(self, card: MediaCard) -> None:
-        """Removes and safely disposes of a MediaCard."""
         if card in self.cards:
             self.cards.remove(card)
         self.media_grid_layout.removeWidget(card)
+        card.cleanup()
         card.setParent(None)
         card.deleteLater()
         self.update_selection_counter()
 
-    def clear_media_grid(self) -> None:
-        """Safely clears all media cards from the layout."""
-        for card in list(self.cards):
-            self.media_grid_layout.removeWidget(card)
-            card.setParent(None)
-            card.deleteLater()
-        self.cards.clear()
+    def on_inspection_finished(self, count: int) -> None:
+        self.progress_bar.setValue(100)
+        self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 13)
+        self.btn_inspect.setText(self.tr_text("inspect_media"))
+        self.lbl_status.setText(
+            self.tr_text("status_inspection_done", count=len(self.cards))
+        )
+        self.show_toast(self.tr_text("status_inspection_done", count=count))
+
+    def start_download(self) -> None:
+        selected_cards = [c for c in self.cards if getattr(c, "is_selected", False)]
+        if not selected_cards:
+            self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
+            return
+
+        items = []
+        for card in selected_cards:
+            card.set_status("queued")
+            items.append(card.get_item_data())
+
+        self.btn_download_all.setEnabled(False)
+        self.lbl_status.setText(self.tr_text("status_downloading", count=len(items)))
+
+        self.download_worker = DownloadWorker(
+            items=items,
+            save_folder=self.save_folder,
+            cookie_file=self.cookie_manager.get_cookie_file_path(),
+            cookie_str=self.cookie_manager.get_cookie_string(),
+            parent=self,
+        )
+        self.download_worker.progress.connect(self.progress_bar.setValue)
+        self.download_worker.item_started.connect(self._on_item_started)
+        self.download_worker.item_finished.connect(self._on_item_finished)
+        self.download_worker.finished.connect(self._on_download_finished)
+        self.download_worker.start()
+
+    def _on_item_started(self, item_id: str) -> None:
+        for card in self.cards:
+            cid = str(
+                getattr(card, "item_id", None)
+                or card.item_data.get("id")
+                or card.item_data.get("shortcode")
+            )
+            if cid == str(item_id):
+                card.set_status("downloading")
+
+    def _on_item_finished(self, item_id: str, ok: bool) -> None:
+        for card in self.cards:
+            cid = str(
+                getattr(card, "item_id", None)
+                or card.item_data.get("id")
+                or card.item_data.get("shortcode")
+            )
+            if cid == str(item_id):
+                card.set_status("finished" if ok else "error")
         self.update_selection_counter()
 
-    def on_inspection_progress(self, val: int) -> None:
-        self.progress_bar.setValue(val)
-
-    def on_inspection_finished(self, total_count: int) -> None:
+    def _on_download_finished(self, success_count: int) -> None:
+        self.btn_download_all.setEnabled(True)
         self.progress_bar.setValue(100)
-        self._set_button_icon(self.btn_inspect, "search", "#ffffff", 16)
-        self.btn_inspect.setText("Inspect Media")
-        if total_count == 0:
-            self.lbl_status.setText(
-                "Inspection completed: 0 items found. (Instagram may require active session cookies)."
-            )
-            self.show_toast(
-                "Found 0 items. Ensure the URL is public or import logged-in cookies.",
-                is_error=True,
-            )
-        else:
-            self.lbl_status.setText(
-                f"Inspection completed! Found {total_count} items ready."
-            )
-            self.show_toast(f"Found {total_count} items ready.")
+        self.lbl_status.setText(
+            self.tr_text("status_download_done", count=success_count)
+        )
+        self.show_toast(self.tr_text("status_download_done", count=success_count))
 
-    def on_inspection_error(self, err_msg: str) -> None:
-        self._set_button_icon(self.btn_inspect, "search", "#ffffff", 16)
-        self.btn_inspect.setText("Inspect Media")
-        self.lbl_status.setText(f"Error: {err_msg}")
-        self.show_toast(err_msg, is_error=True)
-
-    def on_status_message(self, msg: str) -> None:
-        self.lbl_status.setText(msg)
-
-    # --------------------------------------------------------
-    # Grid Selection & Management Actions
-    # --------------------------------------------------------
     def update_selection_counter(self) -> None:
         total = len(self.cards)
-        selected_cards = [c for c in self.cards if getattr(c, "is_selected", True)]
-        selected_count = len(selected_cards)
-        if selected_count == 1:
-            card_url = (
-                selected_cards[0].item_data.get("url")
-                or f"https://www.instagram.com/reel/{selected_cards[0].shortcode}/"
-            )
-            self.lbl_selected_count.setText(f"Selected: 1 / {total} items — {card_url}")
-        elif selected_count > 1:
-            last_url = (
-                selected_cards[-1].item_data.get("url")
-                or f"https://www.instagram.com/reel/{selected_cards[-1].shortcode}/"
-            )
-            self.lbl_selected_count.setText(
-                f"Selected: {selected_count} / {total} items (Last: {last_url})"
-            )
-        else:
-            self.lbl_selected_count.setText(f"Selected: 0 / {total} items")
+        selected = len([c for c in self.cards if getattr(c, "is_selected", True)])
+        self.lbl_queue_count.setText(
+            self.tr_text("media_queue_title", selected=selected, total=total)
+        )
+        self.tab_widget.setTabText(0, self.tr_text("tab_media_queue", count=total))
 
     def select_all_cards(self) -> None:
         for card in self.cards:
-            if hasattr(card, "set_selected"):
-                card.set_selected(True)
+            card.set_selected(True)
         self.update_selection_counter()
 
     def delete_selected_cards(self) -> None:
         for card in list(self.cards):
             if getattr(card, "is_selected", False):
                 self.remove_card(card)
-        self.update_selection_counter()
 
     def clear_completed_cards(self) -> None:
         for card in list(self.cards):
-            if (
-                getattr(card, "is_finished", False)
-                or getattr(card, "status", "") == "finished"
-            ):
+            if getattr(card, "is_finished", False):
                 self.remove_card(card)
-        self.update_selection_counter()
 
-    # --------------------------------------------------------
-    # Cookie & Folder Management
-    # --------------------------------------------------------
     def update_cookie_status(self) -> None:
         if self.cookie_manager.has_cookies():
             user_id = self.cookie_manager.get_user_id()
-            session_id = self.cookie_manager.get_session_id()
-            if session_id:
-                tag = f"(User: #{user_id})" if user_id else "(Session Active)"
-                self.lbl_cookie_status.setText(f"Cookie: Connected {tag}")
-                self.lbl_cookie_status.setStyleSheet(
-                    "color: #4ade80; font-weight: 600;"
-                )
-            else:
-                self.lbl_cookie_status.setText("Cookie: Anonymous (No Session ID)")
-                self.lbl_cookie_status.setStyleSheet(
-                    "color: #fbbf24; font-weight: 600;"
-                )
+            self.lbl_cookie_status.setText(
+                self.tr_text("cookie_connected", user=user_id or "Active")
+            )
+            self.lbl_cookie_status.setStyleSheet("color: #10B981;")
         else:
-            self.lbl_cookie_status.setText("Cookie: Not Connected")
-            self.lbl_cookie_status.setStyleSheet("color: #94a3b8;")
+            self.lbl_cookie_status.setText(self.tr_text("cookie_disconnected"))
+            self.lbl_cookie_status.setStyleSheet("color: #A0A0B2;")
 
     def import_cookie(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Import Instagram Cookie File",
+            self.tr_text("dialog_import_cookie"),
             "",
-            "Cookie Files (*.txt *.json);;All Files (*.*)",
+            "Cookie (*.txt *.json);;All (*.*)",
         )
-        if not file_path:
-            return
-
-        success = self.cookie_manager.import_cookie_file(file_path)
-        if success:
-            self.cookie_str = self.cookie_manager.get_cookie_string()
-            self.cookie_file = self.cookie_manager.get_cookie_file_path()
+        if file_path and self.cookie_manager.import_cookie_file(file_path):
             self.update_cookie_status()
-            if getattr(
-                self.cookie_manager, "has_authenticated_cookies", lambda: True
-            )():
-                user_id = self.cookie_manager.get_user_id()
-                self.show_toast(f"Cookies imported! (User: #{user_id or 'Active'})")
-            else:
-                self.show_toast(
-                    "Cookies imported, but no logged-in sessionid found. Please ensure you are logged into Instagram.",
-                    is_error=True,
-                )
+            self.show_toast(self.tr_text("toast_cookie_success"))
         else:
-            self.show_toast("Failed to parse cookie file.", is_error=True)
-
-    def clear_cookie(self) -> None:
-        """Clears all stored cookies."""
-        self.cookie_manager.clear_cookies()
-        self.cookie_str = ""
-        self.cookie_file = ""
-        self.update_cookie_status()
-        self.save_settings()
-        self.show_toast("Cookie cleared.")
+            self.show_toast(self.tr_text("toast_cookie_failed"), is_error=True)
 
     def browse_save_folder(self) -> None:
-        """Opens directory picker and updates persistent save directory."""
         folder = QFileDialog.getExistingDirectory(
-            self, "Select Save Directory", self.save_folder
+            self, self.tr_text("dialog_select_folder"), self.save_folder
         )
         if folder:
-            self.save_folder = folder
-            self.lbl_save_folder.setText(f"Save Folder: {self.save_folder}")
+            self.save_folder = os.path.abspath(folder)
             self.save_settings()
+            self.show_toast(f"Save folder: {self.save_folder}")
 
     def open_save_folder(self) -> None:
         if os.path.exists(self.save_folder):
             if sys.platform == "win32":
-                os.startfile(self.save_folder)  # type: ignore
+                os.startfile(self.save_folder)
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", self.save_folder])
             else:
                 subprocess.Popen(["xdg-open", self.save_folder])
-        else:
-            self.show_toast("Save folder does not exist.", is_error=True)
 
-    # --------------------------------------------------------
-    # Download Execution Flow
-    # --------------------------------------------------------
-    def start_download(self) -> None:
-        selected_cards = [c for c in self.cards if getattr(c, "is_selected", True)]
-        if not selected_cards:
-            self.show_toast("No media items selected for download.", is_error=True)
-            return
+    def show_toast(self, msg: str, is_error: bool = False) -> None:
+        self.lbl_toast.setStyleSheet(f"color: {'#FF6B6B' if is_error else '#10B981'};")
+        self.lbl_toast.setText(msg)
+        QTimer.singleShot(3500, lambda: self.lbl_toast.setText(""))
 
-        items_to_download = [c.get_item_data() for c in selected_cards]
-        self.btn_download_all.setEnabled(False)
-        self.lbl_status.setText(f"Downloading {len(items_to_download)} items...")
+    def _on_lang_changed(self, idx: int) -> None:
+        self.current_lang = "th" if idx == 1 else "en"
+        self.apply_translations()
+        self.save_settings()
 
-        self.download_worker = DownloadWorker(
-            items=items_to_download,
-            save_folder=self.save_folder,
-            cookie_file=self.cookie_file,
-            cookie_str=self.cookie_str,
-            parent=self,
-        )
-        if hasattr(self.download_worker, "progress"):
-            self.download_worker.progress.connect(self.on_download_progress)
-        if hasattr(self.download_worker, "item_started"):
-            self.download_worker.item_started.connect(self.on_download_item_started)
-        if hasattr(self.download_worker, "item_finished"):
-            self.download_worker.item_finished.connect(self.on_download_item_finished)
-        if hasattr(self.download_worker, "status_message"):
-            self.download_worker.status_message.connect(self.on_status_message)
-        if hasattr(self.download_worker, "finished"):
-            self.download_worker.finished.connect(self.on_download_finished)
-        self.download_worker.start()
+    def load_settings(self) -> None:
+        """Loads persistent user preferences and last window geometry from settings.json."""
+        if os.path.exists(self.SETTINGS_FILE):
+            try:
+                with open(self.SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if isinstance(d, dict):
+                    self.save_folder = d.get("save_folder", self.save_folder)
+                    self.current_lang = d.get("language", self.current_lang)
+                    self.auto_clipboard = bool(
+                        d.get("auto_clipboard", self.auto_clipboard)
+                    )
+                    self.profile_mode = d.get("profile_mode", self.profile_mode)
+                    self.quality_preset = d.get("quality_preset", self.quality_preset)
+                    self._saved_geometry_hex = d.get("window_geometry", "")
+                    self._is_maximized = bool(d.get("window_maximized", False))
+            except Exception as e:
+                logger.debug(f"Failed to load settings: {e}")
 
-    def on_download_item_started(self, item_id: str) -> None:
-        for card in self.cards:
-            if (
-                getattr(card, "item_id", None) == item_id
-                or getattr(card, "shortcode", None) == item_id
-            ):
-                if hasattr(card, "set_status"):
-                    card.set_status("downloading")
+    def save_settings(self) -> None:
+        """Persists current link preferences, profile mode, save path, and window geometry to settings.json."""
+        try:
+            os.makedirs(os.path.dirname(self.SETTINGS_FILE), exist_ok=True)
+            geometry_hex = self.saveGeometry().toHex().data().decode("utf-8")
+            payload = {
+                "save_folder": self.save_folder,
+                "language": self.current_lang,
+                "auto_clipboard": self.auto_clipboard,
+                "profile_mode": self.profile_mode,
+                "quality_preset": self.quality_preset,
+                "window_geometry": geometry_hex,
+                "window_maximized": self.isMaximized(),
+            }
+            with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            logger.debug(f"Failed to save settings: {e}")
 
-    def cancel_download(self) -> None:
-        if self.download_worker and self.download_worker.isRunning():
-            self.download_worker.cancel()
-            self.btn_download_all.setEnabled(True)
-            self.lbl_status.setText("Download cancelled.")
-
-    def on_download_progress(self, val: int) -> None:
-        self.progress_bar.setValue(val)
-
-    def on_download_item_finished(self, item_id: str, success: bool) -> None:
-        for card in self.cards:
-            if (
-                getattr(card, "item_id", None) == item_id
-                or getattr(card, "shortcode", None) == item_id
-            ):
-                if hasattr(card, "set_status"):
-                    card.set_status("finished" if success else "error")
-
-    def on_download_finished(self, success_count: int) -> None:
-        self.btn_download_all.setEnabled(True)
-        self.progress_bar.setValue(100)
-        self.lbl_status.setText(f"Download complete! {success_count} items downloaded.")
-        self.show_toast(f"Downloaded {success_count} items.")
+    def closeEvent(self, event) -> None:
+        """Saves all settings and window state upon exit."""
+        self.save_settings()
+        super().closeEvent(event)

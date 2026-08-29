@@ -1,183 +1,228 @@
 """
-gui/styles.py - Dark theme, modern scrollbars, and card stylesheet definitions.
+gui/styles.py - Instagram-inspired cute modern dark theme with tab segmented styling.
 """
 
-DARK_THEME_QSS = """
+from __future__ import annotations
+
+COLORS = {
+    "background": "#0D0D12",
+    "surface": "#16161F",
+    "surface_secondary": "#1E1E2A",
+    "card": "#212130",
+    "card_hover": "#29293C",
+    "border": "rgba(255, 255, 255, 0.08)",
+    "border_focus": "#E1306C",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#A0A0B2",
+    "text_muted": "#6E6E82",
+    "ig_pink": "#E1306C",
+    "ig_purple": "#833AB4",
+    "ig_orange": "#F56040",
+    "ig_yellow": "#FCAF45",
+}
+
+MEDIA_TYPE_COLORS = {
+    "REEL": {
+        "bg": "rgba(131, 58, 180, 0.25)",
+        "fg": "#DDA2F8",
+        "border": "rgba(131, 58, 180, 0.5)",
+    },
+    "STORY": {
+        "bg": "rgba(225, 48, 108, 0.25)",
+        "fg": "#FF7597",
+        "border": "rgba(225, 48, 108, 0.5)",
+    },
+    "HIGHLIGHT": {
+        "bg": "rgba(252, 175, 69, 0.25)",
+        "fg": "#FFCA7A",
+        "border": "rgba(252, 175, 69, 0.5)",
+    },
+    "POST": {
+        "bg": "rgba(0, 149, 246, 0.25)",
+        "fg": "#70C5FF",
+        "border": "rgba(0, 149, 246, 0.5)",
+    },
+    "CAROUSEL": {
+        "bg": "rgba(245, 96, 64, 0.25)",
+        "fg": "#FF9980",
+        "border": "rgba(245, 96, 64, 0.5)",
+    },
+    "IMAGE": {
+        "bg": "rgba(16, 185, 129, 0.25)",
+        "fg": "#6EE7B7",
+        "border": "rgba(16, 185, 129, 0.5)",
+    },
+    "VIDEO": {
+        "bg": "rgba(131, 58, 180, 0.25)",
+        "fg": "#DDA2F8",
+        "border": "rgba(131, 58, 180, 0.5)",
+    },
+    "AUDIO": {
+        "bg": "rgba(6, 182, 212, 0.25)",
+        "fg": "#67E8F9",
+        "border": "rgba(6, 182, 212, 0.5)",
+    },
+    "PROFILE": {
+        "bg": "rgba(16, 185, 129, 0.25)",
+        "fg": "#6EE7B7",
+        "border": "rgba(16, 185, 129, 0.5)",
+    },
+    "LINK": {
+        "bg": "rgba(110, 110, 130, 0.25)",
+        "fg": "#C4C4D4",
+        "border": "rgba(110, 110, 130, 0.5)",
+    },
+}
+
+DARK_STYLESHEET = """
+QMainWindow {
+    background-color: #0D0D12;
+}
+
 QWidget {
-    background-color: #16161c;
-    color: #eaeaea;
-    font-family: 'Segoe UI', sans-serif;
+    color: #FFFFFF;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     font-size: 9pt;
 }
 
-QGroupBox {
-    border: 1px solid #2e2e3d;
-    border-radius: 6px;
-    margin-top: 8px;
-    font-weight: bold;
-    color: #fa7e1e;
-    padding: 8px;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 4px;
+/* Glass Bento Enclosures */
+QFrame#BentoPanel {
+    background-color: #16161F;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
 }
 
-QPlainTextEdit {
-    background-color: #20202a;
-    border: 1px solid #38384a;
-    border-radius: 5px;
-    padding: 5px;
-    color: #ffffff;
+/* Modern Segmented Tab Bar */
+QTabWidget::pane {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    background-color: #16161F;
+    top: -1px;
 }
 
+QTabBar::tab {
+    background-color: #16161F;
+    color: #A0A0B2;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-bottom: none;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+    padding: 7px 18px;
+    margin-right: 4px;
+    font-weight: 600;
+    font-size: 8.5pt;
+}
+
+QTabBar::tab:hover {
+    background-color: #1E1E2B;
+    color: #FFFFFF;
+}
+
+QTabBar::tab:selected {
+    background-color: #1E1E2B;
+    color: #FFFFFF;
+    border: 1px solid rgba(225, 48, 108, 0.5);
+    border-bottom: 2px solid #E1306C;
+}
+
+/* Cute Pill Buttons */
 QPushButton {
-    background-color: #d62976;
+    background-color: #1E1E2A;
+    color: #F0F0F5;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 5px 14px;
+    font-weight: 600;
+}
+
+QPushButton:hover {
+    background-color: #272738;
+    border: 1px solid rgba(225, 48, 108, 0.4);
+    color: #FFFFFF;
+}
+
+QPushButton:pressed {
+    background-color: #191924;
+}
+
+/* Instagram Gradient Primary Buttons */
+QPushButton#PrimaryActionButton, QPushButton#DownloadAllButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #833AB4, stop:0.5 #E1306C, stop:1 #F56040);
+    color: #FFFFFF;
     border: none;
+    border-radius: 8px;
+    font-weight: 700;
+    padding: 6px 18px;
+}
+
+QPushButton#PrimaryActionButton:hover, QPushButton#DownloadAllButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #9546CD, stop:0.5 #EE3E7A, stop:1 #F77254);
+}
+
+QPushButton#PrimaryActionButton:pressed, QPushButton#DownloadAllButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #702F9C, stop:0.5 #C7255B, stop:1 #D94D2E);
+}
+
+QPushButton#DestructiveButton {
+    background-color: rgba(239, 68, 68, 0.12);
+    color: #FF6B6B;
+    border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+QPushButton#DestructiveButton:hover {
+    background-color: rgba(239, 68, 68, 0.24);
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    color: #FF8787;
+}
+
+/* Cute Glowing Checkbox */
+QCheckBox {
+    color: #A0A0B2;
+    font-weight: 500;
+    spacing: 8px;
+}
+
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
     border-radius: 5px;
-    color: #ffffff;
-    font-weight: bold;
-    padding: 5px 12px;
-}
-QPushButton:hover { background-color: #fa7e1e; }
-QPushButton:disabled { background-color: #2c2c38; color: #606070; }
-
-QProgressBar {
-    background-color: #20202a;
-    border: 1px solid #38384a;
-    border-radius: 4px;
-    text-align: center;
-    color: #ffffff;
-    font-size: 9px;
-}
-QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #fa7e1e, stop:1 #d62976);
-    border-radius: 3px;
+    border: 1.5px solid rgba(255, 255, 255, 0.22);
+    background-color: #1A1A26;
 }
 
-QCheckBox { color: #cccccc; }
-
-/* ========================================================================= */
-/* Modern Minimalist ScrollBar Styling                                       */
-/* ========================================================================= */
-QScrollArea {
-    background-color: transparent;
-    border: none;
+QCheckBox::indicator:hover {
+    border-color: #E1306C;
 }
 
 QCheckBox::indicator:checked {
-    background-color: #3b82f6;
-    border: 1px solid #3b82f6;
-    image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='20 6 9 17 4 12'/></svg>");
+    background-color: #E1306C;
+    border-color: #E1306C;
 }
 
-/* Vertical ScrollBar */
+/* Smooth Minimal Scrollbar */
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+
 QScrollBar:vertical {
-    background-color: transparent;
-    width: 8px;
-    margin: 4px 2px 4px 0px;
-    border-radius: 4px;
+    border: none;
+    background: transparent;
+    width: 6px;
+    margin: 4px 2px;
 }
+
 QScrollBar::handle:vertical {
-    background-color: #2e2e3e;
-    min-height: 35px;
-    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.16);
+    min-height: 24px;
+    border-radius: 3px;
 }
+
 QScrollBar::handle:vertical:hover {
-    background-color: #4a4a62;
+    background: #E1306C;
 }
-QScrollBar::handle:vertical:pressed {
-    background-color: #d62976;
-}
-QScrollBar::sub-line:vertical, QScrollBar::add-line:vertical {
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0px;
-    width: 0px;
-    background: transparent;
-    border: none;
-}
-QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
-    background: transparent;
-}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-    background: transparent;
-}
-
-/* Horizontal ScrollBar */
-QScrollBar:horizontal {
-    background-color: transparent;
-    height: 8px;
-    margin: 0px 4px 2px 4px;
-    border-radius: 4px;
-}
-QScrollBar::handle:horizontal {
-    background-color: #2e2e3e;
-    min-width: 35px;
-    border-radius: 4px;
-}
-QScrollBar::handle:horizontal:hover {
-    background-color: #4a4a62;
-}
-QScrollBar::handle:horizontal:pressed {
-    background-color: #d62976;
-}
-QScrollBar::sub-line:horizontal, QScrollBar::add-line:horizontal {
-    height: 0px;
-    width: 0px;
-    background: transparent;
-    border: none;
-}
-QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-    background: transparent;
 }
 """
-
-CARD_SELECTED_QSS = """
-MediaCardWidget {
-    background-color: #2b1f2d;
-    border: 2px solid #d62976;
-    border-radius: 8px;
-}
-QLabel { color: #ffffff; }
-QComboBox {
-    background-color: #17171e;
-    border: 1px solid #d62976;
-    border-radius: 4px;
-    padding: 4px 8px;
-    color: #ffffff;
-    font-size: 11px;
-}
-"""
-
-CARD_DEFAULT_QSS = """
-MediaCardWidget {
-    background-color: #21212b;
-    border: 1px solid #363647;
-    border-radius: 8px;
-}
-MediaCardWidget:hover {
-    border: 1px solid #5a5a72;
-}
-QLabel { color: #eaeaea; }
-QComboBox {
-    background-color: #17171e;
-    border: 1px solid #4a4a5e;
-    border-radius: 4px;
-    padding: 4px 8px;
-    color: #ffffff;
-    font-size: 11px;
-}
-"""
-
-MEDIA_TYPE_COLORS = {
-    "STORY": {"bg": "#D946EF", "fg": "#FFFFFF"},  # Magenta
-    "REEL": {"bg": "#8B5CF6", "fg": "#FFFFFF"},  # Purple
-    "CAROUSEL (IMAGE)": {"bg": "#0284C7", "fg": "#FFFFFF"},  # Cyan / Blue
-    "CAROUSEL (VIDEO)": {"bg": "#2563EB", "fg": "#FFFFFF"},  # Royal Blue
-    "CAROUSEL": {"bg": "#0284C7", "fg": "#FFFFFF"},  # Blue Fallback
-    "IMAGE": {"bg": "#0D9488", "fg": "#FFFFFF"},  # Teal
-    "VIDEO": {"bg": "#EA580C", "fg": "#FFFFFF"},  # Orange
-    "POST": {"bg": "#3B82F6", "fg": "#FFFFFF"},  # Blue
-    "HIGHLIGHT": {"bg": "#F59E0B", "fg": "#000000"},  # Amber
-    "AUDIO": {"bg": "#10B981", "fg": "#FFFFFF"},  # Emerald
-}

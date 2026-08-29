@@ -2,5 +2,8 @@
   "save_folder": "E:\\Work\\yt-dlp-instagram\\downloads",
   "language": "en",
   "auto_clipboard": true,
-  "quality_preset": "best_video"
+  "profile_mode": "reels",
+  "quality_preset": "best_video",
+  "window_geometry": "01d9d0cb00030000fffffc49000001baffffffb800000480fffffc49000001d9ffffffb80000048000000001000000000438fffffc49000001d9ffffffb800000480",
+  "window_maximized": false
 }

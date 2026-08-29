@@ -1,444 +1,327 @@
-try:
-    from core.parser import extract_instagram_urls, parse_instagram_url
-except ImportError:
+"""
+gui/widgets/url_chip_input.py - URL input controller and tab-embeddable chip list view.
+"""
 
-    def extract_instagram_urls(text: str) -> List[str]:
-        return [line.strip() for line in text.splitlines() if line.strip()]
-
-    def parse_instagram_url(url: str) -> dict:
-        return {"type": "url", "url": url}
-
+from __future__ import annotations
 
 import re
-from typing import List, Set, Optional
+from typing import Dict, List, Optional
+from PyQt6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, Qt, pyqtSignal
+from PyQt6.QtGui import QFont, QKeySequence
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
-try:
-    from PyQt6.QtCore import Qt, pyqtSignal, QSize
-    from PyQt6.QtGui import QFont, QColor, QKeySequence
-    from PyQt6.QtWidgets import (
-        QWidget,
-        QVBoxLayout,
-        QHBoxLayout,
-        QPlainTextEdit,
-        QLabel,
-        QPushButton,
-        QFrame,
-        QScrollArea,
-        QSizePolicy,
-    )
-except ImportError:
-
-    class QWidget:
-        def __init__(self, parent=None):
-            pass
-
-        def setStyleSheet(self, *a):
-            pass
-
-        def setObjectName(self, *a):
-            pass
-
-        def setMinimumHeight(self, *a):
-            pass
-
-        def setMaximumHeight(self, *a):
-            pass
-
-        def setSizePolicy(self, *a):
-            pass
-
-    class QFrame(QWidget):
-        pass
-
-    class QVBoxLayout:
-        def __init__(self, parent=None):
-            pass
-
-        def setContentsMargins(self, *a):
-            pass
-
-        def setSpacing(self, *a):
-            pass
-
-        def addWidget(self, *a, **kw):
-            pass
-
-        def addLayout(self, *a, **kw):
-            pass
-
-        def addStretch(self, *a):
-            pass
-
-        def count(self):
-            return 0
-
-    class QHBoxLayout(QVBoxLayout):
-        pass
-
-    class QLabel(QWidget):
-        def __init__(self, text="", parent=None):
-            super().__init__(parent)
-
-        def setText(self, *a):
-            pass
-
-    class QPushButton(QWidget):
-        def __init__(self, text="", parent=None):
-            super().__init__(parent)
-            self.clicked = MagicSignal()
-
-        def setText(self, *a):
-            pass
-
-    class QPlainTextEdit(QWidget):
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self._text = ""
-
-        def setPlaceholderText(self, t):
-            pass
-
-        def toPlainText(self):
-            return self._text
-
-        def setPlainText(self, t):
-            self._text = t
-
-        def clear(self):
-            self._text = ""
-
-        def appendPlainText(self, t):
-            self._text += "\n" + t
-
-    class MagicSignal:
-        def connect(self, f):
-            pass
-
-        def emit(self, *a):
-            pass
+from core.parser import parse_instagram_url
+from gui.styles import MEDIA_TYPE_COLORS
 
 
-try:
-    from gui.icons import get_icon
-except ImportError:
+class UrlChipItem(QFrame):
+    removed = pyqtSignal(str)
 
-    def get_icon(name: str, color: str = "#ffffff", size: int = 18):
-        return None
-
-
-class URLChip(QFrame):
-    """A compact, styled pill/chip displaying an Instagram URL with category badge and remove button."""
-
-    removed = pyqtSignal(str) if "pyqtSignal" in globals() else MagicSignal()  # type: ignore
-
-    def __init__(self, url: str, category: str = "", parent=None):
+    def __init__(self, raw_url: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.url = url
-        self.category = category
-        self.setObjectName("URLChipPill")
-        self.init_ui()
+        self.raw_url = raw_url
+        self._init_ui()
 
-    def _format_chip_details(self, u: str) -> tuple[str, str, str]:
-        """Returns (badge_text, display_label, badge_color)."""
-        try:
-            info = parse_instagram_url(u)
-            ttype = info.get("type", "url").upper().replace("_", " ")
-            user = info.get("username")
-            code = info.get("shortcode")
-            tid = info.get("target_id")
+    def _init_ui(self) -> None:
+        self.setObjectName("urlChipItem")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(34)
 
-            if "REELS" in ttype or ttype == "PROFILE REELS":
-                badge = "REELS"
-                color = "#4f46e5"
-                label = f"@{user} (Reels)" if user else u
-            elif ttype == "PROFILE":
-                badge = "PROFILE"
-                color = "#059669"
-                label = f"@{user} (Profile)" if user else u
-            elif ttype == "REEL":
-                badge = "REEL"
-                color = "#6366f1"
-                label = f"#{code} (Reel)" if code else u
-            elif ttype in ("POST", "TV"):
-                badge = "POST"
-                color = "#3b82f6"
-                label = f"#{code} (Post)" if code else u
-            elif ttype == "STORY":
-                badge = "STORY"
-                color = "#e11d48"
-                label = f"@{user} (Story)" if user else u
-            elif ttype == "HIGHLIGHT":
-                badge = "HIGHLIGHT"
-                color = "#d97706"
-                label = f"#{tid} (Highlight)" if tid else u
-            elif ttype == "AUDIO":
-                badge = "AUDIO"
-                color = "#0284c7"
-                label = f"#{tid} (Audio)" if tid else u
-            else:
-                badge = "URL"
-                color = "#64748b"
-                label = u
-
-            if len(label) > 42:
-                label = label[:22] + "..." + label[-16:]
-
-            return badge, label, color
-        except Exception:
-            return "URL", u[:30], "#64748b"
-
-    def init_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 3, 6, 3)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 2, 8, 2)
+        layout.setSpacing(10)
 
-        badge_text, display_text, badge_bg = self._format_chip_details(self.url)
-        if self.category:
-            badge_text = self.category.upper()
+        meta = parse_instagram_url(self.raw_url)
+        ttype = str(meta.get("type") or "LINK").upper()
+        badge_style = MEDIA_TYPE_COLORS.get("POST")
+        for prefix, style in MEDIA_TYPE_COLORS.items():
+            if ttype.startswith(prefix):
+                badge_style = style
+                break
 
-        # Category Badge
-        self.lbl_badge = QLabel(badge_text, self)
-        self.lbl_badge.setStyleSheet(
+        self.badge_lbl = QLabel(ttype, self)
+        self.badge_lbl.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        self.badge_lbl.setStyleSheet(
             f"""
-            background-color: {badge_bg};
-            color: #ffffff;
-            font-size: 9px;
-            font-weight: 700;
-            padding: 1px 5px;
+            background-color: {badge_style['bg']};
+            color: {badge_style['fg']};
+            border: 1px solid {badge_style['border']};
             border-radius: 4px;
-            letter-spacing: 0.3px;
+            padding: 1px 6px;
+            font-size: 7.5pt;
         """
         )
-        layout.addWidget(self.lbl_badge)
+        layout.addWidget(self.badge_lbl)
 
-        self.lbl_text = QLabel(display_text, self)
-        self.lbl_text.setToolTip(f"[{badge_text}] {self.url}")
-        self.lbl_text.setStyleSheet(
-            "color: #e2e8f0; font-size: 11px; font-weight: 500;"
+        clean_text = (
+            self.raw_url.replace("https://", "")
+            .replace("http://", "")
+            .replace("www.", "")
         )
-        layout.addWidget(self.lbl_text)
+        self.url_lbl = QLabel(
+            clean_text[:60] + ("..." if len(clean_text) > 60 else ""), self
+        )
+        self.url_lbl.setToolTip(self.raw_url)
+        self.url_lbl.setFont(QFont("Segoe UI", 8))
+        self.url_lbl.setStyleSheet("color: #E2E2EA; background: transparent;")
+        layout.addWidget(self.url_lbl, 1)
 
-        # Remove / Close Button
-        self.btn_close = QPushButton("✕", self)
-        self.btn_close.setObjectName("ChipCloseButton")
-        self.btn_close.setToolTip("Remove URL")
-        if hasattr(self.btn_close, "setFixedSize"):
-            self.btn_close.setFixedSize(16, 16)
-        if hasattr(self.btn_close, "setCursor") and "Qt" in globals():
-            cursor_shape = getattr(
-                getattr(Qt, "CursorShape", Qt), "PointingHandCursor", None
-            )
-            if cursor_shape is not None:
-                self.btn_close.setCursor(cursor_shape)
-        if hasattr(self.btn_close, "setFocusPolicy") and "Qt" in globals():
-            focus_policy = getattr(getattr(Qt, "FocusPolicy", Qt), "NoFocus", None)
-            if focus_policy is not None:
-                self.btn_close.setFocusPolicy(focus_policy)
-        self.btn_close.setStyleSheet(
+        self.del_btn = QPushButton("✕", self)
+        self.del_btn.setFixedSize(20, 20)
+        self.del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.del_btn.setStyleSheet(
             """
-            QPushButton#ChipCloseButton {
-                background: transparent;
-                color: #94a3b8;
+            QPushButton {
+                background: rgba(255, 255, 255, 0.05);
+                color: #A0A0B2;
+                border: none;
+                font-size: 8pt;
+                font-weight: bold;
+                border-radius: 10px;
+            }
+            QPushButton:hover {
+                background-color: rgba(225, 48, 108, 0.3);
+                color: #FF7597;
+            }
+        """
+        )
+        self.del_btn.clicked.connect(lambda: self.removed.emit(self.raw_url))
+        layout.addWidget(self.del_btn)
+
+        self.setStyleSheet(
+            """
+            QFrame#urlChipItem {
+                background-color: #1A1A24;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+            }
+            QFrame#urlChipItem:hover {
+                border: 1px solid rgba(225, 48, 108, 0.4);
+                background-color: #222230;
+            }
+        """
+        )
+
+
+class URLChipInput(QObject := QWidget):
+    """
+    Manages URL input text entry and provides the embeddable chip list view for the tab container.
+    """
+
+    urls_changed = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._urls: List[str] = []
+        self._chip_widgets: Dict[str, UrlChipItem] = {}
+        self._scroll_anim: Optional[QPropertyAnimation] = None
+
+        self._init_input_bar()
+        self._init_list_view()
+
+    def _init_input_bar(self) -> None:
+        """Constructs the top input bar widget."""
+        self.input_widget = QWidget()
+        layout = QHBoxLayout(self.input_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.input_edit = QLineEdit(self.input_widget)
+        self.input_edit.setPlaceholderText(
+            "Paste Instagram links (Ctrl+V or Enter multiple links)..."
+        )
+        self.input_edit.setFixedHeight(36)
+        self.input_edit.setStyleSheet(
+            """
+            QLineEdit {
+                background-color: #16161F;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 6px 12px;
+                color: #FFFFFF;
+                font-size: 9pt;
+            }
+            QLineEdit:focus {
+                border: 1px solid #E1306C;
+                background-color: #1C1C28;
+            }
+        """
+        )
+        self.input_edit.returnPressed.connect(self._handle_manual_entry)
+        self.input_edit.installEventFilter(self)
+        layout.addWidget(self.input_edit, 1)
+
+        self.btn_add = QPushButton("+ Add", self.input_widget)
+        self.btn_add.setFixedHeight(36)
+        self.btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_add.setStyleSheet(
+            """
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #833AB4, stop:0.5 #E1306C, stop:1 #F56040);
+                color: #FFFFFF;
                 border: none;
                 border-radius: 8px;
-                font-size: 10px;
-                font-weight: bold;
-                padding: 0;
+                padding: 0 16px;
+                font-weight: 700;
+                font-size: 8.5pt;
             }
-            QPushButton#ChipCloseButton:hover {
-                background: rgba(239, 68, 68, 0.2);
-                color: #ef4444;
-            }
-            QPushButton#ChipCloseButton:pressed {
-                background: rgba(239, 68, 68, 0.35);
-                color: #dc2626;
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #9546CD, stop:0.5 #EE3E7A, stop:1 #F77254);
             }
         """
         )
-        self.btn_close.clicked.connect(self._on_remove_clicked)
-        layout.addWidget(self.btn_close)
+        self.btn_add.clicked.connect(self._handle_manual_entry)
+        layout.addWidget(self.btn_add)
 
-    def _on_remove_clicked(self) -> None:
-        self.removed.emit(self.url)
+    def _init_list_view(self) -> None:
+        """Constructs the tab-embeddable chip list view widget."""
+        self.list_widget = QWidget()
+        main_layout = QVBoxLayout(self.list_widget)
+        main_layout.setContentsMargins(10, 8, 10, 8)
+        main_layout.setSpacing(6)
 
+        # Tab Header Bar
+        header_bar = QHBoxLayout()
+        self.lbl_list_count = QLabel("URL Links (0 items)", self.list_widget)
+        self.lbl_list_count.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.lbl_list_count.setStyleSheet("color: #FFFFFF;")
+        header_bar.addWidget(self.lbl_list_count)
+        header_bar.addStretch()
 
-class URLChipInput(QWidget):
-    """
-    Multi-line URL input widget for Instagram URLs.
-    Supports manual typing, multi-line pasting, auto-clipboard injection,
-    and extraction of all clean targets.
-    """
+        self.btn_clear_all = QPushButton("Clear All Links", self.list_widget)
+        self.btn_clear_all.setObjectName("DestructiveButton")
+        self.btn_clear_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_all.clicked.connect(self.clear)
+        header_bar.addWidget(self.btn_clear_all)
+        main_layout.addLayout(header_bar)
 
-    urls_changed = pyqtSignal() if "pyqtSignal" in globals() else MagicSignal()  # type: ignore
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("URLChipInputContainer")
-        self._chips: List[str] = []
-        self._chips_widgets: List[URLChip] = []
-        self._is_internal_updating: bool = False
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        self.text_edit = QPlainTextEdit(self)
-        self.text_edit.setObjectName("URLInputBox")
-        self.text_edit.setPlaceholderText(
-            "Paste Instagram URLs here (e.g., https://www.instagram.com/username/reels/ or https://instagram.com/p/...)\n"
-            "Supports multiple links (one per line, comma or space separated)..."
+        # Scroll Area for URL Chips
+        self.scroll_area = QScrollArea(self.list_widget)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.text_edit.setMinimumHeight(68)
-        self.text_edit.setMaximumHeight(110)
-        self.text_edit.setStyleSheet(
-            """
-            QPlainTextEdit#URLInputBox {
-                background: #18181f;
-                color: #f1f5f9;
-                border: 1px solid #2d2d3a;
-                border-radius: 8px;
-                padding: 8px 12px;
-                font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
-                font-size: 13px;
-                line-height: 1.4;
-                selection-background-color: #3b82f6;
-                selection-color: #ffffff;
-            }
-            QPlainTextEdit#URLInputBox:focus {
-                border: 1px solid #4a86e8;
-                background: #1b1b24;
-            }
-        """
+
+        self.list_container = QWidget()
+        self.list_container.setStyleSheet("background: transparent;")
+        self.list_layout = QVBoxLayout(self.list_container)
+        self.list_layout.setContentsMargins(2, 2, 2, 2)
+        self.list_layout.setSpacing(6)
+        self.list_layout.addStretch(1)
+
+        self.scroll_area.setWidget(self.list_container)
+        main_layout.addWidget(self.scroll_area, stretch=1)
+
+    def eventFilter(self, watched: QWidget, event: QEvent) -> bool:
+        if watched == self.input_edit and event.type() == QEvent.Type.KeyPress:
+            if event.matches(QKeySequence.StandardKey.Paste):
+                cb = QApplication.clipboard()
+                if cb and self._process_raw_text(cb.text()):
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _handle_manual_entry(self) -> None:
+        text = self.input_edit.text().strip()
+        if text:
+            self._process_raw_text(text)
+            self.input_edit.clear()
+
+    def _process_raw_text(self, text: str) -> bool:
+        if not text:
+            return False
+
+        ig_regex = re.compile(
+            r'https?://(?:www\.)?instagram\.com/[^\s"\'<>]+', re.IGNORECASE
         )
-        if hasattr(self.text_edit, "textChanged"):
-            self.text_edit.textChanged.connect(self._on_text_changed)
-        layout.addWidget(self.text_edit)
+        matches = ig_regex.findall(text)
+        tokens = matches if matches else re.split(r"[\r\n\t,;\s]+", text.strip())
+        found_any = False
 
-        # Chips horizontal scroll area
-        self.chips_scroll = QScrollArea(self)
-        self.chips_scroll.setWidgetResizable(True)
-        self.chips_scroll.setFixedHeight(34)
-        self.chips_scroll.setFrameShape(
-            QFrame.Shape.NoFrame if hasattr(QFrame, "Shape") else 0
-        )
-        if hasattr(Qt, "ScrollBarPolicy"):
-            self.chips_scroll.setHorizontalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAsNeeded
-            )
-            self.chips_scroll.setVerticalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-            )
-        self.chips_scroll.setVisible(False)
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            clean_url = re.sub(r"([?&])img_index=\d+(&?)", r"\1\2", token).rstrip("?&#")
+            if clean_url in self._urls:
+                continue
+            self._add_chip(clean_url)
+            found_any = True
 
-        self.chips_widget = QWidget()
-        self.chips_layout = QHBoxLayout(self.chips_widget)
-        self.chips_layout.setContentsMargins(0, 0, 0, 0)
-        self.chips_layout.setSpacing(6)
-        self.chips_layout.addStretch()
-        self.chips_scroll.setWidget(self.chips_widget)
+        if found_any:
+            self.input_edit.clear()
+            self._sync_state()
+            self.smooth_scroll_to_bottom()
+            return True
+        return False
 
-        layout.addWidget(self.chips_scroll)
-
-    def _on_text_changed(self) -> None:
-        if self._is_internal_updating:
-            return
-        self._rebuild_chips()
-        self.urls_changed.emit()
-
-    def _rebuild_chips(self) -> None:
-        targets = self.get_targets()
-
-        # Clear existing chips
-        for chip in list(self._chips_widgets):
-            if hasattr(self.chips_layout, "removeWidget"):
-                self.chips_layout.removeWidget(chip)
-            chip.setParent(None)
-            if hasattr(chip, "deleteLater"):
-                chip.deleteLater()
-        self._chips_widgets.clear()
-
-        if not targets:
-            if hasattr(self.chips_scroll, "setVisible"):
-                self.chips_scroll.setVisible(False)
-            return
-
-        if hasattr(self.chips_scroll, "setVisible"):
-            self.chips_scroll.setVisible(True)
-
-        for target in targets:
-            info = parse_instagram_url(target)
-            cat_name = info.get("type", "URL").upper().replace("_", " ")
-            chip = URLChip(target, category=cat_name, parent=self.chips_widget)
-            chip.removed.connect(self._remove_url)
-            # Insert before the trailing stretch
-            idx = max(0, self.chips_layout.count() - 1)
-            if hasattr(self.chips_layout, "insertWidget"):
-                self.chips_layout.insertWidget(idx, chip)
-            elif hasattr(self.chips_layout, "addWidget"):
-                self.chips_layout.addWidget(chip)
-            self._chips_widgets.append(chip)
-
-    def _remove_url(self, target_url: str) -> None:
-        """Removes a specific URL from the text input."""
-        targets = self.get_targets()
-        filtered = [t for t in targets if t != target_url]
-        self._is_internal_updating = True
-        self.text_edit.setPlainText("\n".join(filtered))
-        self._is_internal_updating = False
-        self._rebuild_chips()
-        self.urls_changed.emit()
+    def _add_chip(self, url: str) -> None:
+        chip = UrlChipItem(url, self.list_container)
+        chip.removed.connect(self.remove_url)
+        self._urls.append(url)
+        self._chip_widgets[url] = chip
+        self.list_layout.insertWidget(self.list_layout.count() - 1, chip)
 
     def add_url_chip(self, url: str) -> None:
-        """Adds a valid Instagram URL to the input textbox and categorizes it."""
-        from core.parser import extract_instagram_urls
+        self._process_raw_text(url)
 
-        valid_urls = extract_instagram_urls(url)
-        if not valid_urls:
-            return
+    def remove_url(self, url: str) -> None:
+        if url in self._urls:
+            self._urls.remove(url)
+        if url in self._chip_widgets:
+            widget = self._chip_widgets.pop(url)
+            self.list_layout.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+        self._sync_state()
 
-        current_text = self.text_edit.toPlainText().strip()
-        lines = [line.strip() for line in current_text.splitlines() if line.strip()]
-        new_added = False
-        for u in valid_urls:
-            if u not in lines:
-                lines.append(u)
-                new_added = True
-
-        if new_added:
-            self._is_internal_updating = True
-            self.text_edit.setPlainText(chr(10).join(lines))
-            self._is_internal_updating = False
-            self._rebuild_chips()
-            self.urls_changed.emit()
-
-    def get_targets(self) -> List[str]:
-        """
-        Extracts all valid Instagram targets from the text input field.
-        Filters out non-Instagram text, arbitrary comments, or invalid entries.
-        """
-        raw_text = self.text_edit.toPlainText().strip()
-        if not raw_text:
-            return []
-
-        from core.parser import extract_instagram_urls
-
-        return extract_instagram_urls(raw_text)
-
-    def clear(self) -> None:
-        """Clears the text input and resets state."""
-        self._is_internal_updating = True
-        self.text_edit.clear()
-        self._is_internal_updating = False
-        self._chips.clear()
-        self._rebuild_chips()
+    def _sync_state(self) -> None:
+        count = len(self._urls)
+        self.lbl_list_count.setText(f"URL Links ({count} items)")
         self.urls_changed.emit()
 
-    def set_text(self, text: str) -> None:
-        """Sets raw text content."""
-        self.text_edit.setPlainText(text)
+    def smooth_scroll_to_bottom(self) -> None:
+        """Animates smooth scrolling to the newest link entry."""
+        v_bar = self.scroll_area.verticalScrollBar()
+        if not v_bar:
+            return
+        target_val = v_bar.maximum()
+        self._scroll_anim = QPropertyAnimation(v_bar, b"value", self)
+        self._scroll_anim.setDuration(350)
+        self._scroll_anim.setStartValue(v_bar.value())
+        self._scroll_anim.setEndValue(target_val)
+        self._scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._scroll_anim.start()
 
-    def toPlainText(self) -> str:
-        """Returns the raw input text."""
-        return self.text_edit.toPlainText()
+    def get_targets(self) -> List[str]:
+        unsubmitted = self.input_edit.text().strip()
+        if unsubmitted:
+            self._process_raw_text(unsubmitted)
+        return list(self._urls)
+
+    def get_urls(self) -> List[str]:
+        return self.get_targets()
+
+    def count(self) -> int:
+        return len(self._urls)
+
+    def clear(self) -> None:
+        for url in list(self._urls):
+            self.remove_url(url)
+        self.input_edit.clear()
+        self._sync_state()
+
+
+UrlChipInput = URLChipInput
+URLChip = UrlChipItem
