@@ -1,5 +1,5 @@
 """
-gui/main_window.py - Instagram Pro Studio Main Window with Profile Mode Selector.
+gui/main_window.py - Instagram Pro Studio Main Window with Profile Mode Selector and Download Cancellation.
 """
 
 from __future__ import annotations
@@ -12,7 +12,9 @@ import sys
 from typing import Any, Dict, List, Optional
 
 # Suppress Windows OLE clipboard mutex retry logs
-os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime=false;qt.qpa.*=false"
+os.environ["QT_LOGGING_RULES"] = (
+    "qt.text.font.db=false;qt.text.*=false;qt.qpa.mime=false;qt.qpa.*=false"
+)
 
 from PyQt6.QtCore import (
     QByteArray,
@@ -328,7 +330,13 @@ class MainWindow(QMainWindow):
         self.btn_clear_completed.setText(self.tr_text("btn_clear_completed"))
         self.btn_change_folder.setText(self.tr_text("btn_change_folder"))
         self.btn_open_folder.setText(self.tr_text("btn_open_folder"))
-        self.btn_download_all.setText(self.tr_text("btn_download_selected"))
+
+        is_downloading = self.download_worker and self.download_worker.isRunning()
+        self.btn_download_all.setText(
+            self.tr_text(
+                "btn_cancel_download" if is_downloading else "btn_download_selected"
+            )
+        )
 
         if not hasattr(self, "_custom_status") or not self._custom_status:
             self.lbl_status.setText(self.tr_text("status_ready"))
@@ -488,6 +496,15 @@ class MainWindow(QMainWindow):
         self.show_toast(self.tr_text("status_inspection_done", count=count))
 
     def start_download(self) -> None:
+        # If currently downloading, clicking the button cancels the ongoing download
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.cancel()
+            self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 13)
+            self.btn_download_all.setText(self.tr_text("btn_download_selected"))
+            self.lbl_status.setText(self.tr_text("status_download_cancelled"))
+            self.show_toast(self.tr_text("toast_download_cancelled"))
+            return
+
         selected_cards = [c for c in self.cards if getattr(c, "is_selected", False)]
         if not selected_cards:
             self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
@@ -498,7 +515,9 @@ class MainWindow(QMainWindow):
             card.set_status("queued")
             items.append(card.get_item_data())
 
-        self.btn_download_all.setEnabled(False)
+        self._set_button_icon(self.btn_download_all, "stop", "#FFFFFF", 13)
+        self.btn_download_all.setText(self.tr_text("btn_cancel_download"))
+        self.btn_download_all.setEnabled(True)
         self.lbl_status.setText(self.tr_text("status_downloading", count=len(items)))
 
         self.download_worker = DownloadWorker(
@@ -536,12 +555,24 @@ class MainWindow(QMainWindow):
         self.update_selection_counter()
 
     def _on_download_finished(self, success_count: int) -> None:
+        self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 13)
+        self.btn_download_all.setText(self.tr_text("btn_download_selected"))
         self.btn_download_all.setEnabled(True)
         self.progress_bar.setValue(100)
-        self.lbl_status.setText(
-            self.tr_text("status_download_done", count=success_count)
-        )
-        self.show_toast(self.tr_text("status_download_done", count=success_count))
+
+        # Reset any leftover queued cards if cancelled
+        for card in self.cards:
+            if getattr(card, "status", "") in ("queued", "downloading"):
+                card.set_status("ready")
+
+        if self.download_worker and self.download_worker._is_cancelled:
+            self.lbl_status.setText(self.tr_text("status_download_cancelled"))
+            self.show_toast(self.tr_text("toast_download_cancelled"))
+        else:
+            self.lbl_status.setText(
+                self.tr_text("status_download_done", count=success_count)
+            )
+            self.show_toast(self.tr_text("status_download_done", count=success_count))
 
     def update_selection_counter(self) -> None:
         total = len(self.cards)

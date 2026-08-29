@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from gui.widgets.image_viewer_dialog import ImageViewerDialog
 
 from gui.styles import MEDIA_TYPE_COLORS
 
@@ -188,6 +189,22 @@ class HoverThumbnailLabel(QLabel):
             self._preview_popup.deleteLater()
             self._preview_popup = None
 
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            # ซ่อน Hover Preview Popup ทันทีเมื่อคลิกเปิดดูภาพใหญ่
+            if hasattr(self, "_preview_popup") and self._preview_popup:
+                self._preview_popup.hide()
+
+            # ส่งคำสั่งให้ MediaCard เปิดหน้าต่าง Lightbox แสดงรูปภาพ
+            parent_card = self.parent()
+            while parent_card and not hasattr(parent_card, "open_image_gallery"):
+                parent_card = parent_card.parent()
+            if parent_card and hasattr(parent_card, "open_image_gallery"):
+                parent_card.open_image_gallery()
+                return
+
+        super().mousePressEvent(event)
+
 
 class MediaCard(QFrame):
     deleted = pyqtSignal()
@@ -260,8 +277,20 @@ class MediaCard(QFrame):
         if len(display_title) > 60:
             display_title = display_title[:57] + "..."
 
+        # ส่ง display_title เข้าไปใน QLabel พร้อมกำหนด Font ให้รองรับภาษาไทย
         self.lbl_title = QLabel(display_title, self)
-        self.lbl_title.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        title_font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
+        title_font.setFamilies(
+            [
+                "Segoe UI",
+                "Leelawadee UI",
+                "Tahoma",
+                "Noto Sans Thai",
+                "sans-serif",
+            ]
+        )
+        title_font.setPointSize(9)
+        self.lbl_title.setFont(title_font)
         self.lbl_title.setStyleSheet("color: #FFFFFF; font-size: 9pt;")
         top_row.addWidget(self.lbl_title, 1)
 
@@ -273,8 +302,12 @@ class MediaCard(QFrame):
 
         url_str = self.item_data.get("url") or ""
         clean_url = url_str.replace("https://www.", "").replace("https://", "")
-        self.lbl_url = QLabel(clean_url[:48], self)
-        self.lbl_url.setFont(QFont("Segoe UI", 8))
+
+        # ส่ง clean_url เข้าไปใน QLabel
+        self.lbl_url = QLabel(clean_url, self)
+        url_font = QFont("Segoe UI", 8)
+        url_font.setPointSize(8)
+        self.lbl_url.setFont(url_font)
         self.lbl_url.setStyleSheet("color: #A0A0B2; font-size: 8pt;")
         bot_row.addWidget(self.lbl_url)
 
@@ -412,3 +445,50 @@ class MediaCard(QFrame):
             except Exception:
                 pass
             self.thumb_loader = None
+
+    def open_image_gallery(self) -> None:
+        """Collects all non-video image URLs in this post and opens the large photo gallery dialog."""
+        image_urls: List[str] = []
+        slides = self.item_data.get("slides") or []
+
+        # 1. กรณีเป็นโพสต์ Carousel (มีหลายภาพ/วิดีโอ) -> เลือกเฉพาะสไลด์ที่เป็นรูปภาพเท่านั้น
+        if slides and isinstance(slides, list):
+            for slide in slides:
+                is_vid = bool(slide.get("is_video"))
+                if not is_vid:
+                    img_url = (
+                        slide.get("download_url")
+                        or slide.get("thumbnail_url")
+                        or slide.get("display_url")
+                    )
+                    if (
+                        img_url
+                        and img_url.startswith("http")
+                        and img_url not in image_urls
+                    ):
+                        image_urls.append(img_url)
+
+        # 2. กรณีเป็นโพสต์รูปภาพเดี่ยว
+        if not image_urls:
+            media_type = (
+                self.item_data.get("media_type") or self.item_data.get("type") or ""
+            ).upper()
+
+            # ไม่แสดงหากสื่อเป็นวิดีโอเดี่ยว (REEL หรือ VIDEO)
+            if "REEL" not in media_type and "VIDEO" not in media_type:
+                single_img = (
+                    self.item_data.get("thumbnail_url")
+                    or self.item_data.get("download_url")
+                    or self.item_data.get("display_url")
+                )
+                if single_img and single_img.startswith("http"):
+                    image_urls.append(single_img)
+
+        # หากมีรูปภาพให้เปิดหน้าต่าง Lightbox Gallery Viewer
+        if image_urls:
+            dialog = ImageViewerDialog(
+                image_urls=image_urls,
+                title=self.item_data.get("title", ""),
+                parent=self.window(),
+            )
+            dialog.exec()
