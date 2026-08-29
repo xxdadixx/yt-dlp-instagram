@@ -374,7 +374,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
 
     post_match = POST_REEL_REGEX.match(clean_url)
     if post_match:
-        shortcode = post_match.group(1) or post_match.group(2) or post_match.group(3)
+        shortcode = next((g for g in post_match.groups() if g), "")
         url_lower = clean_url.lower()
         if "/reel/" in url_lower or "/reels/" in url_lower or "/r/" in url_lower:
             media_type = "reel"
@@ -403,7 +403,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
 
     highlight_match = HIGHLIGHTS_REGEX.match(clean_url)
     if highlight_match:
-        highlight_id = highlight_match.group(1) or highlight_match.group(2)
+        highlight_id = next((g for g in highlight_match.groups() if g), "")
         return {
             "type": "highlight",
             "valid": True,
@@ -418,9 +418,10 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
 
     story_match = STORIES_REGEX.match(clean_url)
     if story_match:
-        username = story_match.group(1).lower()
-        story_id = story_match.group(2)
-        if username not in RESERVED_USERNAMES:
+        groups = [g for g in story_match.groups() if g]
+        username = groups[0].lower() if groups else ""
+        story_id = groups[1] if len(groups) > 1 else None
+        if username and username not in RESERVED_USERNAMES:
             return {
                 "type": "story",
                 "valid": True,
@@ -467,3 +468,35 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
 
 
 parse_url = parse_instagram_url
+
+
+def normalize_instagram_url(url: str) -> tuple[str, str]:
+    """
+    Cleans tracking/slide query parameters while preserving story usernames,
+    and returns (clean_url, media_type).
+    """
+    url = url.strip()
+    parsed = urlparse(url)
+
+    # Strip unnecessary query parameters (like ?img_index=1, ?igsh=..., etc.)
+    # Carousel posts need the base post URL to fetch all slides.
+    clean_url = urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", "", "")
+    )
+
+    # Detect Media Type
+    path = parsed.path.strip("/")
+    if re.match(r"^stories/highlights/", path) or re.match(r"^s/[A-Za-z0-9_=-]+", path):
+        media_type = "HIGHLIGHT"
+    elif re.match(r"^stories/[^/]+/[0-9]+", path):
+        media_type = "STORY"
+    elif re.match(r"^stories/[^/]+", path):
+        media_type = "STORIES"  # User story reel / multiple stories
+    elif re.match(r"^(?:reel|reels)/", path):
+        media_type = "REEL"
+    elif re.match(r"^p/[^/]+", path):
+        media_type = "POST"  # Could be single image/video or carousel
+    else:
+        media_type = "PROFILE"
+
+    return clean_url, media_type

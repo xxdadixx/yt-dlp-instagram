@@ -168,3 +168,16 @@ QComboBox {
     font-size: 11px;
 }
 """
+
+MEDIA_TYPE_COLORS = {
+    "STORY": {"bg": "#D946EF", "fg": "#FFFFFF"},  # Magenta
+    "REEL": {"bg": "#8B5CF6", "fg": "#FFFFFF"},  # Purple
+    "CAROUSEL (IMAGE)": {"bg": "#0284C7", "fg": "#FFFFFF"},  # Cyan / Blue
+    "CAROUSEL (VIDEO)": {"bg": "#2563EB", "fg": "#FFFFFF"},  # Royal Blue
+    "CAROUSEL": {"bg": "#0284C7", "fg": "#FFFFFF"},  # Blue Fallback
+    "IMAGE": {"bg": "#0D9488", "fg": "#FFFFFF"},  # Teal
+    "VIDEO": {"bg": "#EA580C", "fg": "#FFFFFF"},  # Orange
+    "POST": {"bg": "#3B82F6", "fg": "#FFFFFF"},  # Blue
+    "HIGHLIGHT": {"bg": "#F59E0B", "fg": "#000000"},  # Amber
+    "AUDIO": {"bg": "#10B981", "fg": "#FFFFFF"},  # Emerald
+}

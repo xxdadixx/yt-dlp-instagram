@@ -355,188 +355,199 @@ class InspectWorker(QThread):
         return None
 
     def _extract_media_cards(
-        self, media: Dict[str, Any], fallback_username: str = "", raw_target: str = ""
+        self, item: Dict[str, Any], raw_target: str = "", fallback_username: str = ""
     ) -> List[Dict[str, Any]]:
-        """Normalizes raw Instagram API / GraphQL objects into standardized MediaCard dictionaries."""
-        if not media or not isinstance(media, dict):
+        """Extracts individual media cards from Instagram API/GraphQL objects (including carousels)."""
+        if not item or not isinstance(item, dict):
             return []
 
-        m = media.get("media", media)
-        if not isinstance(m, dict):
-            return []
+        media = item.get("media", item)
+        shortcode = media.get("code") or media.get("shortcode") or ""
+        user_info = media.get("user") or media.get("owner") or {}
+        username = user_info.get("username") or fallback_username
 
-        raw_id = m.get("id") or m.get("pk") or m.get("pk_id")
-        code = m.get("code") or m.get("shortcode")
-        if not code and raw_id:
-            try:
-                numeric_id = int(str(raw_id).split("_")[0])
-                code = id_to_shortcode(numeric_id)
-            except Exception:
-                pass
+        # Check for carousel children
+        carousel_children = media.get("carousel_media") or [
+            edge.get("node", {})
+            for edge in media.get("edge_sidecar_to_children", {}).get("edges", [])
+        ]
 
-        shortcode = str(code or raw_id or "")
-        base_id = str(raw_id).split("_")[0] if raw_id else shortcode
-        if not shortcode:
-            return []
+        cards = []
+        if carousel_children:
+            total = len(carousel_children)
+            for idx, child in enumerate(carousel_children, start=1):
+                child_id = str(child.get("id") or f"{shortcode}_{idx}")
+                is_vid = bool(
+                    child.get("is_video")
+                    or child.get("media_type") == 2
+                    or child.get("video_versions")
+                )
 
-        img_index = None
-        if raw_target:
-            try:
-                parsed_raw = urllib.parse.urlparse(raw_target)
-                qs = urllib.parse.parse_qs(parsed_raw.query)
-                if "img_index" in qs and qs["img_index"]:
-                    img_index = int(qs["img_index"][0])
-            except Exception:
-                pass
+                # Video URL
+                v_url = ""
+                if is_vid:
+                    v_versions = child.get("video_versions") or []
+                    v_url = (
+                        v_versions[0].get("url", "")
+                        if v_versions
+                        else child.get("video_url", "")
+                    )
 
-        user_info = m.get("user") or m.get("owner") or {}
-        username = user_info.get("username", "") if isinstance(user_info, dict) else ""
-        if not username:
-            username = fallback_username
+                # Image / Thumbnail URL
+                img_versions = child.get("image_versions2", {}).get(
+                    "candidates", []
+                ) or child.get("display_resources", [])
+                t_url = (
+                    img_versions[0].get("url", "")
+                    if img_versions
+                    else child.get("display_url", "")
+                )
 
-        caption_text = ""
-        cap = m.get("caption")
-        if isinstance(cap, dict):
-            caption_text = cap.get("text", "")
-        elif isinstance(cap, str):
-            caption_text = cap
-        elif m.get("edge_media_to_caption", {}).get("edges"):
-            edges = m["edge_media_to_caption"]["edges"]
-            if edges and isinstance(edges[0], dict):
-                caption_text = edges[0].get("node", {}).get("text", "")
+                card_type = "CAROUSEL (VIDEO)" if is_vid else "CAROUSEL (IMAGE)"
+                cards.append(
+                    {
+                        "id": child_id,
+                        "shortcode": shortcode,
+                        "title": f"Instagram Post #{shortcode} (Slide {idx}/{total})",
+                        "username": username,
+                        "url": f"https://www.instagram.com/p/{shortcode}/?img_index={idx}",
+                        "thumbnail_url": t_url,
+                        "video_url": v_url,
+                        "download_url": v_url or t_url,
+                        "caption": (
+                            media.get("caption", {}).get("text", "")
+                            if isinstance(media.get("caption"), dict)
+                            else ""
+                        ),
+                        "duration": float(child.get("video_duration") or 0.0),
+                        "view_count": int(
+                            media.get("view_count") or media.get("play_count") or 0
+                        ),
+                        "like_count": int(media.get("like_count") or 0),
+                        "media_type": card_type,
+                        "quality": self.quality_preset,
+                        "selected": True,
+                        "status": "ready",
+                    }
+                )
+        else:
+            is_vid = is_standalone_video(media)
+            v_url = ""
+            if is_vid:
+                v_versions = media.get("video_versions") or []
+                v_url = (
+                    v_versions[0].get("url", "")
+                    if v_versions
+                    else media.get("video_url", "")
+                )
 
-        base_title = (
-            caption_text.splitlines()[0]
-            if caption_text.splitlines()
-            else f"Instagram Media {shortcode}"
-        )
-
-        carousel_items = m.get("carousel_media") or []
-        sidecar_edges = m.get("edge_sidecar_to_children", {}).get("edges", [])
-        slides = []
-        if carousel_items and isinstance(carousel_items, list):
-            slides = carousel_items
-        elif sidecar_edges and isinstance(sidecar_edges, list):
-            slides = [e.get("node", {}) for e in sidecar_edges if isinstance(e, dict)]
-
-        results: List[Dict[str, Any]] = []
-
-        def _build_card(
-            obj: Dict[str, Any], idx: Optional[int] = None, total: int = 1
-        ) -> Dict[str, Any]:
-            thumb_url = ""
-            cands = obj.get("image_versions2", {}).get("candidates", [])
-            if cands and isinstance(cands, list) and isinstance(cands[0], dict):
-                thumb_url = cands[0].get("url", "")
-            elif obj.get("display_url"):
-                thumb_url = obj.get("display_url", "")
-            elif obj.get("thumbnail_src"):
-                thumb_url = obj.get("thumbnail_src", "")
-            elif obj.get("display_resources") and isinstance(
-                obj["display_resources"], list
-            ):
-                thumb_url = obj["display_resources"][-1].get("src", "")
-
-            direct_video_url = ""
-            v_versions = obj.get("video_versions", [])
-            if (
-                v_versions
-                and isinstance(v_versions, list)
-                and isinstance(v_versions[0], dict)
-            ):
-                direct_video_url = v_versions[0].get("url", "")
-            elif obj.get("video_url"):
-                direct_video_url = obj.get("video_url", "")
-
-            is_reel_url = any(
-                x in (raw_target or "").lower() for x in ("/reel/", "/reels/", "/r/")
-            )
-            is_vid = (
-                bool(direct_video_url)
-                or obj.get("is_video") is True
-                or obj.get("media_type") == 2
-                or is_reel_url
-                or m.get("product_type") == "clips"
+            img_versions = media.get("image_versions2", {}).get(
+                "candidates", []
+            ) or media.get("display_resources", [])
+            t_url = (
+                img_versions[0].get("url", "")
+                if img_versions
+                else media.get("display_url", "")
             )
 
-            if is_reel_url or is_vid:
-                slide_media_type = "reel"
+            b_type = (
+                "REEL"
+                if (
+                    "/reel/" in raw_target.lower()
+                    or media.get("product_type") == "clips"
+                )
+                else ("VIDEO" if is_vid else "IMAGE")
+            )
+            cards.append(
+                {
+                    "id": str(media.get("id") or shortcode),
+                    "shortcode": shortcode,
+                    "title": f"Instagram {b_type} #{shortcode}",
+                    "username": username,
+                    "url": raw_target or f"https://www.instagram.com/p/{shortcode}/",
+                    "thumbnail_url": t_url,
+                    "video_url": v_url,
+                    "download_url": v_url or t_url,
+                    "caption": (
+                        media.get("caption", {}).get("text", "")
+                        if isinstance(media.get("caption"), dict)
+                        else ""
+                    ),
+                    "duration": float(media.get("video_duration") or 0.0),
+                    "view_count": int(
+                        media.get("view_count") or media.get("play_count") or 0
+                    ),
+                    "like_count": int(media.get("like_count") or 0),
+                    "media_type": b_type,
+                    "quality": self.quality_preset,
+                    "selected": True,
+                    "status": "ready",
+                }
+            )
+
+        return cards
+
+    def _fetch_stories_web(self, username: str, user_id: str) -> None:
+        """Fetches active user stories using Instagram Story Reel API with yt-dlp fallback."""
+        self.status_message.emit(f"Inspecting active stories for @{username}...")
+        found_any = False
+
+        story_endpoints = [
+            f"https://i.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
+            f"https://i.instagram.com/api/v1/feed/user/{user_id}/story/",
+        ]
+
+        h = {
+            "User-Agent": MOBILE_USER_AGENT,
+            "X-IG-App-ID": IG_APP_ID,
+        }
+        if self._csrf_token:
+            h["X-CSRFToken"] = self._csrf_token
+
+        for endpoint in story_endpoints:
+            if self.is_cancelled:
+                return
+            res = self._make_request(endpoint, headers=h)
+            if not res or not isinstance(res, dict):
+                continue
+
+            items = []
+            if "reels" in res and isinstance(res["reels"], dict):
+                user_reel = res["reels"].get(str(user_id)) or {}
+                items = user_reel.get("items", [])
             elif (
-                (idx is not None and total > 1)
-                or img_index is not None
-                or "carousel" in (raw_target or "").lower()
-                or obj.get("media_type") == 8
-                or bool(obj.get("carousel_media"))
+                "reels_media" in res
+                and isinstance(res["reels_media"], list)
+                and res["reels_media"]
             ):
-                slide_media_type = "carousel"
-            else:
-                slide_media_type = "post"
+                items = res["reels_media"][0].get("items", [])
+            elif "reel" in res and isinstance(res["reel"], dict):
+                items = res["reel"].get("items", [])
+            elif "items" in res and isinstance(res["items"], list):
+                items = res["items"]
 
-            card_id = (
-                f"{base_id}_{idx}"
-                if (idx is not None and (total > 1 or img_index is not None))
-                else base_id
-            )
-            if idx is not None and total > 1:
-                slide_title = f"{base_title} (Slide {idx}/{total})"
-                canonical_url = f"{IG_BASE_URL}/p/{shortcode}/?img_index={idx}"
-            elif idx is not None:
-                slide_title = f"{base_title} (Slide {idx})"
-                canonical_url = f"{IG_BASE_URL}/p/{shortcode}/?img_index={idx}"
-            else:
-                slide_title = base_title
-                canonical_url = (
-                    f"{IG_BASE_URL}/reel/{shortcode}/"
-                    if slide_media_type == "reel"
-                    else f"{IG_BASE_URL}/p/{shortcode}/"
-                )
+            if items:
+                total_stories = len(items)
+                for idx, item in enumerate(items, start=1):
+                    if self.is_cancelled:
+                        return
+                    cards = self._extract_media_cards(item, fallback_username=username)
+                    for card in cards:
+                        cid = card["id"]
+                        card["media_type"] = "STORY"
+                        card["title"] = f"@{username} Story ({idx}/{total_stories})"
+                        card["url"] = f"{IG_BASE_URL}/stories/{username}/{cid}/"
+                        if cid not in self.seen_ids:
+                            self.seen_ids.add(cid)
+                            self.item_found.emit(card)
+                            found_any = True
+                if found_any:
+                    return
 
-            if raw_target and shortcode in raw_target and img_index is not None:
-                canonical_url = raw_target
-
-            duration = float(
-                obj.get("video_duration")
-                or obj.get("duration")
-                or (
-                    obj.get("clips_metadata", {}).get("duration_in_ms", 0) / 1000.0
-                    if isinstance(obj.get("clips_metadata"), dict)
-                    else 0
-                )
-                or 0.0
+        if not found_any and not self.is_cancelled:
+            self._inspect_via_ytdlp(
+                f"{IG_BASE_URL}/stories/{username}/", default_username=username
             )
-            view_count = int(
-                m.get("play_count")
-                or m.get("view_count")
-                or m.get("video_view_count")
-                or m.get("video_play_count")
-                or 0
-            )
-            like_count = int(
-                m.get("like_count")
-                or m.get("edge_liked_by", {}).get("count")
-                or m.get("edge_media_preview_like", {}).get("count")
-                or 0
-            )
-
-            return {
-                "id": card_id,
-                "shortcode": shortcode,
-                "title": slide_title
-                or f"Instagram {slide_media_type.capitalize()} {shortcode}",
-                "username": username,
-                "url": canonical_url,
-                "thumbnail_url": thumb_url,
-                "video_url": direct_video_url,
-                "download_url": direct_video_url or thumb_url,
-                "caption": caption_text,
-                "duration": duration,
-                "view_count": view_count,
-                "like_count": like_count,
-                "media_type": slide_media_type,
-                "quality": self.quality_preset,
-                "selected": True,
-                "status": "ready",
-            }
 
     def _fetch_all_profile_media_web(
         self, username: str, user_id: str, reels_only: bool = False
@@ -922,8 +933,8 @@ class InspectWorker(QThread):
                 x in url.lower() for x in ("/p/", "/reel/", "/reels/", "/tv/", "/r/")
             )
             ydl_opts = {
-                "extract_flat": not is_single,
-                "quiet": True,
+                "extract_flat": False,
+                "noplaylist": False,
                 "no_warnings": True,
                 "ignoreerrors": True,
                 "skip_download": True,
@@ -943,6 +954,10 @@ class InspectWorker(QThread):
             if REELS_TAB_REGEX.match(clean_url):
                 clean_url = re.sub(r"/reels/?.*$", "/", clean_url)
 
+            clean_url = normalize_url(url) or url
+            if REELS_TAB_REGEX.match(clean_url):
+                clean_url = re.sub(r"/reels/?.*$", "/", clean_url)
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
                     info = ydl.extract_info(clean_url, download=False)
@@ -953,19 +968,10 @@ class InspectWorker(QThread):
                 if not info or not isinstance(info, dict):
                     return
 
-                img_index = None
-                try:
-                    parsed_raw = urllib.parse.urlparse(url)
-                    qs = urllib.parse.parse_qs(parsed_raw.query)
-                    if "img_index" in qs and qs["img_index"]:
-                        img_index = int(qs["img_index"][0])
-                except Exception:
-                    pass
-
                 entries = info.get("entries")
                 if entries is not None:
                     try:
-                        entries = list(entries)
+                        entries = [e for e in entries if e]
                     except Exception:
                         entries = [info]
                 else:
@@ -975,14 +981,7 @@ class InspectWorker(QThread):
                     entries = [info]
 
                 total_entries = len(entries)
-                if (
-                    img_index is not None
-                    and 1 <= img_index <= total_entries
-                    and total_entries > 1
-                ):
-                    target_entries = [(img_index, entries[img_index - 1])]
-                else:
-                    target_entries = list(enumerate(entries, start=1))
+                target_entries = list(enumerate(entries, start=1))
 
                 for idx, entry in target_entries:
                     if self.is_cancelled:
@@ -1015,13 +1014,40 @@ class InspectWorker(QThread):
                         or (entry.get("ext") == "mp4")
                     )
 
-                    badge_media_type = (
-                        "audio"
-                        if entry.get("ext") in ("mp3", "m4a", "wav")
-                        or ("/audio/" in url.lower())
-                        else ("reel" if has_video else "post")
+                    # Context-aware type detection
+                    is_story = (
+                        "/stories/" in url.lower() and "/highlights/" not in url.lower()
+                    )
+                    is_highlight = (
+                        "/stories/highlights/" in url.lower() or "/s/" in url.lower()
+                    )
+                    is_audio = "/audio/" in url.lower() or entry.get("ext") in (
+                        "mp3",
+                        "m4a",
+                        "wav",
+                    )
+                    is_reel = (
+                        "/reel/" in url.lower()
+                        or "/reels/" in url.lower()
+                        or "/r/" in url.lower()
                     )
 
+                    if is_story:
+                        badge_media_type = "STORY"
+                    elif is_highlight:
+                        badge_media_type = "HIGHLIGHT"
+                    elif is_audio:
+                        badge_media_type = "AUDIO"
+                    elif is_reel:
+                        badge_media_type = "REEL"
+                    elif total_entries > 1:
+                        badge_media_type = (
+                            "CAROUSEL (VIDEO)" if has_video else "CAROUSEL (IMAGE)"
+                        )
+                    else:
+                        badge_media_type = "VIDEO" if has_video else "IMAGE"
+
+                    # Select highest quality direct stream
                     direct_url = ""
                     entry_raw_url = entry.get("url")
                     if isinstance(entry_raw_url, str) and entry_raw_url.startswith(
@@ -1042,31 +1068,52 @@ class InspectWorker(QThread):
                         if not is_webpage:
                             direct_url = entry_raw_url
 
-                    if not direct_url and formats and isinstance(formats, list):
-                        for f in reversed(formats):
-                            if (
-                                isinstance(f, dict)
-                                and f.get("url")
-                                and not any(
-                                    d in f["url"]
-                                    for d in ("instagram.com/p/", "instagram.com/reel/")
+                    if formats and isinstance(formats, list):
+                        valid_formats = [
+                            f
+                            for f in formats
+                            if isinstance(f, dict)
+                            and f.get("url")
+                            and not any(
+                                d in f["url"]
+                                for d in ("instagram.com/p/", "instagram.com/reel/")
+                            )
+                        ]
+                        if valid_formats:
+                            if has_video:
+                                best_fmt = max(
+                                    valid_formats,
+                                    key=lambda f: (
+                                        f.get("height") or 0,
+                                        f.get("tbr") or 0,
+                                    ),
                                 )
-                            ):
-                                direct_url = f["url"]
-                                break
+                                direct_url = best_fmt.get("url") or direct_url
+                            elif not direct_url:
+                                best_fmt = max(
+                                    valid_formats,
+                                    key=lambda f: (
+                                        f.get("height") or 0,
+                                        f.get("width") or 0,
+                                    ),
+                                )
+                                direct_url = best_fmt.get("url") or direct_url
 
-                    thumb_url = entry.get("thumbnail") or (
-                        direct_url if not has_video else ""
-                    )
+                    thumb_url = entry.get("thumbnail")
+                    if not thumb_url and entry.get("thumbnails"):
+                        thumb_url = entry["thumbnails"][-1].get("url")
+                    if not thumb_url and not has_video:
+                        thumb_url = direct_url
+
                     title_str = (
                         entry.get("title")
                         or entry.get("description")
-                        or f"Instagram {badge_media_type.capitalize()} {code}"
+                        or f"Instagram {badge_media_type} {code}"
                     )
                     title_first_line = (
                         title_str.splitlines()[0]
                         if title_str
-                        else f"Instagram {badge_media_type.capitalize()} {code}"
+                        else f"Instagram {badge_media_type} {code}"
                     )
 
                     card_id = (
@@ -1077,19 +1124,34 @@ class InspectWorker(QThread):
                     if card_id in self.seen_ids:
                         continue
 
-                    if total_entries > 1 and img_index is None:
+                    # Canonical URLs and Titles per type
+                    if is_story:
+                        slide_title = (
+                            f"@{uploader} Story ({idx}/{total_entries})"
+                            if total_entries > 1
+                            else f"@{uploader} Story"
+                        )
+                        item_url = (
+                            entry.get("webpage_url")
+                            or f"{IG_BASE_URL}/stories/{uploader}/{base_code}/"
+                        )
+                    elif is_highlight:
+                        slide_title = (
+                            f"Story Highlight ({idx}/{total_entries})"
+                            if total_entries > 1
+                            else "Story Highlight"
+                        )
+                        item_url = entry.get("webpage_url") or url
+                    elif total_entries > 1:
                         slide_title = (
                             f"{title_first_line} (Slide {idx}/{total_entries})"
                         )
                         item_url = f"{IG_BASE_URL}/p/{base_code}/?img_index={idx}"
-                    elif img_index is not None:
-                        slide_title = f"{title_first_line} (Slide {img_index})"
-                        item_url = f"{IG_BASE_URL}/p/{base_code}/?img_index={img_index}"
                     else:
                         slide_title = title_first_line
                         item_url = entry.get("webpage_url") or (
                             f"{IG_BASE_URL}/reel/{base_code}/"
-                            if badge_media_type == "reel"
+                            if badge_media_type == "REEL"
                             else f"{IG_BASE_URL}/p/{base_code}/"
                         )
 
@@ -1100,9 +1162,9 @@ class InspectWorker(QThread):
                         "title": slide_title,
                         "username": uploader,
                         "url": item_url,
-                        "thumbnail_url": thumb_url,
+                        "thumbnail_url": thumb_url or "",
                         "video_url": direct_url if has_video else "",
-                        "download_url": direct_url or thumb_url,
+                        "download_url": direct_url or thumb_url or "",
                         "caption": entry.get("description") or entry.get("title") or "",
                         "duration": float(entry.get("duration") or 0.0),
                         "view_count": int(entry.get("view_count") or 0),
@@ -1371,7 +1433,11 @@ class InspectWorker(QThread):
                     self._inspect_via_ytdlp(raw_target)
 
                 elif ttype == "story" and username:
-                    self._inspect_via_ytdlp(raw_target, default_username=username)
+                    user_id = self._get_user_id(username)
+                    if user_id:
+                        self._fetch_stories_web(username, user_id)
+                    else:
+                        self._inspect_via_ytdlp(raw_target, default_username=username)
 
                 elif ttype == "audio":
                     self.status_message.emit(f"Inspecting Audio track: {raw_target}")

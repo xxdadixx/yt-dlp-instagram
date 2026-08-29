@@ -9,6 +9,22 @@ import logging
 from typing import Any, Dict, Optional
 
 try:
+    from gui.styles import MEDIA_TYPE_COLORS
+except ImportError:
+    MEDIA_TYPE_COLORS = {
+        "STORY": {"bg": "#D946EF", "fg": "#FFFFFF"},
+        "REEL": {"bg": "#8B5CF6", "fg": "#FFFFFF"},
+        "CAROUSEL (IMAGE)": {"bg": "#0284C7", "fg": "#FFFFFF"},
+        "CAROUSEL (VIDEO)": {"bg": "#2563EB", "fg": "#FFFFFF"},
+        "CAROUSEL": {"bg": "#0284C7", "fg": "#FFFFFF"},
+        "IMAGE": {"bg": "#0D9488", "fg": "#FFFFFF"},
+        "VIDEO": {"bg": "#EA580C", "fg": "#FFFFFF"},
+        "POST": {"bg": "#3B82F6", "fg": "#FFFFFF"},
+        "HIGHLIGHT": {"bg": "#F59E0B", "fg": "#000000"},
+        "AUDIO": {"bg": "#10B981", "fg": "#FFFFFF"},
+    }
+
+try:
     from core.parser import parse_instagram_url
 except ImportError:
 
@@ -257,14 +273,12 @@ class MediaCard(QFrame):
         )
         parsed_target = parse_instagram_url(self.item_url)
         url_type = str(parsed_target.get("type") or "").lower()
-        raw_type = str(item_data.get("media_type") or "").strip().lower()
-
-        if url_type in ("reel", "carousel", "story", "highlight", "audio"):
-            self.media_type = url_type
-        elif raw_type in ("reel", "carousel", "story", "highlight", "audio", "post"):
+        raw_type = str(item_data.get("media_type") or "").strip().upper()
+        if raw_type:
             self.media_type = raw_type
         else:
-            self.media_type = "post"
+            parsed_target = parse_instagram_url(self.item_url)
+            self.media_type = str(parsed_target.get("type") or "POST").upper()
 
         self.item_data["media_type"] = self.media_type
         self.is_selected: bool = bool(item_data.get("selected", True))
@@ -593,68 +607,20 @@ class MediaCard(QFrame):
         super().mousePressEvent(event)
 
     def _get_badge_style(self, badge_type: str) -> str:
-        """Returns tailored badge background and text colors."""
-        badge_type = badge_type.upper()
-        if "REEL" in badge_type or "VIDEO" in badge_type:
-            return """
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:1 #7c3aed);
-                color: #ffffff;
+        """Returns badge style mapped to MEDIA_TYPE_COLORS."""
+        badge_key = badge_type.upper()
+        style = MEDIA_TYPE_COLORS.get(badge_key, {"bg": "#3B82F6", "fg": "#FFFFFF"})
+        return f"""
+            QLabel {{
+                background-color: {style['bg']};
+                color: {style['fg']};
                 font-size: 10px;
                 font-weight: 700;
                 padding: 2px 7px;
                 border-radius: 4px;
                 letter-spacing: 0.5px;
-            """
-        elif "CAROUSEL" in badge_type:
-            return """
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10b981);
-                color: #ffffff;
-                font-size: 10px;
-                font-weight: 700;
-                padding: 2px 7px;
-                border-radius: 4px;
-                letter-spacing: 0.5px;
-            """
-        elif "STORY" in badge_type:
-            return """
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #e11d48, stop:1 #f43f5e);
-                color: #ffffff;
-                font-size: 10px;
-                font-weight: 700;
-                padding: 2px 7px;
-                border-radius: 4px;
-                letter-spacing: 0.5px;
-            """
-        elif "HIGHLIGHT" in badge_type:
-            return """
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #d97706, stop:1 #f59e0b);
-                color: #ffffff;
-                font-size: 10px;
-                font-weight: 700;
-                padding: 2px 7px;
-                border-radius: 4px;
-                letter-spacing: 0.5px;
-            """
-        elif "AUDIO" in badge_type:
-            return """
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284c7, stop:1 #38bdf8);
-                color: #ffffff;
-                font-size: 10px;
-                font-weight: 700;
-                padding: 2px 7px;
-                border-radius: 4px;
-                letter-spacing: 0.5px;
-            """
-        else:
-            return """
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #60a5fa);
-                color: #ffffff;
-                font-size: 10px;
-                font-weight: 700;
-                padding: 2px 7px;
-                border-radius: 4px;
-                letter-spacing: 0.5px;
-            """
+            }}
+        """
 
     def _format_count(self, num: int) -> str:
         """Formats numbers into readable strings (e.g. 1.2M, 45.3K, 1,200)."""
@@ -773,3 +739,10 @@ class MediaCard(QFrame):
 
     def get_item_data(self) -> Dict[str, Any]:
         return dict(self.item_data)
+
+    def update_badge(self, media_type: str) -> None:
+        """Updates the media card badge text and dynamic color."""
+        if hasattr(self, "lbl_badge") and self.lbl_badge:
+            self.media_type = media_type.upper()
+            self.lbl_badge.setText(self.media_type)
+            self.lbl_badge.setStyleSheet(self._get_badge_style(self.media_type))
