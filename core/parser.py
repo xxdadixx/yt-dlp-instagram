@@ -32,7 +32,10 @@ def normalize_url(url: str) -> str:
         return ""
     cleaned = url.strip()
     cleaned = re.sub(r"([?&])img_index=\d+(&?)", r"\1\2", cleaned)
-    cleaned = re.sub(r"[?&](?:igsh|utm_[^&=]+)=[^&#]*", "", cleaned).rstrip("?&#")
+    cleaned = re.sub(r"[?&](?:igsh|utm_[^&=]+|hl|locale)=[^&#]*", "", cleaned).rstrip(
+        "?&#"
+    )
+    cleaned = cleaned.split("?")[0].rstrip("/")
     return cleaned
 
 
@@ -119,7 +122,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "url": f"https://www.instagram.com/reels/audio/{audio_id}/",
         }
 
-    # 7. Profile Reels Tab (e.g., https://www.instagram.com/username/reels/)
+    # 7. Profile Reels Tab (e.g., https://www.instagram.com/username/reels)
     prof_reels_m = re.search(
         r"instagram\.com/([A-Za-z0-9_.]+)/(?:reels|reel)/?", clean_url, re.IGNORECASE
     )
@@ -142,7 +145,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 "target_id": username,
             }
 
-    # 8. General Profile (e.g., https://www.instagram.com/username/)
+    # 8. General Profile (e.g., https://www.instagram.com/username)
     prof_m = re.search(r"instagram\.com/([A-Za-z0-9_.]+)/?", clean_url, re.IGNORECASE)
     if prof_m:
         username = prof_m.group(1)
@@ -188,4 +191,5 @@ def is_standalone_video(media_dict: Dict[str, Any]) -> bool:
         or media_dict.get("media_type") == 2
         or media_dict.get("video_versions")
         or media_dict.get("product_type") == "clips"
+        or media_dict.get("__typename") == "GraphVideo"
     )

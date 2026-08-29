@@ -80,9 +80,10 @@ QMainWindow {
 }
 
 QWidget {
+    background-color: #0D0D12;
     color: #FFFFFF;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-    font-size: 9pt;
+    font-family: 'Segoe UI', 'Leelawadee UI', 'Tahoma', 'Noto Sans Thai', 'Apple Color Emoji', 'Segoe UI Emoji', sans-serif;
+    font-size: 13px;
 }
 
 /* Glass Bento Enclosures */
