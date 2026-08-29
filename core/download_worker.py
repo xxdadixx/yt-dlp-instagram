@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 class DownloadWorker(QThread):
     """
-    High-Performance Sequential Download Worker.
+    High-Performance Sequential Download Worker with Abort / Cancel capabilities.
     Processes media items strictly 1-by-1 to prevent race conditions and skipped items,
     utilizing persistent socket connection pools and 256 KB streaming buffers.
     """
@@ -92,8 +92,12 @@ class DownloadWorker(QThread):
         self.session.headers.update(headers)
 
     def cancel(self) -> None:
-        """Signals the worker to abort further downloads immediately."""
+        """Signals the worker to abort current and future downloads immediately."""
         self._is_cancelled = True
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
     def run(self) -> None:
         """Main sequential execution loop."""
@@ -118,12 +122,21 @@ class DownloadWorker(QThread):
 
             try:
                 saved_path = self._process_single_item(item, index, total_items)
-                if saved_path and os.path.exists(saved_path):
+                if self._is_cancelled:
+                    self.item_finished.emit(item_id, False)
+                    break
+
+                if saved_path and (
+                    os.path.exists(saved_path) or os.path.isdir(self.save_folder)
+                ):
                     success_count += 1
                     self.item_finished.emit(item_id, True)
                 else:
                     self.item_finished.emit(item_id, False)
             except Exception as exc:
+                if self._is_cancelled:
+                    self.item_finished.emit(item_id, False)
+                    break
                 logger.error(f"Error downloading item {item_id}: {exc}", exc_info=True)
                 self.item_finished.emit(item_id, False)
 
@@ -137,33 +150,90 @@ class DownloadWorker(QThread):
     def _process_single_item(
         self, item: Dict[str, Any], index: int, total_items: int
     ) -> str:
-        """Determines best download strategy (Direct CDN streaming or yt-dlp fallback)."""
-        direct_url = item.get("download_url") or item.get("media_url")
-        media_type = (item.get("type") or "video").lower()
+        """Determines best download strategy (Carousel child downloader, Direct CDN streaming, or yt-dlp)."""
+        if self._is_cancelled:
+            return ""
+
         title = item.get("title") or item.get("id") or f"instagram_{int(time.time())}"
         clean_title = sanitize_filename(title)[:80]
+        item_id = str(item.get("id") or item.get("shortcode") or index)
+
+        # Strategy 1: Multi-Item Carousel Post -> Download all slide images/videos
+        slides = item.get("slides")
+        if slides and isinstance(slides, list) and len(slides) > 0:
+            saved_any = False
+            last_path = ""
+            for s_idx, slide in enumerate(slides, start=1):
+                if self._is_cancelled:
+                    break
+                slide_url = (
+                    slide.get("download_url")
+                    or slide.get("video_url")
+                    or slide.get("thumbnail_url")
+                )
+                is_vid = bool(slide.get("is_video"))
+                ext = ".mp4" if is_vid else ".jpg"
+                slide_path = os.path.join(
+                    self.save_folder, f"{clean_title}_{item_id}_{s_idx}{ext}"
+                )
+                if slide_url and (
+                    slide_url.startswith("http://") or slide_url.startswith("https://")
+                ):
+                    try:
+                        self._download_direct_stream(
+                            slide_url, slide_path, index, total_items
+                        )
+                        if os.path.exists(slide_path):
+                            saved_any = True
+                            last_path = slide_path
+                    except Exception as s_err:
+                        if self._is_cancelled:
+                            break
+                        logger.debug(f"Slide {s_idx} stream failed: {s_err}")
+
+            if self._is_cancelled:
+                return ""
+            if saved_any:
+                return last_path
+            # Fallback to yt-dlp if direct slide streaming failed
+            return self._download_via_ytdlp(item, clean_title, index, total_items)
+
+        # Strategy 2: Single Post / Reel / Image
+        direct_url = (
+            item.get("download_url") or item.get("media_url") or item.get("video_url")
+        )
+        media_type = (item.get("type") or item.get("media_type") or "video").lower()
 
         ext = (
             ".mp4"
             if "image" not in media_type and "photo" not in media_type
             else ".jpg"
         )
-        target_path = os.path.join(
-            self.save_folder, f"{clean_title}_{item.get('id', index)}{ext}"
+        target_path = os.path.join(self.save_folder, f"{clean_title}_{item_id}{ext}")
+
+        # Verify that direct_url is an actual CDN media link and not an Instagram HTML page
+        is_direct_cdn = bool(
+            direct_url
+            and direct_url.startswith("http")
+            and not any(
+                x in direct_url
+                for x in ("/p/", "/reel/", "/reels/", "/tv/", "/stories/")
+            )
         )
 
-        # Strategy 1: Direct CDN High-Throughput Streaming (Fastest)
-        if direct_url and direct_url.startswith("http"):
+        if is_direct_cdn:
             try:
                 return self._download_direct_stream(
                     direct_url, target_path, index, total_items
                 )
             except Exception as stream_err:
+                if self._is_cancelled:
+                    return ""
                 logger.warning(
-                    f"Direct stream failed for {item.get('id')}, falling back to yt-dlp: {stream_err}"
+                    f"Direct stream failed for {item_id}, falling back to yt-dlp: {stream_err}"
                 )
 
-        # Strategy 2: High-Performance yt-dlp Engine Fallback
+        # Strategy 3: yt-dlp Fallback
         return self._download_via_ytdlp(item, clean_title, index, total_items)
 
     def _download_direct_stream(
@@ -185,7 +255,10 @@ class DownloadWorker(QThread):
                     if self._is_cancelled:
                         f.close()
                         if os.path.exists(temp_path):
-                            os.remove(temp_path)
+                            try:
+                                os.remove(temp_path)
+                            except Exception:
+                                pass
                         raise InterruptedError("Download cancelled.")
 
                     if chunk:
@@ -209,8 +282,19 @@ class DownloadWorker(QThread):
                             )
                             self.progress.emit(min(overall_percent, 99))
 
+        if self._is_cancelled:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            raise InterruptedError("Download cancelled.")
+
         if os.path.exists(target_path):
-            os.remove(target_path)
+            try:
+                os.remove(target_path)
+            except Exception:
+                pass
         os.rename(temp_path, target_path)
         return target_path
 
@@ -218,7 +302,10 @@ class DownloadWorker(QThread):
         self, item: Dict[str, Any], clean_title: str, index: int, total_items: int
     ) -> str:
         """Executes yt-dlp extractor fallback with progress hook."""
-        url = item.get("url") or item.get("webpage_url")
+        if self._is_cancelled:
+            return ""
+
+        url = item.get("url") or item.get("webpage_url") or item.get("download_url")
         outtmpl = os.path.join(self.save_folder, f"{clean_title}_%(id)s.%(ext)s")
         last_progress_time = 0.0
 
@@ -255,4 +342,8 @@ class DownloadWorker(QThread):
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            if not info:
+                return ""
+            if "entries" in info and info["entries"]:
+                return ydl.prepare_filename(info["entries"][0])
             return ydl.prepare_filename(info)
