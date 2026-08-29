@@ -1,6 +1,6 @@
 """
 core/parser.py - URL parsing, data normalization, media ID encoding, and standalone video filtering.
-Handles Instagram URLs, tracking parameters, path shorthand, domain aliases, and carousel slide indices.
+Handles Instagram URLs, tracking parameters, path shorthand, domain aliases, carousel slide indices, and direct CDN streams.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 
 from config.constants import (
     AUDIO_REGEX,
+    DIRECT_CDN_REGEX,
     HIGHLIGHTS_REGEX,
     INSTAGRAM_DOMAINS,
     MEDIA_TYPE_CAROUSEL,
@@ -62,7 +63,6 @@ def is_standalone_video(item: Dict[str, Any]) -> bool:
 
     media_type = media.get("media_type")
 
-    # Reject Carousel items
     if media_type == MEDIA_TYPE_CAROUSEL or media_type == 8:
         return False
     if "carousel_media" in media and media["carousel_media"]:
@@ -72,11 +72,9 @@ def is_standalone_video(item: Dict[str, Any]) -> bool:
     if "edge_sidecar_to_children" in media and media["edge_sidecar_to_children"]:
         return False
 
-    # Reject Static Photo items
     if media_type == MEDIA_TYPE_PHOTO or media_type == 1:
         return False
 
-    # Accept Video / Reel items
     if media_type == MEDIA_TYPE_VIDEO or media_type == 2:
         return True
     if media.get("is_video") is True:
@@ -91,15 +89,15 @@ def is_standalone_video(item: Dict[str, Any]) -> bool:
 
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.]{1,30}$")
 PATH_PATTERN = re.compile(
-    r"^[a-zA-Z0-9_.]{1,30}/(?:reels|p|reel|tv|stories|highlights)/?$",
+    r"^[a-zA-Z0-9_.]{1,30}/(?:reels|p|post|reel|tv|r|stories|highlights)/?$",
     re.IGNORECASE,
 )
 PATH_SHORTHAND_PATTERN = re.compile(
-    r"^(?:share/)?(?:p|reel|reels|tv|stories|highlights|audio|reels/audio|s)/[a-zA-Z0-9_\-.]*/?$",
+    r"^(?:share/(?:p|post|reel|reels|tv|r|stories|highlights|audio|reels/audio|s)?|[a-zA-Z0-9_.]{1,30}/(?:reels|p|post|reel|tv|r|stories|highlights)|p/|post/|reel/|reels/|tv/|r/|stories/|highlights/|audio/|reels/audio/|s/)[a-zA-Z0-9_\-.]*/?$",
     re.IGNORECASE,
 )
 
-PUNCT_CHARS = set(" ()[]{}<>.,!;") | {chr(34), chr(39)}
+PUNCT_CHARS = set(" ()[]{}<>.,!;") | {'"', "'"}
 
 
 def _strip_punct(s: str) -> str:
@@ -125,11 +123,17 @@ def normalize_url(url: str) -> str:
             return f"https://www.instagram.com/{username}/"
         return ""
 
+    # Handle direct CDN media URLs
+    if any(cdn in url.lower() for cdn in ("cdninstagram.com", "fbcdn.net")):
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        return url
+
     has_known_domain = any(dom in url.lower() for dom in INSTAGRAM_DOMAINS)
     if not has_known_domain:
         if not url.startswith(("http://", "https://")):
             if PATH_PATTERN.match(url) or PATH_SHORTHAND_PATTERN.match(url):
-                return f"https://www.instagram.com/{url.strip('/')}/"
+                return normalize_url(f'https://www.instagram.com/{url.strip("/")}/')
             elif (
                 USERNAME_PATTERN.match(url)
                 and url.lower() not in RESERVED_USERNAMES
@@ -151,8 +155,19 @@ def normalize_url(url: str) -> str:
     except Exception:
         return ""
 
-    if any(dom in netloc for dom in INSTAGRAM_DOMAINS):
+    if any(
+        dom in netloc
+        for dom in (
+            "instagram.com",
+            "ddinstagram.com",
+            "kkinstagram.com",
+            "instagr.am",
+            "ig.me",
+        )
+    ):
         netloc = "www.instagram.com"
+    elif any(cdn in netloc for cdn in ("cdninstagram.com", "fbcdn.net")):
+        return url
     else:
         return ""
 
@@ -160,13 +175,30 @@ def normalize_url(url: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
 
-    # Normalize share paths, shorthand, and in-profile media paths
+    # Strip subpaths like /embed/, /captioned/, /comments/, /c/123456/
+    path = re.sub(
+        r"/(?:embed(?:/captioned)?|captioned|comments|c/[a-zA-Z0-9_]+)/?$",
+        "/",
+        path,
+        flags=re.IGNORECASE,
+    )
+
+    # Normalize share paths and shorthand paths
     path = re.sub(r"^/share/(?:p|post)/", r"/p/", path, flags=re.IGNORECASE)
     path = re.sub(r"^/share/(?:reel|reels|r)/", r"/reel/", path, flags=re.IGNORECASE)
     path = re.sub(r"^/share/tv/", r"/tv/", path, flags=re.IGNORECASE)
+    path = re.sub(
+        r"^/share/([a-zA-Z0-9_\-]+)/?$", r"/p/\g<1>/", path, flags=re.IGNORECASE
+    )
     path = re.sub(r"^/post/", r"/p/", path, flags=re.IGNORECASE)
     path = re.sub(r"^/r/", r"/reel/", path, flags=re.IGNORECASE)
+    path = re.sub(r"^/reel/audio/", r"/reels/audio/", path, flags=re.IGNORECASE)
+    path = re.sub(
+        r"^/stories/highlights/s/", r"/stories/highlights/", path, flags=re.IGNORECASE
+    )
+    path = re.sub(r"^/s/s/", r"/s/", path, flags=re.IGNORECASE)
 
+    # Normalize /username/p/CODE/ or /username/reel/CODE/ -> /p/CODE/ or /reel/CODE/
     path = re.sub(
         r"^/[a-zA-Z0-9_.]+/p/([a-zA-Z0-9_\-]+)/?",
         r"/p/\g<1>/",
@@ -218,14 +250,17 @@ def extract_instagram_urls(text: str) -> List[str]:
     if not text:
         return []
 
-    patterns = [
-        r"https?://(?:[a-zA-Z0-9_\-]+\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am)/[^\s,)>\]}\"']+",
-        r"@[a-zA-Z0-9_.]{1,30}",
-    ]
+    url_regex = re.compile(
+        r"https?://(?:[a-zA-Z0-9_\-]+\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am|ig\.me|cdninstagram\.com|fbcdn\.net)/[^\s,)\(\]\[\}\"\'><]+",
+        re.IGNORECASE,
+    )
+    user_regex = re.compile(r"@[a-zA-Z0-9_.]{1,30}")
+
     candidates = []
-    for pat in patterns:
-        for m in re.finditer(pat, text, re.IGNORECASE):
-            candidates.append(m.group(0).strip())
+    for m in url_regex.finditer(text):
+        candidates.append(m.group(0).strip())
+    for m in user_regex.finditer(text):
+        candidates.append(m.group(0).strip())
 
     for line in text.splitlines():
         line = line.strip()
@@ -278,6 +313,22 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "description": "Invalid URL",
         }
 
+    # Direct CDN media stream
+    if DIRECT_CDN_REGEX.match(clean_url) or any(
+        cdn in clean_url.lower() for cdn in ("cdninstagram.com", "fbcdn.net")
+    ):
+        return {
+            "type": "direct_media",
+            "valid": True,
+            "username": None,
+            "shortcode": None,
+            "target_id": None,
+            "img_index": None,
+            "clean_url": clean_url,
+            "raw_url": url,
+            "description": "Direct Media Stream",
+        }
+
     img_index = None
     try:
         parsed_raw = urlparse(url)
@@ -290,7 +341,6 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 1. Profile Reels Tab
     reels_match = REELS_TAB_REGEX.match(clean_url)
     if reels_match:
         username = reels_match.group(1).lower()
@@ -307,7 +357,6 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 "description": f"@{username} Reels Tab",
             }
 
-    # 2. Audio Page
     audio_match = AUDIO_REGEX.match(clean_url)
     if audio_match:
         audio_id = audio_match.group(1)
@@ -323,12 +372,11 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "description": f"Audio Track (ID: #{audio_id})",
         }
 
-    # 3. Single Post / Reel / Carousel / TV
     post_match = POST_REEL_REGEX.match(clean_url)
     if post_match:
-        shortcode = post_match.group(1)
+        shortcode = post_match.group(1) or post_match.group(2) or post_match.group(3)
         url_lower = clean_url.lower()
-        if "/reel/" in url_lower or "/reels/" in url_lower:
+        if "/reel/" in url_lower or "/reels/" in url_lower or "/r/" in url_lower:
             media_type = "reel"
             desc = f"Instagram Reel (#{shortcode})"
         elif "/tv/" in url_lower:
@@ -353,7 +401,6 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "description": desc,
         }
 
-    # 4. Highlights
     highlight_match = HIGHLIGHTS_REGEX.match(clean_url)
     if highlight_match:
         highlight_id = highlight_match.group(1) or highlight_match.group(2)
@@ -369,7 +416,6 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "description": f"Story Highlight (ID: #{highlight_id})",
         }
 
-    # 5. Stories
     story_match = STORIES_REGEX.match(clean_url)
     if story_match:
         username = story_match.group(1).lower()
@@ -391,7 +437,6 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 ),
             }
 
-    # 6. Profile
     profile_match = PROFILE_REGEX.match(clean_url)
     if profile_match:
         username = profile_match.group(1).lower()

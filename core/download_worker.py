@@ -1,6 +1,7 @@
 """
 core/download_worker.py - Resilient background download worker for Instagram media items.
 Supports direct CDN stream downloads, API media info extraction, and yt-dlp fallback.
+Handles correct file extensions (video, photo, carousel, audio), temp files, and safe thread cancellation.
 """
 
 from __future__ import annotations
@@ -84,7 +85,7 @@ def sanitize_filename(name: str, max_length: int = 50) -> str:
     """Sanitizes strings to be safe for file paths across Windows, macOS, and Linux."""
     if not name:
         return "instagram_media"
-    cleaned = re.sub(r'[\/*?:"<>|]', "_", name)
+    cleaned = re.sub(r'[\\/*?:"<>|]', "_", name)
     cleaned = re.sub(r"[\s_]+", "_", cleaned)
     cleaned = cleaned.strip(" ._")
     return cleaned[:max_length] if cleaned else "instagram_media"
@@ -258,28 +259,6 @@ class DownloadWorker(QThread):
         except Exception:
             pass
 
-        # 2. Web info endpoint
-        try:
-            web_url = f"{IG_BASE_URL}/p/{shortcode}/?__a=1&__d=dis"
-            headers = dict(DEFAULT_HEADERS)
-            if self.cookie_str:
-                headers["Cookie"] = self.cookie_str
-            req = urllib.request.Request(web_url, headers=headers)
-            with urllib.request.urlopen(
-                req, context=self._ssl_ctx, timeout=DEFAULT_REQUEST_TIMEOUT
-            ) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-                data = json.loads(raw)
-                items = data.get("items", [])
-                if items:
-                    v_versions = items[0].get("video_versions", [])
-                    if v_versions and isinstance(v_versions, list):
-                        v_url = v_versions[0].get("url")
-                        if v_url:
-                            return v_url
-        except Exception:
-            pass
-
         return None
 
     def _download_single(
@@ -287,21 +266,49 @@ class DownloadWorker(QThread):
     ) -> bool:
         """Attempts direct CDN download first, then API lookup, then yt-dlp fallback."""
         clean_user = sanitize_filename(username, max_length=40) or "instagram"
-        clean_sc = sanitize_filename(shortcode, max_length=40) or "media"
-        target_filename = f"{clean_user}_{clean_sc}.mp4"
+        item_id = str(item.get("id") or shortcode)
+        clean_sc = sanitize_filename(item_id, max_length=50) or "media"
+
+        media_type = str(item.get("media_type") or "reel").lower()
+        has_video_url = bool(
+            item.get("video_url") and str(item.get("video_url")).startswith("http")
+        )
+
+        if media_type == "audio":
+            ext = "mp3"
+            direct_url = item.get("download_url") or item.get("video_url")
+            is_video = False
+        elif media_type in ("post", "photo", "image") or not has_video_url:
+            if has_video_url and item.get("is_video") is True:
+                ext = "mp4"
+                direct_url = item.get("video_url") or item.get("download_url")
+                is_video = True
+            else:
+                ext = "jpg"
+                direct_url = (
+                    item.get("download_url")
+                    or item.get("thumbnail_url")
+                    or item.get("video_url")
+                )
+                is_video = False
+        else:
+            ext = "mp4"
+            direct_url = item.get("video_url") or item.get("download_url")
+            is_video = True
+
+        target_filename = f"{clean_user}_{clean_sc}.{ext}"
         out_path = os.path.join(self.save_folder, target_filename)
 
-        # 1. Check for pre-extracted direct video URL
-        direct_url = item.get("video_url") or item.get("download_url")
-        if direct_url and direct_url.startswith("http"):
-            if self._download_stream_url(direct_url, out_path):
+        # 1. Check for pre-extracted direct URL (video or image)
+        if direct_url and str(direct_url).startswith("http"):
+            if self._download_stream_url(str(direct_url), out_path):
                 return True
 
         if self.is_cancelled:
             return False
 
-        # 2. Try resolving fresh direct CDN URL from media info API
-        if shortcode:
+        # 2. Try resolving fresh direct CDN URL from media info API (for videos)
+        if shortcode and ext == "mp4":
             api_direct_url = self._fetch_direct_video_url(shortcode)
             if api_direct_url:
                 if self._download_stream_url(api_direct_url, out_path):
@@ -313,8 +320,7 @@ class DownloadWorker(QThread):
         # 3. Fallback: Download via yt-dlp with sanitized outtmpl
         if yt_dlp is not None:
             try:
-                media_type = item.get("media_type", "reel")
-                if media_type == "post":
+                if not is_video and media_type in ("post", "photo", "carousel"):
                     canonical_url = f"{IG_BASE_URL}/p/{clean_sc}/"
                 else:
                     canonical_url = f"{IG_BASE_URL}/reel/{clean_sc}/"
@@ -345,13 +351,9 @@ class DownloadWorker(QThread):
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ret = ydl.download([canonical_url])
-                    if ret == 0 and os.path.exists(out_path):
+                    if ret == 0:
                         return True
-                    if direct_url and direct_url.startswith("http"):
-                        ret2 = ydl.download([direct_url])
-                        if ret2 == 0:
-                            return True
-            except Exception as ex:
-                logger.debug(f"yt-dlp download failed for {url}: {ex}")
+            except Exception as e:
+                logger.debug(f"yt-dlp download failed for {url}: {e}")
 
-        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+        return False

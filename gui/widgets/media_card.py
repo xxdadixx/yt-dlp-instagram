@@ -1,12 +1,24 @@
 """
 gui/widgets/media_card.py - High-end modern Media Card widget for inspected Instagram media items.
-Features aspect-ratio-preserving vertical thumbnails, badges, rich metadata, and queue controls.
+Features aspect-ratio-preserving vertical thumbnails, badges, rich metadata, safe lifecycle cleanup, and queue controls.
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Optional
+
+try:
+    from core.parser import parse_instagram_url
+except ImportError:
+
+    def parse_instagram_url(u: str) -> Dict[str, Any]:
+        if "/reel/" in u.lower() or "/reels/" in u.lower():
+            return {"type": "reel", "valid": True}
+        if "img_index" in u.lower():
+            return {"type": "carousel", "valid": True}
+        return {"type": "post", "valid": True}
+
 
 try:
     from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
@@ -37,10 +49,17 @@ except ImportError:
             self._slots = []
 
         def connect(self, f):
-            self._slots.append(f)
+            if f not in self._slots:
+                self._slots.append(f)
+
+        def disconnect(self, f=None):
+            if f is None:
+                self._slots.clear()
+            elif f in self._slots:
+                self._slots.remove(f)
 
         def emit(self, *a, **kw):
-            for s in self._slots:
+            for s in list(self._slots):
                 try:
                     s(*a, **kw)
                 except Exception:
@@ -75,7 +94,7 @@ except ImportError:
         def fill(self, *a):
             pass
 
-    class QWidget:
+    class QWidget:  # type: ignore
         def __init__(self, parent=None):
             pass
 
@@ -91,10 +110,23 @@ except ImportError:
         def setParent(self, p):
             pass
 
-    class QFrame(QWidget):
-        pass
+        def setVisible(self, *a):
+            pass
 
-    class QHBoxLayout:
+        def setFixedSize(self, *a):
+            pass
+
+        def setCursor(self, *a):
+            pass
+
+    class QFrame(QWidget):
+        class Shape:
+            NoFrame = 0
+
+        def setFrameShape(self, *a):
+            pass
+
+    class QVBoxLayout:
         def __init__(self, parent=None):
             pass
 
@@ -113,12 +145,16 @@ except ImportError:
         def addStretch(self, *a):
             pass
 
-    class QVBoxLayout(QHBoxLayout):
+        def count(self):
+            return 0
+
+    class QHBoxLayout(QVBoxLayout):
         pass
 
     class QLabel(QWidget):
         def __init__(self, text="", parent=None):
             super().__init__(parent)
+            self._text = text
 
         def setText(self, *a):
             pass
@@ -136,6 +172,9 @@ except ImportError:
             pass
 
         def setToolTip(self, *a):
+            pass
+
+        def clear(self):
             pass
 
     class QCheckBox(QWidget):
@@ -191,9 +230,10 @@ class MediaCard(QFrame):
     Card item representing an inspected media entity in the queue grid.
     Features:
     - Non-distorted, smooth vertical aspect-ratio thumbnail previews (76x102)
-    - Translucent dark theme & badge typography
+    - Apple-inspired translucent dark theme & badge typography
     - Duration, view count, like count, and creator metrics
     - Real-time download status lifecycle & queue controls
+    - Safe background thread teardown and memory cleanup
     """
 
     deleted = pyqtSignal() if "pyqtSignal" in globals() else MagicSignal()  # type: ignore
@@ -215,22 +255,72 @@ class MediaCard(QFrame):
                 else ""
             )
         )
+        parsed_target = parse_instagram_url(self.item_url)
+        url_type = str(parsed_target.get("type") or "").lower()
+        raw_type = str(item_data.get("media_type") or "").strip().lower()
+
+        if url_type in ("reel", "carousel", "story", "highlight", "audio"):
+            self.media_type = url_type
+        elif raw_type in ("reel", "carousel", "story", "highlight", "audio", "post"):
+            self.media_type = raw_type
+        else:
+            self.media_type = "post"
+
+        self.item_data["media_type"] = self.media_type
         self.is_selected: bool = bool(item_data.get("selected", True))
         self.status: str = item_data.get("status", "ready")
         self.is_finished: bool = False
         self.thumb_loader: Optional[ThumbnailLoader] = None
+        self._is_cleaned_up: bool = False
 
         self.setObjectName("MediaCardFrame")
         self.init_ui()
+
+    def cleanup(self) -> None:
+        """Safely stops background thumbnail loaders and disconnects slots to prevent memory leaks."""
+        if self._is_cleaned_up:
+            return
+        self._is_cleaned_up = True
+
+        if self.thumb_loader:
+            try:
+                if hasattr(self.thumb_loader, "loaded") and self.thumb_loader.loaded:
+                    self.thumb_loader.loaded.disconnect(self._on_thumbnail_loaded)
+            except Exception:
+                pass
+            if hasattr(self.thumb_loader, "cancel"):
+                self.thumb_loader.cancel()
+            if hasattr(self.thumb_loader, "wait"):
+                try:
+                    self.thumb_loader.wait(100)
+                except Exception:
+                    pass
+            self.thumb_loader = None
+
+        if hasattr(self, "chk_select") and hasattr(self.chk_select, "stateChanged"):
+            try:
+                self.chk_select.stateChanged.disconnect()
+            except Exception:
+                pass
+
+        if hasattr(self, "btn_delete") and hasattr(self.btn_delete, "clicked"):
+            try:
+                self.btn_delete.clicked.disconnect()
+            except Exception:
+                pass
+
+        if hasattr(self, "lbl_thumb") and hasattr(self.lbl_thumb, "clear"):
+            try:
+                self.lbl_thumb.clear()
+            except Exception:
+                pass
 
     def init_ui(self) -> None:
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(12, 10, 14, 10)
         main_layout.setSpacing(14)
 
-        # ----------------------------------------------------
         # 1. Selection Checkbox
-        # ----------------------------------------------------
         self.chk_select = QCheckBox(self)
         self.chk_select.setChecked(self.is_selected)
         if hasattr(self.chk_select, "stateChanged") and hasattr(
@@ -239,9 +329,7 @@ class MediaCard(QFrame):
             self.chk_select.stateChanged.connect(self._on_check_changed)
         main_layout.addWidget(self.chk_select)
 
-        # ----------------------------------------------------
         # 2. Aspect-Ratio Preserving Thumbnail Box
-        # ----------------------------------------------------
         self.lbl_thumb = QLabel(self)
         self.lbl_thumb.setObjectName("CardThumbnail")
         if hasattr(self.lbl_thumb, "setFixedSize"):
@@ -252,7 +340,9 @@ class MediaCard(QFrame):
             if "Qt" in globals() and hasattr(Qt, "AlignmentFlag"):
                 self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        badge_type = str(self.item_data.get("media_type", "reel")).upper()
+        badge_type = getattr(
+            self, "media_type", str(self.item_data.get("media_type", "reel"))
+        ).upper()
         self.lbl_thumb.setText(badge_type)
         self.lbl_thumb.setStyleSheet(
             """
@@ -277,9 +367,7 @@ class MediaCard(QFrame):
                 self.thumb_loader.loaded.connect(self._on_thumbnail_loaded)
             self.thumb_loader.start()
 
-        # ----------------------------------------------------
         # 3. Media Metadata Information Layout
-        # ----------------------------------------------------
         info_layout = QVBoxLayout()
         info_layout.setContentsMargins(0, 2, 0, 2)
         info_layout.setSpacing(5)
@@ -378,12 +466,16 @@ class MediaCard(QFrame):
         url_row = QHBoxLayout()
         url_row.setSpacing(6)
 
-        display_url = self.item_url
+        item_url = (
+            self.item_data.get("url")
+            or f"https://www.instagram.com/reel/{self.shortcode}/"
+        )
+        display_url = item_url
         if len(display_url) > 60:
             display_url = display_url[:35] + "..." + display_url[-18:]
 
         self.lbl_url = QLabel(
-            f'<a href="{self.item_url}" style="color: #60a5fa; text-decoration: none;">🔗 {display_url}</a>',
+            f'<a href="{item_url}" style="color: #60a5fa; text-decoration: none;">🔗 {display_url}</a>',
             self,
         )
         if hasattr(self.lbl_url, "setOpenExternalLinks"):
@@ -393,14 +485,13 @@ class MediaCard(QFrame):
                 getattr(Qt.TextInteractionFlag, "TextBrowserInteraction", 1)
                 | getattr(Qt.TextInteractionFlag, "TextSelectableByMouse", 1)
             )
-        self.lbl_url.setToolTip(f"Instagram Link: {self.item_url}")
+        self.lbl_url.setToolTip(f"Instagram Link: {item_url}")
         self.lbl_url.setStyleSheet("font-size: 11px; font-weight: 500;")
         url_row.addWidget(self.lbl_url)
         url_row.addStretch()
         info_layout.addLayout(url_row)
 
         # --- Line 4: Real-Time Status Lifecycle ---
-
         status_row = QHBoxLayout()
         status_row.setSpacing(8)
 
@@ -415,9 +506,7 @@ class MediaCard(QFrame):
 
         main_layout.addLayout(info_layout, stretch=1)
 
-        # ----------------------------------------------------
         # 4. Action Controls (Delete Button)
-        # ----------------------------------------------------
         self.btn_delete = QPushButton(self)
         self.btn_delete.setObjectName("CardDeleteButton")
         if hasattr(self.btn_delete, "setToolTip"):
@@ -454,6 +543,9 @@ class MediaCard(QFrame):
         )
         self.btn_delete.clicked.connect(lambda: self.deleted.emit())
         main_layout.addWidget(self.btn_delete)
+
+        # Initialize active selection styling
+        self._update_selection_style()
 
     def _update_selection_style(self) -> None:
         """Updates border, glow, and background tint when card selection state changes."""
@@ -533,9 +625,29 @@ class MediaCard(QFrame):
                 border-radius: 4px;
                 letter-spacing: 0.5px;
             """
-        else:
+        elif "HIGHLIGHT" in badge_type:
             return """
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #d97706, stop:1 #f59e0b);
+                color: #ffffff;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 2px 7px;
+                border-radius: 4px;
+                letter-spacing: 0.5px;
+            """
+        elif "AUDIO" in badge_type:
+            return """
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284c7, stop:1 #38bdf8);
+                color: #ffffff;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 2px 7px;
+                border-radius: 4px;
+                letter-spacing: 0.5px;
+            """
+        else:
+            return """
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #60a5fa);
                 color: #ffffff;
                 font-size: 10px;
                 font-weight: 700;
@@ -557,7 +669,7 @@ class MediaCard(QFrame):
         Processes thumbnail bytes on GUI main thread with smooth anti-aliased scaling,
         center-cropping to vertical ratio (76x102), and rounded corner mask.
         """
-        if not data:
+        if not data or self._is_cleaned_up:
             return
 
         try:
@@ -574,6 +686,7 @@ class MediaCard(QFrame):
             target_w = self.THUMB_WIDTH
             target_h = self.THUMB_HEIGHT
 
+            # If PyQt6 full graphics engine is available
             if "QPainter" in globals() and "Qt" in globals():
                 # 1. Scale with KeepAspectRatioByExpanding & SmoothTransformation
                 aspect_mode = getattr(
@@ -609,17 +722,19 @@ class MediaCard(QFrame):
                 painter.drawPixmap(0, 0, cropped)
                 painter.end()
 
-                if hasattr(self.lbl_thumb, "setPixmap"):
+                if hasattr(self.lbl_thumb, "setPixmap") and not self._is_cleaned_up:
                     self.lbl_thumb.setPixmap(rounded)
                     self.lbl_thumb.setText("")
             else:
-                if hasattr(self.lbl_thumb, "setPixmap"):
+                if hasattr(self.lbl_thumb, "setPixmap") and not self._is_cleaned_up:
                     self.lbl_thumb.setPixmap(pixmap)
                     self.lbl_thumb.setText("")
         except Exception as e:
             logger.debug(f"Thumbnail processing failed: {e}")
 
     def _on_check_changed(self, state: int) -> None:
+        if self._is_cleaned_up:
+            return
         self.is_selected = state == 2 or state is True
         self.item_data["selected"] = self.is_selected
         self._update_selection_style()
@@ -658,30 +773,3 @@ class MediaCard(QFrame):
 
     def get_item_data(self) -> Dict[str, Any]:
         return dict(self.item_data)
-
-    def cleanup(self) -> None:
-        """Safely stops background thumbnail loaders and disconnects slots to prevent memory leaks."""
-        if self._is_cleaned_up:
-            return
-        self._is_cleaned_up = True
-
-        if self.thumb_loader:
-            try:
-                if hasattr(self.thumb_loader, "loaded") and self.thumb_loader.loaded:
-                    self.thumb_loader.loaded.disconnect(self._on_thumbnail_loaded)
-            except Exception:
-                pass
-            if hasattr(self.thumb_loader, "cancel"):
-                self.thumb_loader.cancel()
-            if hasattr(self.thumb_loader, "wait"):
-                try:
-                    self.thumb_loader.wait(200)
-                except Exception:
-                    pass
-            self.thumb_loader = None
-
-        if hasattr(self, "lbl_thumb") and hasattr(self.lbl_thumb, "clear"):
-            try:
-                self.lbl_thumb.clear()
-            except Exception:
-                pass

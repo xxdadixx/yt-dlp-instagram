@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 
 APP_USER_MODEL_ID = "xxdadixx.instagramprodownloader.app.1.0"
 APP_NAME = "Instagram Pro Downloader - Studio Inspector"
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.5.0"
 
 # Instagram Client Headers & Identifiers
 IG_APP_ID = "936619743392459"
@@ -44,11 +44,15 @@ IG_USER_LOOKUP_URL = "https://i.instagram.com/api/v1/users/lookup/"
 IG_WEB_SEARCH_URL = "https://www.instagram.com/web/search/topsearch/?context=blended&query={username}&rank_token=0.5"
 IG_USERS_SEARCH_URL = "https://i.instagram.com/api/v1/users/search/?q={username}"
 IG_WEB_PROFILE_ALT_URL = "https://www.instagram.com/{username}/?__a=1&__d=dis"
+
 INSTAGRAM_DOMAINS: Tuple[str, ...] = (
     "instagram.com",
     "ddinstagram.com",
     "kkinstagram.com",
     "instagr.am",
+    "ig.me",
+    "cdninstagram.com",
+    "fbcdn.net",
 )
 
 # HTTP Headers
@@ -83,32 +87,36 @@ MAX_PAGINATION_PAGES: int = 50
 REQUEST_DELAY_SECONDS: float = 0.5
 DEFAULT_REQUEST_TIMEOUT: int = 15
 
-# URL Regular Expressions
+DOMAINS_RE_STR = (
+    r"(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am|ig\.me)"
+)
+
 # URL Regular Expressions
 REELS_TAB_REGEX = re.compile(
     rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/([a-zA-Z0-9_\.]+)\/reels\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 POST_REEL_REGEX = re.compile(
-    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:(?:[a-zA-Z0-9_.]+\/)?(?:share\/)?(?:p|post|reel|reels|tv|r)\/([a-zA-Z0-9_\-]+)|(?:share\/(?:p|post|reel|reels|tv|r)\/([a-zA-Z0-9_\-]+)))\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:(?:[a-zA-Z0-9_.]+\/)?(?:share\/)?(?:p|post|reel|reels|tv|r)\/([a-zA-Z0-9_\-]+)|(?:share\/(?:p|post|reel|reels|tv|r)\/([a-zA-Z0-9_\-]+))|share\/([a-zA-Z0-9_\-]+))\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 STORIES_REGEX = re.compile(
-    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/stories\/([a-zA-Z0-9_\.]+)(?:\/([a-zA-Z0-9_\-]+))?\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/stories\/([a-zA-Z0-9_.]+)(?:\/([a-zA-Z0-9_\-]+))?\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 HIGHLIGHTS_REGEX = re.compile(
-    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:stories\/highlights\/([a-zA-Z0-9_\-]+)|s\/([a-zA-Z0-9_\-]+))\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:stories\/highlights\/(?:s\/)?([a-zA-Z0-9_\-]+)|s\/(?:s\/)?([a-zA-Z0-9_\-]+))\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 AUDIO_REGEX = re.compile(
-    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:reels\/audio|audio)\/([a-zA-Z0-9_\-]+)\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/(?:reels\/audio|reel\/audio|audio)\/([a-zA-Z0-9_\-]+)\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
 PROFILE_REGEX = re.compile(
-    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/([a-zA-Z0-9_\.]+)\/?(?:\?.*)?$",
+    rf"^https?:\/\/(?:www\.)?{DOMAINS_RE_STR}\/([a-zA-Z0-9_.]+)\/?(?:\?.*)?$",
     re.IGNORECASE,
 )
+
 DIRECT_CDN_REGEX = re.compile(
     r"^https?:\/\/[a-zA-Z0-9_\-.]*(?:cdninstagram\.com|fbcdn\.net)\/[^\s]+$",
     re.IGNORECASE,
@@ -117,9 +125,11 @@ DIRECT_CDN_REGEX = re.compile(
 # Reserved Instagram URL Path Usernames
 RESERVED_USERNAMES = {
     "p",
+    "post",
     "reel",
     "reels",
     "tv",
+    "r",
     "stories",
     "highlights",
     "audio",
@@ -137,6 +147,7 @@ RESERVED_USERNAMES = {
     "press",
     "terms",
     "privacy",
+    "s",
 }
 
 # Quality Options for Inspector / Downloader

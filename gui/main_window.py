@@ -871,10 +871,19 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self._set_button_icon(self.btn_inspect, "search", "#ffffff", 16)
         self.btn_inspect.setText("Inspect Media")
-        self.lbl_status.setText(
-            f"Inspection completed! Found {total_count} items ready."
-        )
-        self.show_toast(f"Found {total_count} items ready.")
+        if total_count == 0:
+            self.lbl_status.setText(
+                "Inspection completed: 0 items found. (Instagram may require active session cookies)."
+            )
+            self.show_toast(
+                "Found 0 items. Ensure the URL is public or import logged-in cookies.",
+                is_error=True,
+            )
+        else:
+            self.lbl_status.setText(
+                f"Inspection completed! Found {total_count} items ready."
+            )
+            self.show_toast(f"Found {total_count} items ready.")
 
     def on_inspection_error(self, err_msg: str) -> None:
         self._set_button_icon(self.btn_inspect, "search", "#ffffff", 16)
@@ -934,36 +943,51 @@ class MainWindow(QMainWindow):
     # Cookie & Folder Management
     # --------------------------------------------------------
     def update_cookie_status(self) -> None:
-        has_cookie = self.cookie_manager.has_cookies() or bool(
-            self.cookie_str or (self.cookie_file and os.path.exists(self.cookie_file))
-        )
-        if has_cookie:
-            self.lbl_cookie_status.setText("Cookie: Connected (Instagram)")
-            self.lbl_cookie_status.setStyleSheet("color: #4ade80; font-weight: bold;")
+        if self.cookie_manager.has_cookies():
+            user_id = self.cookie_manager.get_user_id()
+            session_id = self.cookie_manager.get_session_id()
+            if session_id:
+                tag = f"(User: #{user_id})" if user_id else "(Session Active)"
+                self.lbl_cookie_status.setText(f"Cookie: Connected {tag}")
+                self.lbl_cookie_status.setStyleSheet(
+                    "color: #4ade80; font-weight: 600;"
+                )
+            else:
+                self.lbl_cookie_status.setText("Cookie: Anonymous (No Session ID)")
+                self.lbl_cookie_status.setStyleSheet(
+                    "color: #fbbf24; font-weight: 600;"
+                )
         else:
             self.lbl_cookie_status.setText("Cookie: Not Connected")
             self.lbl_cookie_status.setStyleSheet("color: #94a3b8;")
 
     def import_cookie(self) -> None:
-        """Opens file dialog and imports cookie file in Netscape, JSON, or text format."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Import Instagram Cookie",
+            "Import Instagram Cookie File",
             "",
             "Cookie Files (*.txt *.json);;All Files (*.*)",
         )
-        if file_path:
-            success = self.cookie_manager.import_cookie_file(file_path)
-            if success:
-                self.cookie_file = self.cookie_manager.get_cookie_file_path()
-                self.cookie_str = self.cookie_manager.get_cookie_string()
-                self.update_cookie_status()
-                self.save_settings()
-                self.show_toast("Cookie imported successfully!")
+        if not file_path:
+            return
+
+        success = self.cookie_manager.import_cookie_file(file_path)
+        if success:
+            self.cookie_str = self.cookie_manager.get_cookie_string()
+            self.cookie_file = self.cookie_manager.get_cookie_file_path()
+            self.update_cookie_status()
+            if getattr(
+                self.cookie_manager, "has_authenticated_cookies", lambda: True
+            )():
+                user_id = self.cookie_manager.get_user_id()
+                self.show_toast(f"Cookies imported! (User: #{user_id or 'Active'})")
             else:
                 self.show_toast(
-                    "Failed to import cookie file. Invalid format.", is_error=True
+                    "Cookies imported, but no logged-in sessionid found. Please ensure you are logged into Instagram.",
+                    is_error=True,
                 )
+        else:
+            self.show_toast("Failed to parse cookie file.", is_error=True)
 
     def clear_cookie(self) -> None:
         """Clears all stored cookies."""
