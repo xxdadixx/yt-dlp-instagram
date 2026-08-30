@@ -479,9 +479,9 @@ class MainWindow(QMainWindow):
     def _on_card_clicked(self, card: MediaCard, modifiers: Qt.KeyboardModifier) -> None:
         """
         Handles queue card selection:
-        - Regular Click: Toggles the individual card's selection state (Selected <-> Deselected).
-        - Ctrl + Click: Toggles the individual card without resetting the anchor.
-        - Shift + Click: Selects a range between the anchor card and the target card.
+        - Regular Click: Toggles card selection (Selected <-> Deselected).
+        - Shift + Click: Selects range from last anchor card to target card.
+        - Ctrl + Click: Toggles card selection.
         """
         if not hasattr(self, "media_cards") or not self.media_cards:
             return
@@ -499,17 +499,69 @@ class MainWindow(QMainWindow):
                 card.toggle_selected()
                 self._last_selected_card = card
         else:
-            # Direct toggle on click (supports deselecting checked items)
             card.toggle_selected()
             self._last_selected_card = card
 
         self._update_queue_action_buttons()
 
+    def _toggle_select_all(self) -> None:
+        """
+        Toggles all cards between Selected and Deselected.
+        If all are currently selected, deselects all; otherwise selects all.
+        """
+        if not hasattr(self, "media_cards") or not self.media_cards:
+            return
+
+        all_selected = all(card.is_selected for card in self.media_cards)
+        new_state = not all_selected
+
+        for card in self.media_cards:
+            card.set_selected(new_state)
+
+        self._update_queue_action_buttons()
+
+    def _update_queue_action_buttons(self) -> None:
+        """
+        Updates the queue header label, tab text, select-all button text, and download button state.
+        """
+        if not hasattr(self, "media_cards"):
+            return
+
+        total_count = len(self.media_cards)
+        selected_count = sum(1 for c in self.media_cards if c.is_selected)
+
+        # Update Header label
+        if hasattr(self, "lbl_queue_header") and self.lbl_queue_header:
+            self.lbl_queue_header.setText(
+                f"Media Queue ({selected_count}/{total_count} Selected)"
+            )
+        elif hasattr(self, "lbl_queue_title") and self.lbl_queue_title:
+            self.lbl_queue_title.setText(
+                f"Media Queue ({selected_count}/{total_count} Selected)"
+            )
+
+        # Update Tab Title
+        if hasattr(self, "tab_widget") and self.tab_widget:
+            self.tab_widget.setTabText(
+                0, f"Media Queue ({selected_count}/{total_count})"
+            )
+
+        # Update Select All / Deselect All Button Label
+        if hasattr(self, "btn_select_all") and self.btn_select_all:
+            if total_count > 0 and selected_count == total_count:
+                self.btn_select_all.setText("Deselect All")
+            else:
+                self.btn_select_all.setText("Select All")
+
+        # Update Download Button State
+        if hasattr(self, "btn_download") and self.btn_download:
+            self.btn_download.setEnabled(selected_count > 0)
+
     def _create_media_card(self, item_data: dict) -> MediaCard:
         card = MediaCard(item_data, parent=self)
         card.card_clicked.connect(self._on_card_clicked)
         card.selection_changed.connect(self._update_queue_action_buttons)
-        card.deleted.connect(lambda: self._on_card_deleted(card))
+        card.deleted.connect(lambda c=card: self._on_card_deleted(c))
         return card
 
     def smooth_scroll_queue_to_bottom(self) -> None:

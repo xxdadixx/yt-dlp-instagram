@@ -296,6 +296,8 @@ class MediaCard(QFrame):
         self.setObjectName("MediaCardFrame")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
         self._init_ui()
         self._update_selection_style()
         self._load_thumbnail()
@@ -438,25 +440,14 @@ class MediaCard(QFrame):
 
         layout.addLayout(action_col)
 
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.card_clicked.emit(self, event.modifiers())
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def _on_check_toggled(self, checked: bool) -> None:
-        self.is_selected = checked
-        self.item_data["selected"] = checked
-        self.selection_changed.emit()
-
     def _update_selection_style(self) -> None:
+        self.setProperty("selected", self.is_selected)
         if self.is_selected:
             self.setStyleSheet(
                 """
-                QFrame#MediaCardFrame {
-                    background-color: #232334;
-                    border: 2px solid #E1306C;
+                QFrame#MediaCardFrame, #MediaCardFrame {
+                    background-color: #232334 !important;
+                    border: 1.5px solid #E1306C !important;
                     border-radius: 10px;
                 }
                 """
@@ -464,20 +455,36 @@ class MediaCard(QFrame):
         else:
             self.setStyleSheet(
                 """
-                QFrame#MediaCardFrame {
-                    background-color: #171720;
-                    border: 1px solid #282836;
+                QFrame#MediaCardFrame, #MediaCardFrame {
+                    background-color: #171720 !important;
+                    border: 1px solid #282836 !important;
                     border-radius: 10px;
                 }
-                QFrame#MediaCardFrame:hover {
-                    background-color: #1E1E2A;
-                    border: 1px solid #3E3E52;
+                QFrame#MediaCardFrame:hover, #MediaCardFrame:hover {
+                    background-color: #1E1E2A !important;
+                    border: 1px solid #3E3E52 !important;
                 }
                 """
             )
         self.style().unpolish(self)
         self.style().polish(self)
         self.update()
+
+    def set_selected(self, selected: bool) -> None:
+        self.is_selected = bool(selected)
+        self.item_data["selected"] = self.is_selected
+        self._update_selection_style()
+        self.selection_changed.emit()
+
+    def toggle_selected(self) -> None:
+        self.set_selected(not self.is_selected)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.card_clicked.emit(self, event.modifiers())
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
     def _load_thumbnail(self) -> None:
         thumb_url = self.item_data.get("thumbnail_url")
@@ -523,46 +530,6 @@ class MediaCard(QFrame):
         self.lbl_thumb.setText("")
         self.lbl_thumb.setPixmap(rounded)
 
-    def _open_lightbox(self) -> None:
-        slides = self.item_data.get("slides")
-        images = []
-        if slides:
-            images = [
-                s.get("download_url") or s.get("thumbnail_url")
-                for s in slides
-                if s.get("download_url") or s.get("thumbnail_url")
-            ]
-        elif self.item_data.get("thumbnail_url"):
-            images = [self.item_data["thumbnail_url"]]
-
-        if images:
-            dlg = ImageViewerDialog(
-                images=images, initial_index=0, parent=self.window()
-            )
-            dlg.exec()
-
-    def _on_thumbnail_loaded(self, data: bytes) -> None:
-        if not data or getattr(self, "_is_cleaned_up", False):
-            return
-        pix = QPixmap()
-        if pix.loadFromData(data) and not pix.isNull():
-            self.lbl_thumb.set_thumbnail_pixmap(pix)
-
-    def _apply_status_style(self, st: str) -> None:
-        cfg = STATUS_STYLES.get(st, STATUS_STYLES["ready"])
-        self.lbl_status.setText(cfg["text"])
-        self.lbl_status.setStyleSheet(
-            f"""
-            background-color: {cfg['bg']};
-            color: {cfg['color']};
-            border: 1px solid {cfg['border']};
-            border-radius: 4px;
-            padding: 1px 6px;
-            font-size: 7pt;
-            font-weight: 700;
-        """
-        )
-
     def set_status(self, status: str) -> None:
         self.status = status
         self.item_data["status"] = status
@@ -583,20 +550,6 @@ class MediaCard(QFrame):
             self.lbl_status.setStyleSheet(
                 "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
             )
-
-    def set_selected(self, selected: bool) -> None:
-        self.is_selected = bool(selected)
-        self.item_data["selected"] = self.is_selected
-        self._update_selection_style()
-        self.selection_changed.emit()
-
-    def toggle_selected(self) -> None:
-        self.set_selected(not self.is_selected)
-
-    def _on_toggle_select(self, state: int) -> None:
-        self.is_selected = state == 2 or state is True
-        self._update_selection_style()
-        self.selection_changed.emit()
 
     def get_item_data(self) -> Dict[str, Any]:
         return self.item_data
