@@ -6,13 +6,27 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse
 
 # Support alphanumeric, underscore, and dot characters in usernames
 PROFILE_REGEX = re.compile(
     r"^(?:https?://)?(?:www\.)?instagram\.com/(?!(?:p|reel|reels|stories|explore|direct|accounts|tv)/)([a-zA-Z0-9_.]+)/?",
     re.IGNORECASE,
 )
+
+RESERVED_ROOT_PATHS = {
+    "p",
+    "reel",
+    "reels",
+    "tv",
+    "stories",
+    "explore",
+    "direct",
+    "accounts",
+    "api",
+    "graphql",
+    "developer",
+}
 
 
 def sanitize_instagram_url(url: str) -> str:
@@ -80,134 +94,52 @@ def normalize_url(url: str) -> str:
     return cleaned
 
 
-def parse_instagram_url(url: str) -> Dict[str, Any]:
+def parse_instagram_url(url: str) -> Dict[str, Optional[str]]:
     """
-    Parses and categorizes an Instagram URL into structured metadata.
-    Distinguishes profile reels tabs (/username/reels/) from general profiles (/username/).
+    Parses and normalizes Instagram URLs into routing targets matching InspectWorker's schema.
     """
-    if not url or not isinstance(url, str):
-        return {"type": "unknown", "url": ""}
+    cleaned_url = (url or "").strip()
+    parsed = urlparse(cleaned_url)
+    path = parsed.path.strip("/")
+    segments = [seg for seg in path.split("/") if seg]
 
-    clean_url = normalize_url(url)
+    if not segments:
+        return {"type": "unknown", "username": None, "shortcode": None}
 
-    # 1. Single Reels
-    reel_m = re.search(
-        r"instagram\.com/(?:reel|reels)/([A-Za-z0-9_-]+)", clean_url, re.IGNORECASE
-    )
-    if reel_m:
-        shortcode = reel_m.group(1)
+    first = segments[0].lower()
+
+    # Single media: /p/{shortcode}, /reel/{shortcode}, /reels/{shortcode}, /tv/{shortcode}
+    if first in {"p", "reel", "reels", "tv"} and len(segments) >= 2:
         return {
-            "type": "reel",
-            "shortcode": shortcode,
-            "url": f"https://www.instagram.com/reel/{shortcode}/",
-            "target_id": shortcode,
+            "type": "reel" if first in {"reel", "reels"} else "post",
+            "username": None,
+            "shortcode": segments[1],
         }
 
-    # 2. Highlights
-    hl_m = re.search(
-        r"instagram\.com/stories/highlights/([0-9A-Za-z_-]+)", clean_url, re.IGNORECASE
-    )
-    if hl_m:
-        highlight_id = hl_m.group(1)
-        return {
-            "type": "highlight",
-            "target_id": highlight_id,
-            "url": f"https://www.instagram.com/stories/highlights/{highlight_id}/",
-        }
-
-    # 3. Stories
-    story_m = re.search(
-        r"instagram\.com/stories/([^/?#]+)(?:/([0-9]+))?", clean_url, re.IGNORECASE
-    )
-    if story_m:
-        username = story_m.group(1)
-        story_id = story_m.group(2)
+    # Stories: /stories/{username}/{story_id?}
+    if first == "stories" and len(segments) >= 2:
         return {
             "type": "story",
-            "username": username,
-            "story_id": story_id,
-            "url": clean_url,
+            "username": segments[1],
+            "shortcode": segments[2] if len(segments) >= 3 else None,
         }
 
-    # 4. Posts / Carousels
-    post_m = re.search(r"instagram\.com/p/([A-Za-z0-9_-]+)", clean_url, re.IGNORECASE)
-    if post_m:
-        shortcode = post_m.group(1)
-        return {
-            "type": "post",
-            "shortcode": shortcode,
-            "url": f"https://www.instagram.com/p/{shortcode}/",
-            "target_id": shortcode,
-        }
-
-    # 5. IGTV
-    tv_m = re.search(r"instagram\.com/tv/([A-Za-z0-9_-]+)", clean_url, re.IGNORECASE)
-    if tv_m:
-        shortcode = tv_m.group(1)
-        return {
-            "type": "tv",
-            "shortcode": shortcode,
-            "url": f"https://www.instagram.com/tv/{shortcode}/",
-            "target_id": shortcode,
-        }
-
-    # 6. Audio
-    audio_m = re.search(
-        r"instagram\.com/reels/audio/([0-9]+)", clean_url, re.IGNORECASE
-    )
-    if audio_m:
-        audio_id = audio_m.group(1)
-        return {
-            "type": "audio",
-            "target_id": audio_id,
-            "url": f"https://www.instagram.com/reels/audio/{audio_id}/",
-        }
-
-    # 7. Profile Reels Tab (e.g., https://www.instagram.com/username/reels)
-    prof_reels_m = re.search(
-        r"instagram\.com/([A-Za-z0-9_.]+)/(?:reels|reel)/?", clean_url, re.IGNORECASE
-    )
-    if prof_reels_m:
-        username = prof_reels_m.group(1)
-        if username.lower() not in (
-            "p",
-            "reel",
-            "reels",
-            "stories",
-            "tv",
-            "explore",
-            "direct",
-            "audio",
-        ):
+    # User profile / Reels tab: /{username}/reels/ or /{username}/
+    if first not in RESERVED_ROOT_PATHS:
+        username = segments[0]
+        if len(segments) >= 2 and segments[1].lower() in {"reels", "reel"}:
             return {
                 "type": "profile_reels",
                 "username": username,
-                "url": f"https://www.instagram.com/{username}/reels/",
-                "target_id": username,
+                "shortcode": None,
             }
+        return {
+            "type": "profile",
+            "username": username,
+            "shortcode": None,
+        }
 
-    # 8. General Profile (e.g., https://www.instagram.com/username)
-    prof_m = re.search(r"instagram\.com/([A-Za-z0-9_.]+)/?", clean_url, re.IGNORECASE)
-    if prof_m:
-        username = prof_m.group(1)
-        if username.lower() not in (
-            "p",
-            "reel",
-            "reels",
-            "stories",
-            "tv",
-            "explore",
-            "direct",
-            "audio",
-        ):
-            return {
-                "type": "profile",
-                "username": username,
-                "url": f"https://www.instagram.com/{username}/",
-                "target_id": username,
-            }
-
-    return {"type": "unknown", "url": clean_url}
+    return {"type": "unknown", "username": None, "shortcode": None}
 
 
 def shortcode_to_id(shortcode: str) -> Optional[int]:

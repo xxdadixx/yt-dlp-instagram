@@ -1,16 +1,27 @@
-"""
-utils/logger.py - Silent logger to suppress external library noise (yt-dlp).
-"""
+# File: utils/logger.py
+from __future__ import annotations
 
-class SilentLogger:
-    def debug(self, msg: str) -> None:
-        pass
+import logging
+from PyQt6.QtCore import QObject, pyqtSignal
 
-    def info(self, msg: str) -> None:
-        pass
 
-    def warning(self, msg: str) -> None:
-        pass
+class QLogEmitter(QObject):
+    log_record_emitted = pyqtSignal(str, int)  # (formatted_message, log_level_no)
 
-    def error(self, msg: str) -> None:
-        pass
+
+class QtLogHandler(logging.Handler):
+    """
+    Thread-safe logging handler routing records across thread boundaries
+    to PyQt6 UI slots via signals.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emitter = QLogEmitter()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self.emitter.log_record_emitted.emit(msg, record.levelno)
+        except Exception:
+            self.handleError(record)

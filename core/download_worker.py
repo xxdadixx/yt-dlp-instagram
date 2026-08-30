@@ -29,7 +29,7 @@ except (ImportError, AttributeError):
     except (ImportError, AttributeError):
         INSTAGRAM_APP_ID = "936619743392459"
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("DownloadWorker")
 
 
 class DownloadWorker(QThread):

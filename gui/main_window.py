@@ -52,6 +52,8 @@ from gui.widgets.media_card import MediaCard
 from gui.widgets.modern_progress_bar import ModernProgressBar
 from gui.widgets.no_scroll_combo import NoScrollComboBox
 from gui.widgets.url_chip_input import URLChipInput
+from gui.widgets.log_viewer_widget import LogViewerWidget
+from utils.logger import QtLogHandler
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,7 @@ class MainWindow(QMainWindow):
         self.load_settings()
         os.makedirs(self.save_folder, exist_ok=True)
 
+        self._setup_logging()
         self.init_ui()
         self.apply_translations()
         self.setup_clipboard_monitor()
@@ -268,6 +271,14 @@ class MainWindow(QMainWindow):
         # Tab 1: URL Links List
         self.tab_widget.addTab(self.url_container.list_widget, "URL Links (0)")
 
+        # Tab 2: Activity Logs (Right after URL Links)
+        self.log_viewer = LogViewerWidget(self)
+        self.tab_widget.addTab(self.log_viewer, "Activity Logs")
+        if hasattr(self, "log_handler") and self.log_handler:
+            self.log_handler.emitter.log_record_emitted.connect(
+                self.log_viewer.append_log
+            )
+
         main_layout.addWidget(self.tab_widget, stretch=1)
 
         # 6. Bottom Bento Bar: Folder Controls + Status + Download Action
@@ -313,6 +324,19 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Delete"), self, self.delete_selected_cards)
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, self.start_download)
         QShortcut(QKeySequence(Qt.Key.Key_Enter), self, self.start_download)
+
+    def _setup_logging(self) -> None:
+        """Configures QtLogHandler to intercept application logs and forward them to the UI."""
+        self.log_handler = QtLogHandler()
+        formatter = logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s", "%H:%M:%S"
+        )
+        self.log_handler.setFormatter(formatter)
+        self.log_handler.setLevel(logging.DEBUG)
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.DEBUG)
+        root_logger.addHandler(self.log_handler)
 
     def apply_translations(self) -> None:
         self.lbl_app_brand.setText(self.tr_text("app_title"))
@@ -454,7 +478,20 @@ class MainWindow(QMainWindow):
         self.inspect_worker.item_found.connect(self.add_card)
         self.inspect_worker.progress.connect(self.progress_bar.setValue)
         self.inspect_worker.status_message.connect(self.lbl_status.setText)
+        self.inspect_worker.status_message.connect(
+            lambda msg: logger.info(f"[Inspect] {msg}")
+        )
+        self.inspect_worker.error.connect(
+            lambda err: logger.error(f"[Inspect Error] {err}")
+        )
+        self.inspect_worker.error_occurred.connect(
+            lambda err: logger.error(f"[Inspect Error] {err}")
+        )
         self.inspect_worker.finished.connect(self.on_inspection_finished)
+
+        logger.info(
+            f"Starting inspection for {len(targets)} target(s) with mode='{self.profile_mode}'"
+        )
         self.inspect_worker.start()
         self._update_action_button_states()
 
@@ -485,6 +522,11 @@ class MainWindow(QMainWindow):
             self.media_grid_layout.addWidget(card)
 
         self.cards.append(card)
+        logger.info(
+            f"✓ Added [{card.item_data.get('media_type', 'MEDIA')}] "
+            f"@{card.item_data.get('username', 'unknown')} - "
+            f"{card.item_data.get('shortcode', 'no_code')}"
+        )
         self.update_selection_counter()
         self._update_action_button_states()
         self.smooth_scroll_queue_to_bottom()
@@ -635,6 +677,9 @@ class MainWindow(QMainWindow):
             self.tr_text("status_inspection_done", count=len(self.cards))
         )
         self.lbl_toast.setText("")
+        logger.info(
+            f"Inspection complete: {count} new item(s) found. Total cards: {len(self.cards)}"
+        )
         self._update_action_button_states()
 
     def start_download(self) -> None:
