@@ -6,6 +6,47 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+# Support alphanumeric, underscore, and dot characters in usernames
+PROFILE_REGEX = re.compile(
+    r"^(?:https?://)?(?:www\.)?instagram\.com/(?!(?:p|reel|reels|stories|explore|direct|accounts|tv)/)([a-zA-Z0-9_.]+)/?",
+    re.IGNORECASE,
+)
+
+
+def sanitize_instagram_url(url: str) -> str:
+    """Strip tracking and pagination query parameters from the Instagram URL."""
+    if not url:
+        return ""
+    parsed = urlparse(url.strip())
+    # Retain scheme and netloc if present
+    path = parsed.path.rstrip("/")
+    return (
+        f"https://www.instagram.com{path}"
+        if not parsed.netloc
+        else f"{parsed.scheme}://{parsed.netloc}{path}"
+    )
+
+
+def extract_username_from_url(url: str) -> str | None:
+    """Extract clean username from a profile URL."""
+    match = PROFILE_REGEX.search(url.strip())
+    if match:
+        username = match.group(1).strip()
+        # Ensure it is not a system route
+        if username.lower() not in {
+            "p",
+            "reel",
+            "reels",
+            "stories",
+            "explore",
+            "direct",
+            "accounts",
+            "tv",
+        }:
+            return username
+    return None
 
 
 def extract_instagram_urls(text: str) -> List[str]:

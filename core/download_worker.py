@@ -236,14 +236,31 @@ class DownloadWorker(QThread):
         # Strategy 3: yt-dlp Fallback
         return self._download_via_ytdlp(item, clean_title, index, total_items)
 
+    def _get_download_headers(self, url: str) -> dict[str, str]:
+        """Returns minimal headers for CDN assets, omitting session cookies to protect account."""
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "keep-alive",
+        }
+        # Only attach session cookies when requesting instagram.com API endpoints, never CDNs
+        is_cdn = any(domain in url for domain in ("cdninstagram.com", "fbcdn.net"))
+        if not is_cdn and self.cookie_str:
+            headers["Cookie"] = self.cookie_str
+        return headers
+
     def _download_direct_stream(
         self, url: str, target_path: str, index: int, total_items: int
     ) -> str:
         """Streams media directly via 256 KB chunk buffering with smooth overall progress updates."""
         CHUNK_SIZE = 256 * 1024  # 256 KB buffer
         temp_path = f"{target_path}.part"
+        req_headers = self._get_download_headers(url)
 
-        with self.session.get(url, stream=True, timeout=(6.0, 30.0)) as response:
+        with self.session.get(
+            url, headers=req_headers, stream=True, timeout=(6.0, 30.0)
+        ) as response:
             response.raise_for_status()
             total_size = int(response.headers.get("content-length", 0))
 

@@ -5,24 +5,24 @@ gui/widgets/media_card.py - Instagram-styled Media Card with interactive hover z
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
-from PyQt6.QtCore import QPoint, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPixmap
+import os
+from typing import Any, Dict, List, Optional
+
+from PyQt6.QtCore import QByteArray, Qt, pyqtSignal
+from PyQt6.QtGui import QFont, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication,
-    QCheckBox,
     QFrame,
-    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
-from gui.widgets.image_viewer_dialog import ImageViewerDialog
 
-from gui.styles import MEDIA_TYPE_COLORS
+from gui.widgets.image_viewer_dialog import ImageViewerDialog
+from gui.widgets.thumbnail_loader import ThumbnailLoader
+
+logger = logging.getLogger(__name__)
 
 STATUS_STYLES = {
     "ready": {
@@ -74,37 +74,116 @@ class ThumbnailHoverPopup(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(14)
 
-        self.container = QFrame(self)
-        self.container.setStyleSheet(
-            """
-            QFrame {
-                background-color: #14141E;
-                border: 1.5px solid #E1306C;
-                border-radius: 12px;
-            }
-        """
+        # 1. Rounded Thumbnail Preview (Clickable Lightbox)
+        self.lbl_thumb = QLabel("Loading...", self)
+        self.lbl_thumb.setFixedSize(64, 64)
+        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_thumb.setStyleSheet(
+            "background-color: #21212B; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08); color: #71717A;"
+        )
+        self.lbl_thumb.setFont(self._get_app_font(size=8))
+        self.lbl_thumb.mousePressEvent = lambda e: self.open_image_gallery()
+        layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        # 2. Details Column (Title & Metadata)
+        details_layout = QVBoxLayout()
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(5)
+
+        raw_title = str(
+            self.item_data.get("title")
+            or self.item_data.get("caption")
+            or "Instagram Media"
+        ).strip()
+        display_title = raw_title.splitlines()[0] if raw_title else "Instagram Media"
+        if len(display_title) > 95:
+            display_title = display_title[:92] + "..."
+
+        self.lbl_title = QLabel(display_title, self)
+        self.lbl_title.setObjectName("CardTitle")
+        self.lbl_title.setFont(self._get_app_font(size=10, bold=True))
+        self.lbl_title.setStyleSheet("color: #FFFFFF;")
+        details_layout.addWidget(self.lbl_title)
+
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setSpacing(8)
+
+        # Username Tag
+        raw_username = str(self.item_data.get("username") or "instagram").strip()
+        display_username = (
+            f"@{raw_username}" if not raw_username.startswith("@") else raw_username
+        )
+        self.lbl_username = QLabel(display_username, self)
+        self.lbl_username.setObjectName("CardUsername")
+        self.lbl_username.setFont(self._get_app_font(size=9, bold=True))
+        self.lbl_username.setStyleSheet("color: #38BDF8;")
+        meta_row.addWidget(self.lbl_username)
+
+        # Media Type Capsule Badge
+        badge_type = str(self.item_data.get("media_type") or "MEDIA").upper()
+        self.lbl_badge = QLabel(badge_type, self)
+        self.lbl_badge.setObjectName("CardBadge")
+        self.lbl_badge.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_badge.setStyleSheet(
+            "background-color: rgba(245, 96, 64, 0.18); color: #F56040; border-radius: 4px; padding: 2px 6px;"
+        )
+        meta_row.addWidget(self.lbl_badge)
+
+        # Likes / Views Metadata
+        likes = self.item_data.get("like_count") or 0
+        views = self.item_data.get("view_count") or 0
+        meta_parts = []
+        if likes > 0:
+            meta_parts.append(f"❤️ {likes:,}")
+        if views > 0:
+            meta_parts.append(f"👁️ {views:,}")
+        meta_str = " • ".join(meta_parts) if meta_parts else f"ID: {self.item_id[:12]}"
+
+        self.lbl_meta = QLabel(meta_str, self)
+        self.lbl_meta.setObjectName("CardMeta")
+        self.lbl_meta.setFont(self._get_app_font(size=9))
+        self.lbl_meta.setStyleSheet("color: #94A3B8;")
+        meta_row.addWidget(self.lbl_meta)
+        meta_row.addStretch()
+
+        details_layout.addLayout(meta_row)
+        layout.addLayout(details_layout, stretch=1)
+
+        # 3. Status Badge & Quick Remove Button
+        action_col = QHBoxLayout()
+        action_col.setContentsMargins(0, 0, 0, 0)
+        action_col.setSpacing(8)
+        action_col.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
 
-        # Drop shadow effect
-        shadow = QGraphicsDropShadowEffect(self.container)
-        shadow.setBlurRadius(20)
-        shadow.setColor(QColor(0, 0, 0, 200))
-        shadow.setOffset(0, 6)
-        self.container.setGraphicsEffect(shadow)
+        self.lbl_status = QLabel(self.status.upper(), self)
+        self.lbl_status.setObjectName("StatusPillReady")
+        self.lbl_status.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setStyleSheet(
+            "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
+        )
+        action_col.addWidget(self.lbl_status)
 
-        container_layout = QVBoxLayout(self.container)
-        container_layout.setContentsMargins(4, 4, 4, 4)
+        self.btn_delete = QPushButton("✕", self)
+        self.btn_delete.setFixedSize(24, 24)
+        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete.setFont(self._get_app_font(size=9, bold=True))
+        self.btn_delete.setStyleSheet(
+            "QPushButton { background-color: transparent; color: #71717A; border: none; border-radius: 12px; }"
+            "QPushButton:hover { background-color: rgba(239, 68, 68, 0.2); color: #EF4444; }"
+        )
+        self.btn_delete.clicked.connect(self.deleted.emit)
+        action_col.addWidget(self.btn_delete)
 
-        self.lbl_image = QLabel(self.container)
-        self.lbl_image.setFixedSize(210, 280)
-        self.lbl_image.setStyleSheet("background-color: #0E0E14; border-radius: 8px;")
-        self.lbl_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        container_layout.addWidget(self.lbl_image)
-
-        layout.addWidget(self.container)
+        layout.addLayout(action_col)
 
     def set_preview_pixmap(self, pixmap: QPixmap) -> None:
         if pixmap and not pixmap.isNull():
@@ -126,18 +205,23 @@ class HoverThumbnailLabel(QLabel):
     Interactive thumbnail widget that shows a floating enlarged preview on hover.
     """
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, item_data: Dict[str, Any], parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setFixedSize(44, 54)
-        self.setStyleSheet(
-            "background-color: #0E0E14; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.08);"
+        self.item_data: Dict[str, Any] = item_data or {}
+        self.item_id: str = str(
+            self.item_data.get("id")
+            or self.item_data.get("shortcode")
+            or self.item_data.get("url")
+            or "item"
         )
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMouseTracking(True)
+        self.is_selected: bool = bool(self.item_data.get("selected", True))
+        self.status: str = str(self.item_data.get("status", "ready"))
+        self.thumb_loader: Optional[ThumbnailLoader] = None
 
-        self._raw_pixmap: Optional[QPixmap] = None
-        self._preview_popup: Optional[ThumbnailHoverPopup] = None
+        self.setObjectName("MediaCardFrame")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self._init_ui()
+        self._load_thumbnail()
 
     def set_thumbnail_pixmap(self, pixmap: QPixmap) -> None:
         self._raw_pixmap = pixmap
@@ -191,198 +275,367 @@ class HoverThumbnailLabel(QLabel):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            # ซ่อน Hover Preview Popup ทันทีเมื่อคลิกเปิดดูภาพใหญ่
-            if hasattr(self, "_preview_popup") and self._preview_popup:
-                self._preview_popup.hide()
-
-            # ส่งคำสั่งให้ MediaCard เปิดหน้าต่าง Lightbox แสดงรูปภาพ
-            parent_card = self.parent()
-            while parent_card and not hasattr(parent_card, "open_image_gallery"):
-                parent_card = parent_card.parent()
-            if parent_card and hasattr(parent_card, "open_image_gallery"):
-                parent_card.open_image_gallery()
-                return
-
+            self.card_clicked.emit(self, event.modifiers())
         super().mousePressEvent(event)
 
 
 class MediaCard(QFrame):
+    card_clicked = pyqtSignal(object, object)  # Emits (self, Qt.KeyboardModifier)
     deleted = pyqtSignal()
     selection_changed = pyqtSignal()
 
     def __init__(self, item_data: Dict[str, Any], parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.item_data = dict(item_data)
-        self.item_id = str(item_data.get("id") or item_data.get("shortcode") or "")
-        self.shortcode = str(item_data.get("shortcode") or "")
-        self.is_selected = True
-        self.is_finished = False
-        self.setMouseTracking(True)
+        self.item_data: Dict[str, Any] = item_data or {}
+        self.item_id: str = str(
+            self.item_data.get("id")
+            or self.item_data.get("shortcode")
+            or self.item_data.get("url")
+            or "item"
+        )
+        self.is_selected: bool = bool(self.item_data.get("selected", True))
+        self.status: str = str(self.item_data.get("status", "ready"))
+        self.thumb_loader: Optional[ThumbnailLoader] = None
+
+        self.setObjectName("MediaCardFrame")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._init_ui()
+        self._update_selection_style()
+        self._load_thumbnail()
+
+    def _get_app_font(self, size: int = 9, bold: bool = False) -> QFont:
+        valid_size = max(8, int(size))
+        font = QFont("Segoe UI", valid_size)
+        font.setFamilies(
+            ["Segoe UI", "Leelawadee UI", "Tahoma", "Noto Sans Thai", "sans-serif"]
+        )
+        if bold:
+            font.setWeight(QFont.Weight.Bold)
+        return font
 
     def _init_ui(self) -> None:
-        self.setObjectName("MediaCardCapsule")
-        self.setFixedHeight(64)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 4, 12, 4)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(14)
 
-        # 1. Checkbox
-        self.chk_select = QCheckBox(self)
-        self.chk_select.setChecked(self.is_selected)
-        self.chk_select.stateChanged.connect(self._on_toggle_select)
-        layout.addWidget(self.chk_select)
-
-        # 2. Interactive Hover Zoom Thumbnail
-        self.lbl_thumb = HoverThumbnailLabel(self)
-        self._load_thumbnail()
-        layout.addWidget(self.lbl_thumb)
-
-        # 3. Stacked Metadata Info
-        info_stack = QVBoxLayout()
-        info_stack.setSpacing(3)
-        info_stack.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-
-        # Line 1: Type Badge + Title
-        top_row = QHBoxLayout()
-        top_row.setSpacing(8)
-
-        mtype = str(
-            self.item_data.get("media_type") or self.item_data.get("type") or "POST"
-        ).upper()
-        badge_style = MEDIA_TYPE_COLORS.get("POST")
-        for prefix, style in MEDIA_TYPE_COLORS.items():
-            if mtype.startswith(prefix):
-                badge_style = style
-                break
-
-        self.lbl_type = QLabel(mtype, self)
-        self.lbl_type.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-        self.lbl_type.setStyleSheet(
-            f"""
-            background-color: {badge_style['bg']};
-            color: {badge_style['fg']};
-            border: 1px solid {badge_style['border']};
-            border-radius: 4px;
-            padding: 1px 6px;
-            font-size: 7.5pt;
-        """
+        # 1. Rounded Thumbnail Preview (Clickable Lightbox)
+        self.lbl_thumb = QLabel("Loading...", self)
+        self.lbl_thumb.setFixedSize(64, 64)
+        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_thumb.setStyleSheet(
+            "background-color: #21212B; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08); color: #71717A;"
         )
-        top_row.addWidget(self.lbl_type)
+        self.lbl_thumb.setFont(self._get_app_font(size=8))
+        self.lbl_thumb.mousePressEvent = lambda e: self.open_image_gallery()
+        layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        title = self.item_data.get("title") or f"Instagram Media #{self.shortcode}"
-        display_title = title.replace("\n", " ").strip()
-        if len(display_title) > 60:
-            display_title = display_title[:57] + "..."
+        # 2. Details Column (Title & Metadata)
+        details_layout = QVBoxLayout()
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(5)
 
-        # ส่ง display_title เข้าไปใน QLabel พร้อมกำหนด Font ให้รองรับภาษาไทย
+        raw_title = str(
+            self.item_data.get("title")
+            or self.item_data.get("caption")
+            or "Instagram Media"
+        ).strip()
+        display_title = raw_title.splitlines()[0] if raw_title else "Instagram Media"
+        if len(display_title) > 95:
+            display_title = display_title[:92] + "..."
+
         self.lbl_title = QLabel(display_title, self)
-        title_font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
-        title_font.setFamilies(
-            [
-                "Segoe UI",
-                "Leelawadee UI",
-                "Tahoma",
-                "Noto Sans Thai",
-                "sans-serif",
-            ]
+        self.lbl_title.setObjectName("CardTitle")
+        self.lbl_title.setFont(self._get_app_font(size=10, bold=True))
+        self.lbl_title.setStyleSheet("color: #FFFFFF;")
+        self.lbl_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        details_layout.addWidget(self.lbl_title)
+
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setSpacing(8)
+
+        # Username Tag
+        raw_username = str(self.item_data.get("username") or "instagram").strip()
+        display_username = (
+            f"@{raw_username}" if not raw_username.startswith("@") else raw_username
         )
-        title_font.setPointSize(9)
-        self.lbl_title.setFont(title_font)
-        self.lbl_title.setStyleSheet("color: #FFFFFF; font-size: 9pt;")
-        top_row.addWidget(self.lbl_title, 1)
+        self.lbl_username = QLabel(display_username, self)
+        self.lbl_username.setObjectName("CardUsername")
+        self.lbl_username.setFont(self._get_app_font(size=9, bold=True))
+        self.lbl_username.setStyleSheet("color: #38BDF8;")
+        self.lbl_username.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        meta_row.addWidget(self.lbl_username)
 
-        info_stack.addLayout(top_row)
-
-        # Line 2: Subtle Path + Status Pill
-        bot_row = QHBoxLayout()
-        bot_row.setSpacing(8)
-
-        url_str = self.item_data.get("url") or ""
-        clean_url = url_str.replace("https://www.", "").replace("https://", "")
-
-        # ส่ง clean_url เข้าไปใน QLabel
-        self.lbl_url = QLabel(clean_url, self)
-        url_font = QFont("Segoe UI", 8)
-        url_font.setPointSize(8)
-        self.lbl_url.setFont(url_font)
-        self.lbl_url.setStyleSheet("color: #A0A0B2; font-size: 8pt;")
-        bot_row.addWidget(self.lbl_url)
-
-        bot_row.addStretch()
-
-        self.lbl_status = QLabel("READY", self)
-        self.lbl_status.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-        self._apply_status_style("ready")
-        bot_row.addWidget(self.lbl_status)
-
-        info_stack.addLayout(bot_row)
-        layout.addLayout(info_stack, 1)
-
-        # 4. Trash Button
-        self.btn_del = QPushButton("✕", self)
-        self.btn_del.setFixedSize(22, 22)
-        self.btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_del.setStyleSheet(
-            """
-            QPushButton {
-                background: rgba(255, 255, 255, 0.05);
-                border: none;
-                color: #A0A0B2;
-                font-size: 9pt;
-                font-weight: 500;
-                border-radius: 11px;
-            }
-            QPushButton:hover {
-                background: rgba(225, 48, 108, 0.3);
-                color: #FF7597;
-            }
-        """
+        # Media Type Capsule Badge
+        badge_type = str(self.item_data.get("media_type") or "MEDIA").upper()
+        self.lbl_badge = QLabel(badge_type, self)
+        self.lbl_badge.setObjectName("CardBadge")
+        self.lbl_badge.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_badge.setStyleSheet(
+            "background-color: rgba(245, 96, 64, 0.18); color: #F56040; border-radius: 4px; padding: 2px 6px;"
         )
-        self.btn_del.clicked.connect(self.deleted.emit)
-        layout.addWidget(self.btn_del)
+        self.lbl_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        meta_row.addWidget(self.lbl_badge)
 
-        self._update_selection_style()
+        # Likes / Views Metadata
+        likes = self.item_data.get("like_count") or 0
+        views = self.item_data.get("view_count") or 0
+        meta_parts = []
+        if likes > 0:
+            meta_parts.append(f"❤️ {likes:,}")
+        if views > 0:
+            meta_parts.append(f"👁️ {views:,}")
+        meta_str = " • ".join(meta_parts) if meta_parts else f"ID: {self.item_id[:12]}"
+
+        self.lbl_meta = QLabel(meta_str, self)
+        self.lbl_meta.setObjectName("CardMeta")
+        self.lbl_meta.setFont(self._get_app_font(size=9))
+        self.lbl_meta.setStyleSheet("color: #94A3B8;")
+        self.lbl_meta.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        meta_row.addWidget(self.lbl_meta)
+        meta_row.addStretch()
+
+        details_layout.addLayout(meta_row)
+        layout.addLayout(details_layout, stretch=1)
+
+        # 3. Status Badge & Quick Remove Button
+        action_col = QHBoxLayout()
+        action_col.setContentsMargins(0, 0, 0, 0)
+        action_col.setSpacing(8)
+        action_col.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.lbl_status = QLabel(self.status.upper(), self)
+        self.lbl_status.setObjectName("StatusPillReady")
+        self.lbl_status.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setStyleSheet(
+            "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
+        )
+        self.lbl_status.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        action_col.addWidget(self.lbl_status)
+
+        self.btn_delete = QPushButton("✕", self)
+        self.btn_delete.setFixedSize(24, 24)
+        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete.setFont(self._get_app_font(size=9, bold=True))
+        self.btn_delete.setStyleSheet(
+            "QPushButton { background-color: transparent; color: #71717A; border: none; border-radius: 12px; }"
+            "QPushButton:hover { background-color: rgba(239, 68, 68, 0.2); color: #EF4444; }"
+        )
+        self.btn_delete.clicked.connect(self.deleted.emit)
+        action_col.addWidget(self.btn_delete)
+
+        layout.addLayout(action_col)
+
+    def _init_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(14)
+
+        # 1. Rounded Thumbnail Preview (Clickable Lightbox)
+        self.lbl_thumb = QLabel(self)
+        self.lbl_thumb.setFixedSize(64, 64)
+        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_thumb.setStyleSheet(
+            "background-color: #21212B; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08); color: #71717A;"
+        )
+        self.lbl_thumb.setFont(self._get_app_font(size=8))
+        self.lbl_thumb.setText("Loading...")
+        self.lbl_thumb.mousePressEvent = lambda e: self.open_image_gallery()
+        layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        # 2. Details Column (Title & Metadata)
+        details_layout = QVBoxLayout()
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(5)
+
+        raw_title = str(
+            self.item_data.get("title")
+            or self.item_data.get("caption")
+            or "Instagram Media"
+        ).strip()
+        display_title = raw_title.splitlines()[0] if raw_title else "Instagram Media"
+        if len(display_title) > 95:
+            display_title = display_title[:92] + "..."
+
+        self.lbl_title = QLabel(display_title, self)
+        self.lbl_title.setObjectName("CardTitle")
+        self.lbl_title.setFont(self._get_app_font(size=10, bold=True))
+        self.lbl_title.setStyleSheet("color: #FFFFFF;")
+        details_layout.addWidget(self.lbl_title)
+
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setSpacing(8)
+
+        # Username Tag
+        raw_username = str(self.item_data.get("username") or "instagram").strip()
+        display_username = (
+            f"@{raw_username}" if not raw_username.startswith("@") else raw_username
+        )
+        self.lbl_username = QLabel(display_username, self)
+        self.lbl_username.setObjectName("CardUsername")
+        self.lbl_username.setFont(self._get_app_font(size=9, bold=True))
+        self.lbl_username.setStyleSheet("color: #38BDF8;")
+        meta_row.addWidget(self.lbl_username)
+
+        # Media Type Capsule Badge
+        badge_type = str(self.item_data.get("media_type") or "MEDIA").upper()
+        self.lbl_badge = QLabel(badge_type, self)
+        self.lbl_badge.setObjectName("CardBadge")
+        self.lbl_badge.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_badge.setStyleSheet(
+            "background-color: rgba(245, 96, 64, 0.18); color: #F56040; border-radius: 4px; padding: 2px 6px;"
+        )
+        meta_row.addWidget(self.lbl_badge)
+
+        # Likes / Views Metadata
+        likes = self.item_data.get("like_count") or 0
+        views = self.item_data.get("view_count") or 0
+        meta_parts = []
+        if likes > 0:
+            meta_parts.append(f"❤️ {likes:,}")
+        if views > 0:
+            meta_parts.append(f"👁️ {views:,}")
+        meta_str = " • ".join(meta_parts) if meta_parts else f"ID: {self.item_id[:12]}"
+
+        self.lbl_meta = QLabel(meta_str, self)
+        self.lbl_meta.setObjectName("CardMeta")
+        self.lbl_meta.setFont(self._get_app_font(size=9))
+        self.lbl_meta.setStyleSheet("color: #94A3B8;")
+        meta_row.addWidget(self.lbl_meta)
+        meta_row.addStretch()
+
+        details_layout.addLayout(meta_row)
+        layout.addLayout(details_layout, stretch=1)
+
+        # 3. Status Badge & Quick Remove Button
+        action_col = QHBoxLayout()
+        action_col.setContentsMargins(0, 0, 0, 0)
+        action_col.setSpacing(8)
+        action_col.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        self.lbl_status = QLabel(self.status.upper(), self)
+        self.lbl_status.setObjectName("StatusPillReady")
+        self.lbl_status.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setStyleSheet(
+            "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
+        )
+        action_col.addWidget(self.lbl_status)
+
+        self.btn_delete = QPushButton("✕", self)
+        self.btn_delete.setFixedSize(24, 24)
+        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete.setFont(self._get_app_font(size=9, bold=True))
+        self.btn_delete.setStyleSheet(
+            "QPushButton { background-color: transparent; color: #71717A; border: none; border-radius: 12px; }"
+            "QPushButton:hover { background-color: rgba(239, 68, 68, 0.2); color: #EF4444; }"
+        )
+        self.btn_delete.clicked.connect(self.deleted.emit)
+        action_col.addWidget(self.btn_delete)
+
+        layout.addLayout(action_col)
+
+    def _on_check_toggled(self, checked: bool) -> None:
+        self.is_selected = checked
+        self.item_data["selected"] = checked
+        self.selection_changed.emit()
 
     def _update_selection_style(self) -> None:
         if self.is_selected:
             self.setStyleSheet(
                 """
-                QFrame#MediaCardCapsule {
-                    background-color: #242436;
+                QFrame#MediaCardFrame {
+                    background-color: #232334;
                     border: 1.5px solid #E1306C;
                     border-radius: 10px;
                 }
-            """
+                """
             )
         else:
             self.setStyleSheet(
                 """
-                QFrame#MediaCardCapsule {
-                    background-color: #1A1A24;
-                    border: 1px solid rgba(255, 255, 255, 0.07);
+                QFrame#MediaCardFrame {
+                    background-color: #171720;
+                    border: 1px solid #282836;
                     border-radius: 10px;
                 }
-                QFrame#MediaCardCapsule:hover {
-                    background-color: #20202E;
-                    border: 1px solid rgba(225, 48, 108, 0.35);
+                QFrame#MediaCardFrame:hover {
+                    background-color: #1E1E2A;
+                    border: 1px solid #3E3E52;
                 }
-            """
+                """
             )
 
     def _load_thumbnail(self) -> None:
-        t_url = self.item_data.get("thumbnail_url") or self.item_data.get("thumbnail")
-        if t_url and str(t_url).startswith("http"):
-            try:
-                from gui.widgets.thumbnail_loader import ThumbnailLoader
+        thumb_url = self.item_data.get("thumbnail_url")
+        if not thumb_url:
+            slides = self.item_data.get("slides", [])
+            if slides and isinstance(slides[0], dict):
+                thumb_url = slides[0].get("thumbnail_url")
 
-                self.thumb_loader = ThumbnailLoader(str(t_url), self)
-                self.thumb_loader.loaded.connect(self._on_thumbnail_loaded)
-                self.thumb_loader.start()
-            except Exception as e:
-                logger.debug(f"Failed to initiate thumbnail loader: {e}")
+        if not thumb_url:
+            self.lbl_thumb.setText("No Image")
+            return
+
+        self.thumb_loader = ThumbnailLoader(thumb_url, self)
+        self.thumb_loader.loaded.connect(self._set_thumbnail_pixmap)
+        self.thumb_loader.start()
+
+    def _set_thumbnail_pixmap(self, raw_bytes: bytes) -> None:
+        pix = QPixmap()
+        if not pix.loadFromData(QByteArray(raw_bytes)):
+            self.lbl_thumb.setText("No Image")
+            return
+
+        scaled = pix.scaled(
+            64,
+            64,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        crop_x = max(0, (scaled.width() - 64) // 2)
+        crop_y = max(0, (scaled.height() - 64) // 2)
+        cropped = scaled.copy(crop_x, crop_y, 64, 64)
+
+        rounded = QPixmap(64, 64)
+        rounded.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(rounded)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(0.0, 0.0, 64.0, 64.0, 8.0, 8.0)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, cropped)
+        painter.end()
+
+        self.lbl_thumb.setText("")
+        self.lbl_thumb.setPixmap(rounded)
+
+    def _open_lightbox(self) -> None:
+        slides = self.item_data.get("slides")
+        images = []
+        if slides:
+            images = [
+                s.get("download_url") or s.get("thumbnail_url")
+                for s in slides
+                if s.get("download_url") or s.get("thumbnail_url")
+            ]
+        elif self.item_data.get("thumbnail_url"):
+            images = [self.item_data["thumbnail_url"]]
+
+        if images:
+            dlg = ImageViewerDialog(
+                images=images, initial_index=0, parent=self.window()
+            )
+            dlg.exec()
 
     def _on_thumbnail_loaded(self, data: bytes) -> None:
         if not data or getattr(self, "_is_cleaned_up", False):
@@ -406,17 +659,30 @@ class MediaCard(QFrame):
         """
         )
 
-    def set_status(self, st: str) -> None:
-        self.is_finished = st == "finished"
-        self._apply_status_style(st)
-        if st == "finished":
-            self.set_selected(False)
+    def set_status(self, status: str) -> None:
+        self.status = status
+        self.item_data["status"] = status
+        self.lbl_status.setText(status.upper())
+        if status == "finished":
+            self.lbl_status.setStyleSheet(
+                "color: #10B981; background-color: rgba(16, 185, 129, 0.15); border-radius: 4px; padding: 3px 8px;"
+            )
+        elif status == "downloading":
+            self.lbl_status.setStyleSheet(
+                "color: #FF7597; background-color: rgba(225, 48, 108, 0.2); border-radius: 4px; padding: 3px 8px;"
+            )
+        elif status == "error":
+            self.lbl_status.setStyleSheet(
+                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); border-radius: 4px; padding: 3px 8px;"
+            )
+        else:
+            self.lbl_status.setStyleSheet(
+                "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
+            )
 
-    def set_selected(self, s: bool) -> None:
-        self.is_selected = s
-        self.chk_select.blockSignals(True)
-        self.chk_select.setChecked(s)
-        self.chk_select.blockSignals(False)
+    def set_selected(self, selected: bool) -> None:
+        self.is_selected = bool(selected)
+        self.item_data["selected"] = self.is_selected
         self._update_selection_style()
         self.selection_changed.emit()
 
@@ -426,69 +692,36 @@ class MediaCard(QFrame):
         self.selection_changed.emit()
 
     def get_item_data(self) -> Dict[str, Any]:
-        data = dict(self.item_data)
-        data["card_id"] = str(
-            self.item_id or self.item_data.get("id") or self.item_data.get("shortcode")
-        )
-        return data
+        return self.item_data
 
     def cleanup(self) -> None:
-        if getattr(self, "_is_cleaned_up", False):
-            return
-        self._is_cleaned_up = True
-        if hasattr(self, "lbl_thumb") and self.lbl_thumb:
-            self.lbl_thumb.hide_popup()
-        if hasattr(self, "thumb_loader") and self.thumb_loader:
-            try:
-                self.thumb_loader.cancel()
-                self.thumb_loader.wait(100)
-            except Exception:
-                pass
-            self.thumb_loader = None
+        if self.thumb_loader and self.thumb_loader.isRunning():
+            self.thumb_loader.wait(200)
 
     def open_image_gallery(self) -> None:
-        """Collects all non-video image URLs in this post and opens the large photo gallery dialog."""
-        image_urls: List[str] = []
-        slides = self.item_data.get("slides") or []
+        slides = self.item_data.get("slides")
+        images: List[str] = []
 
-        # 1. กรณีเป็นโพสต์ Carousel (มีหลายภาพ/วิดีโอ) -> เลือกเฉพาะสไลด์ที่เป็นรูปภาพเท่านั้น
         if slides and isinstance(slides, list):
-            for slide in slides:
-                is_vid = bool(slide.get("is_video"))
-                if not is_vid:
-                    img_url = (
-                        slide.get("download_url")
-                        or slide.get("thumbnail_url")
-                        or slide.get("display_url")
-                    )
-                    if (
-                        img_url
-                        and img_url.startswith("http")
-                        and img_url not in image_urls
-                    ):
-                        image_urls.append(img_url)
+            for s in slides:
+                if not s.get("is_video"):
+                    u = s.get("download_url") or s.get("thumbnail_url") or s.get("display_url")
+                    if u and isinstance(u, str) and u.startswith("http") and u not in images:
+                        images.append(u)
 
-        # 2. กรณีเป็นโพสต์รูปภาพเดี่ยว
-        if not image_urls:
-            media_type = (
-                self.item_data.get("media_type") or self.item_data.get("type") or ""
-            ).upper()
+        if not images:
+            single_img = (
+                self.item_data.get("thumbnail_url")
+                or self.item_data.get("download_url")
+                or self.item_data.get("display_url")
+            )
+            if single_img and isinstance(single_img, str) and single_img.startswith("http"):
+                images.append(single_img)
 
-            # ไม่แสดงหากสื่อเป็นวิดีโอเดี่ยว (REEL หรือ VIDEO)
-            if "REEL" not in media_type and "VIDEO" not in media_type:
-                single_img = (
-                    self.item_data.get("thumbnail_url")
-                    or self.item_data.get("download_url")
-                    or self.item_data.get("display_url")
-                )
-                if single_img and single_img.startswith("http"):
-                    image_urls.append(single_img)
-
-        # หากมีรูปภาพให้เปิดหน้าต่าง Lightbox Gallery Viewer
-        if image_urls:
-            dialog = ImageViewerDialog(
-                image_urls=image_urls,
-                title=self.item_data.get("title", ""),
+        if images:
+            dlg = ImageViewerDialog(
+                image_urls=images,
+                title=str(self.item_data.get("title") or self.item_data.get("caption") or ""),
                 parent=self.window(),
             )
-            dialog.exec()
+            dlg.exec()

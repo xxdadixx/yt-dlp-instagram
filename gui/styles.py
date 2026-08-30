@@ -80,10 +80,78 @@ QMainWindow {
 }
 
 QWidget {
-    background-color: #0D0D12;
-    color: #FFFFFF;
-    font-family: 'Segoe UI', 'Leelawadee UI', 'Tahoma', 'Noto Sans Thai', 'Apple Color Emoji', 'Segoe UI Emoji', sans-serif;
+    background-color: #121217;
+    color: #F8FAFC;
+    font-family: "Segoe UI", "Leelawadee UI", "Tahoma", "Noto Sans Thai", sans-serif;
     font-size: 13px;
+}
+
+QLabel {
+    color: #F8FAFC;
+    background-color: transparent;
+}
+
+/* Media Card Container */
+QFrame#MediaCardFrame {
+    background-color: #1C1C24;
+    border: 1px solid #2E2E3E;
+    border-radius: 10px;
+}
+
+/* Media Card Typography */
+QLabel#CardTitle {
+    color: #FFFFFF;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QLabel#CardUsername {
+    color: #38BDF8;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+QLabel#CardMeta {
+    color: #94A3B8;
+    font-size: 11px;
+}
+
+QLabel#CardBadge {
+    background-color: rgba(245, 96, 64, 0.2);
+    color: #F56040;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 4px;
+    padding: 2px 6px;
+}
+
+QLabel#StatusPillReady {
+    color: #A0A0B2;
+    background-color: #2A2A38;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 10px;
+}
+
+QLabel#StatusPillFinished {
+    color: #10B981;
+    background-color: rgba(16, 185, 129, 0.15);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 10px;
+}
+
+QLabel#StatusPillError {
+    color: #EF4444;
+    background-color: rgba(239, 68, 68, 0.15);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 10px;
+}
+
+QFrame#MediaCardFrame:hover {
+    border: 1px solid #3E3E54;
+    background-color: #22222D;
 }
 
 /* Glass Bento Enclosures */
@@ -184,20 +252,21 @@ QCheckBox {
 }
 
 QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
+    width: 18px;
+    height: 18px;
     border-radius: 5px;
-    border: 1.5px solid rgba(255, 255, 255, 0.22);
-    background-color: #1A1A26;
+    background-color: #2A2A38;
+    border: 1px solid #3E3E54;
 }
 
 QCheckBox::indicator:hover {
-    border-color: #E1306C;
+    border: 1px solid #E1306C;
 }
 
 QCheckBox::indicator:checked {
-    background-color: #E1306C;
-    border-color: #E1306C;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #F56040, stop:1 #E1306C);
+    border: 1px solid #F56040;
+    image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='20 6 9 17 4 12'></polyline></svg>");
 }
 
 /* Smooth Minimal Scrollbar */

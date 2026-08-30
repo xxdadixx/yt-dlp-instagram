@@ -62,6 +62,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.cards: List[MediaCard] = []
+        self._last_selected_index: int = -1
         self.inspect_worker: Optional[InspectWorker] = None
         self.download_worker: Optional[DownloadWorker] = None
 
@@ -229,7 +230,8 @@ class MainWindow(QMainWindow):
         self.btn_delete_selected = QPushButton(self)
         self.btn_delete_selected.setObjectName("DestructiveButton")
         self._set_button_icon(self.btn_delete_selected, "trash", "#FF6B6B", 12)
-        self.btn_delete_selected.clicked.connect(self.delete_selected_cards)
+        self.btn_delete_selected.setText("Clear All")
+        self.btn_delete_selected.clicked.connect(self.clear_all_cards)
         queue_bar.addWidget(self.btn_delete_selected)
 
         self.btn_clear_completed = QPushButton(self)
@@ -290,8 +292,14 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(bot_bar)
 
+        # Global Selection & Action Shortcuts
         QShortcut(QKeySequence("Ctrl+A"), self, self.select_all_cards)
+        QShortcut(QKeySequence("Ctrl+D"), self, self.deselect_all_cards)
+        QShortcut(QKeySequence("Ctrl+I"), self, self.invert_selection)
+        QShortcut(QKeySequence("Space"), self, self.toggle_active_selection)
         QShortcut(QKeySequence("Delete"), self, self.delete_selected_cards)
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self, self.start_download)
+        QShortcut(QKeySequence(Qt.Key.Key_Enter), self, self.start_download)
 
     def apply_translations(self) -> None:
         self.lbl_app_brand.setText(self.tr_text("app_title"))
@@ -406,6 +414,7 @@ class MainWindow(QMainWindow):
             self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 13)
             self.btn_inspect.setText(self.tr_text("inspect_media"))
             self.lbl_status.setText(self.tr_text("status_ready"))
+            self._update_action_button_states()
             return
 
         targets = self.url_container.get_targets()
@@ -419,7 +428,6 @@ class MainWindow(QMainWindow):
         self.btn_inspect.setText(self.tr_text("inspect_cancel"))
         self.lbl_status.setText(self.tr_text("status_inspecting"))
 
-        # Switch to Media Queue tab on inspection
         self.tab_widget.setCurrentIndex(0)
 
         self.inspect_worker = InspectWorker(
@@ -435,6 +443,7 @@ class MainWindow(QMainWindow):
         self.inspect_worker.status_message.connect(self.lbl_status.setText)
         self.inspect_worker.finished.connect(self.on_inspection_finished)
         self.inspect_worker.start()
+        self._update_action_button_states()
 
     def add_card(self, item_data: Dict[str, Any]) -> None:
         new_id = str(
@@ -453,6 +462,7 @@ class MainWindow(QMainWindow):
 
         card = MediaCard(item_data, parent=self)
         card.deleted.connect(lambda: self.remove_card(card))
+        card.card_clicked.connect(self._on_card_clicked)
         card.selection_changed.connect(self.update_selection_counter)
 
         count = self.media_grid_layout.count()
@@ -463,7 +473,30 @@ class MainWindow(QMainWindow):
 
         self.cards.append(card)
         self.update_selection_counter()
+        self._update_action_button_states()
         self.smooth_scroll_queue_to_bottom()
+
+    def _on_card_clicked(self, card: MediaCard, modifiers: Qt.KeyboardModifier) -> None:
+        """Handles Single Click toggle, Shift + Click range selection, and Ctrl + Click toggle."""
+        if card not in self.cards:
+            return
+
+        current_idx = self.cards.index(card)
+
+        # Shift + Click: Continuous range selection
+        if (
+            modifiers & Qt.KeyboardModifier.ShiftModifier
+        ) and self._last_selected_index != -1:
+            start = min(self._last_selected_index, current_idx)
+            end = max(self._last_selected_index, current_idx)
+            for idx, c in enumerate(self.cards):
+                c.set_selected(start <= idx <= end)
+        else:
+            # Single click or Ctrl + Click toggles selection on the clicked card
+            card.set_selected(not card.is_selected)
+            self._last_selected_index = current_idx
+
+        self.update_selection_counter()
 
     def smooth_scroll_queue_to_bottom(self) -> None:
         v_bar = self.scroll_area.verticalScrollBar()
@@ -485,6 +518,7 @@ class MainWindow(QMainWindow):
         card.setParent(None)
         card.deleteLater()
         self.update_selection_counter()
+        self._update_action_button_states()
 
     def on_inspection_finished(self, count: int) -> None:
         self.progress_bar.setValue(100)
@@ -493,31 +527,28 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(
             self.tr_text("status_inspection_done", count=len(self.cards))
         )
-        self.show_toast(self.tr_text("status_inspection_done", count=count))
+        self.lbl_toast.setText("")
+        self._update_action_button_states()
 
     def start_download(self) -> None:
-        # If currently downloading, clicking the button cancels the ongoing download
         if self.download_worker and self.download_worker.isRunning():
             self.download_worker.cancel()
             self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 13)
-            self.btn_download_all.setText(self.tr_text("btn_download_selected"))
             self.lbl_status.setText(self.tr_text("status_download_cancelled"))
             self.show_toast(self.tr_text("toast_download_cancelled"))
+            self._update_action_button_states()
             return
 
-        selected_cards = [c for c in self.cards if getattr(c, "is_selected", False)]
+        selected_cards = [c for c in self.cards if c.is_selected]
         if not selected_cards:
             self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
             return
 
-        items = []
+        items = [c.get_item_data() for c in selected_cards]
         for card in selected_cards:
             card.set_status("queued")
-            items.append(card.get_item_data())
 
         self._set_button_icon(self.btn_download_all, "stop", "#FFFFFF", 13)
-        self.btn_download_all.setText(self.tr_text("btn_cancel_download"))
-        self.btn_download_all.setEnabled(True)
         self.lbl_status.setText(self.tr_text("status_downloading", count=len(items)))
 
         self.download_worker = DownloadWorker(
@@ -532,6 +563,7 @@ class MainWindow(QMainWindow):
         self.download_worker.item_finished.connect(self._on_item_finished)
         self.download_worker.finished.connect(self._on_download_finished)
         self.download_worker.start()
+        self._update_action_button_states()
 
     def _on_item_started(self, item_id: str) -> None:
         for card in self.cards:
@@ -556,11 +588,8 @@ class MainWindow(QMainWindow):
 
     def _on_download_finished(self, success_count: int) -> None:
         self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 13)
-        self.btn_download_all.setText(self.tr_text("btn_download_selected"))
-        self.btn_download_all.setEnabled(True)
         self.progress_bar.setValue(100)
 
-        # Reset any leftover queued cards if cancelled
         for card in self.cards:
             if getattr(card, "status", "") in ("queued", "downloading"):
                 card.set_status("ready")
@@ -574,23 +603,44 @@ class MainWindow(QMainWindow):
             )
             self.show_toast(self.tr_text("status_download_done", count=success_count))
 
+        self._update_action_button_states()
+
+    def clear_all_cards(self) -> None:
+        for card in list(self.cards):
+            self.remove_card(card)
+
     def update_selection_counter(self) -> None:
         total = len(self.cards)
-        selected = len([c for c in self.cards if getattr(c, "is_selected", True)])
-        self.lbl_queue_count.setText(
-            self.tr_text("media_queue_title", selected=selected, total=total)
-        )
-        self.tab_widget.setTabText(0, self.tr_text("tab_media_queue", count=total))
+        selected = len([c for c in self.cards if c.is_selected])
+        self.lbl_queue_count.setText(f"Media Queue ({selected}/{total} Selected)")
+        self.tab_widget.setTabText(0, f"Media Queue ({selected}/{total})")
+        self._update_action_button_states()
 
     def select_all_cards(self) -> None:
         for card in self.cards:
             card.set_selected(True)
         self.update_selection_counter()
 
+    def deselect_all_cards(self) -> None:
+        for card in self.cards:
+            card.set_selected(False)
+        self.update_selection_counter()
+
+    def invert_selection(self) -> None:
+        for card in self.cards:
+            card.set_selected(not card.is_selected)
+        self.update_selection_counter()
+
+    def toggle_active_selection(self) -> None:
+        if 0 <= self._last_selected_index < len(self.cards):
+            card = self.cards[self._last_selected_index]
+            card.set_selected(not card.is_selected)
+            self.update_selection_counter()
+
     def delete_selected_cards(self) -> None:
-        for card in list(self.cards):
-            if getattr(card, "is_selected", False):
-                self.remove_card(card)
+        selected_cards = [c for c in self.cards if c.is_selected]
+        for card in selected_cards:
+            self.remove_card(card)
 
     def clear_completed_cards(self) -> None:
         for card in list(self.cards):
@@ -691,3 +741,26 @@ class MainWindow(QMainWindow):
         """Saves all settings and window state upon exit."""
         self.save_settings()
         super().closeEvent(event)
+
+    def _update_action_button_states(self) -> None:
+        """Enforces mutual safety states between Inspection and Download operations."""
+        is_inspecting = bool(self.inspect_worker and self.inspect_worker.isRunning())
+        is_downloading = bool(self.download_worker and self.download_worker.isRunning())
+        has_items = len(self.cards) > 0
+
+        # Inspect button state: Disabled during downloading
+        if is_downloading:
+            self.btn_inspect.setEnabled(False)
+        else:
+            self.btn_inspect.setEnabled(True)
+
+        # Download button state: Disabled during inspection or when queue is empty
+        if is_downloading:
+            self.btn_download_all.setEnabled(True)
+            self.btn_download_all.setText(self.tr_text("btn_cancel_download"))
+        elif is_inspecting or not has_items:
+            self.btn_download_all.setEnabled(False)
+            self.btn_download_all.setText(self.tr_text("btn_download_selected"))
+        else:
+            self.btn_download_all.setEnabled(True)
+            self.btn_download_all.setText(self.tr_text("btn_download_selected"))
