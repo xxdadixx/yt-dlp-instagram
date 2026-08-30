@@ -90,6 +90,16 @@ MAX_PAGINATION_PAGES: int = 1000
 REQUEST_DELAY_SECONDS: float = 0.5
 DEFAULT_REQUEST_TIMEOUT: int = 15
 
+# --- Anti-Scraping & Account Protection Constants ---
+DEFAULT_MAX_ITEMS_PER_PROFILE = 36      # Approx. 3 grid pages per crawl
+PROFILE_PAGING_MEAN_DELAY = 3.0         # Gaussian mean delay (seconds)
+PROFILE_PAGING_STD_DEV = 0.6            # Gaussian standard deviation
+MIN_PAGING_DELAY = 2.0                  # Lower bound floor for pagination
+MAX_PAGING_DELAY = 5.5                  # Upper bound ceiling for pagination
+
+INTER_TARGET_COOLDOWN_MIN = 12.0        # Rest interval between multiple URLs (seconds)
+INTER_TARGET_COOLDOWN_MAX = 20.0
+
 DOMAINS_RE_STR = (
     r"(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am|ig\.me)"
 )

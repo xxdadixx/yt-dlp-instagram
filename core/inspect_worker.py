@@ -1,6 +1,7 @@
 """
 core/inspect_worker.py - High-speed parallel multi-tier media inspection worker for Instagram.
-Features chained multi-tier pagination, detailed system diagnostics, and cookie rate-limit detection.
+Features chained multi-tier pagination, detailed system diagnostics, unauthenticated-first routing,
+adaptive Gaussian jitter pacing, and anti-scraping checkpoint circuit-breakers.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import gzip
 import json
 import logging
 import os
+import random
 import re
 import ssl
 import threading
@@ -18,8 +20,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-import random
 from typing import Any, Dict, List, Optional, Set
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
 try:
@@ -27,21 +29,56 @@ try:
 except ImportError:
     yt_dlp = None
 
-from config.constants import (
-    DEFAULT_HEADERS,
-    DEFAULT_PAGE_SIZE,
-    DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_USER_AGENT,
-    IG_APP_ID,
-    IG_BASE_URL,
-    IG_CLIPS_USER_URL,
-    IG_FEED_USER_URL,
-    IG_USER_INFO_MOBILE_URL,
-    IG_WEB_PROFILE_INFO_URL,
-    MAX_PAGINATION_PAGES,
-    MOBILE_USER_AGENT,
-    USER_AGENT,
-)
+try:
+    from config.constants import (
+        DEFAULT_HEADERS,
+        DEFAULT_PAGE_SIZE,
+        DEFAULT_REQUEST_TIMEOUT,
+        DEFAULT_USER_AGENT,
+        IG_APP_ID,
+        IG_BASE_URL,
+        IG_CLIPS_USER_URL,
+        IG_FEED_USER_URL,
+        IG_USER_INFO_MOBILE_URL,
+        IG_WEB_PROFILE_INFO_URL,
+        MAX_PAGINATION_PAGES,
+        MOBILE_USER_AGENT,
+        USER_AGENT,
+    )
+except ImportError:
+    DEFAULT_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-IG-App-ID": "936619743392459",
+        "X-ASBD-ID": "129477",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    DEFAULT_PAGE_SIZE = 24
+    DEFAULT_REQUEST_TIMEOUT = 12
+    DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    MOBILE_USER_AGENT = "Instagram 300.0.0.29.110 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100)"
+    USER_AGENT = DEFAULT_USER_AGENT
+    IG_BASE_URL = "https://www.instagram.com"
+    IG_APP_ID = "936619743392459"
+    IG_WEB_PROFILE_INFO_URL = (
+        "https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    )
+    IG_FEED_USER_URL = "https://www.instagram.com/api/v1/feed/user/{user_id}/"
+    IG_CLIPS_USER_URL = "https://www.instagram.com/api/v1/clips/user/"
+    IG_USER_INFO_MOBILE_URL = "https://i.instagram.com/api/v1/users/{user_id}/info/"
+    MAX_PAGINATION_PAGES = 15
+
+# --- Anti-Scraping Protection & Pacing Defaults ---
+DEFAULT_MAX_ITEMS_PER_PROFILE = 36  # Safe default threshold (~3 grid pages)
+PROFILE_PAGING_MEAN_DELAY = 2.8  # Gaussian mean delay (seconds)
+PROFILE_PAGING_STD_DEV = 0.5  # Gaussian standard deviation
+MIN_PAGING_DELAY = 1.8  # Lower bound floor for pagination
+MAX_PAGING_DELAY = 5.0  # Upper bound ceiling for pagination
+
+INTER_TARGET_COOLDOWN_MIN = 10.0  # Rest cooldown between distinct targets (seconds)
+INTER_TARGET_COOLDOWN_MAX = 18.0
+
 from core.parser import (
     is_standalone_video,
     normalize_url,
@@ -85,6 +122,7 @@ class InspectWorker(QThread):
         cookie_file: Optional[str] = None,
         profile_mode: str = "all",  # "all", "reels", "photos"
         quality_preset: str = "best_video",
+        max_items_per_profile: int = DEFAULT_MAX_ITEMS_PER_PROFILE,
         parent=None,
     ):
         super().__init__(parent)
@@ -93,6 +131,7 @@ class InspectWorker(QThread):
         self.cookie_file: str = (cookie_file or "").strip()
         self.profile_mode: str = (profile_mode or "all").lower()
         self.quality_preset: str = quality_preset
+        self.max_items_per_profile: int = max_items_per_profile
         self.is_cancelled: bool = False
 
         self._lock = threading.Lock()
@@ -116,85 +155,6 @@ class InspectWorker(QThread):
                     self.cookie_file = fpath
             except Exception:
                 pass
-
-    def _fetch_timeline_feed_web(
-        self, username: str, user_id: str, filter_mode: str = "all"
-    ) -> int:
-        """Paginates user's timeline media via Web REST Feed API with randomized delay."""
-        feed_max_id: Optional[str] = None
-        feed_pages = 0
-        found_count = 0
-
-        while feed_pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
-            feed_url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count=24"
-            if feed_max_id:
-                feed_url += f"&max_id={feed_max_id}"
-
-            h_feed = {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "X-IG-App-ID": IG_APP_ID,
-                "X-ASBD-ID": "129477",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{IG_BASE_URL}/{username}/",
-                "Accept": "*/*",
-            }
-            if self.cookie_str:
-                h_feed["Cookie"] = self.cookie_str
-            if self._csrf_token:
-                h_feed["X-CSRFToken"] = self._csrf_token
-
-            res_feed = self._make_request(
-                feed_url, headers=h_feed, caller_tag="WebTimelineFeed"
-            )
-            if not res_feed or not isinstance(res_feed, dict):
-                break
-
-            items_feed = res_feed.get("items", [])
-            if not items_feed:
-                break
-
-            for item in items_feed:
-                if self.is_cancelled:
-                    return found_count
-                media_item = item.get("media", item)
-                is_vid = (
-                    is_standalone_video(media_item)
-                    or bool(media_item.get("is_video"))
-                    or media_item.get("__typename") == "GraphVideo"
-                )
-
-                if filter_mode == "reels" and not is_vid:
-                    continue
-                if filter_mode == "photos" and is_vid:
-                    continue
-
-                for card in self._extract_media_cards(
-                    media_item, fallback_username=username
-                ):
-                    if filter_mode == "reels":
-                        card["media_type"] = "REEL"
-                    elif filter_mode == "photos" and is_vid:
-                        continue
-
-                    with self._lock:
-                        cid = str(card["id"])
-                        if cid not in self.seen_ids:
-                            self.seen_ids.add(cid)
-                            self.item_found.emit(card)
-                            found_count += 1
-
-            feed_pages += 1
-            more_available = bool(res_feed.get("more_available", False))
-            next_feed_max = res_feed.get("next_max_id") or res_feed.get("max_id")
-            self.status_message.emit(
-                f"✓ [Timeline Feed] Page {feed_pages}: {len(self.seen_ids)} total items found..."
-            )
-            if not more_available or not next_feed_max or next_feed_max == feed_max_id:
-                break
-            feed_max_id = next_feed_max
-            time.sleep(random.uniform(0.6, 1.2))
-
-        return found_count
 
     def cancel(self) -> None:
         """Gracefully flags cancellation and shuts down thread executor."""
@@ -233,6 +193,99 @@ class InspectWorker(QThread):
             logger.debug(f"Failed to ensure cookie file: {e}")
         return None
 
+    def _apply_gaussian_pacing(self) -> None:
+        """Applies a human-like Gaussian randomized delay between page requests."""
+        delay = random.gauss(PROFILE_PAGING_MEAN_DELAY, PROFILE_PAGING_STD_DEV)
+        sleep_time = max(MIN_PAGING_DELAY, min(delay, MAX_PAGING_DELAY))
+
+        start = time.time()
+        while time.time() - start < sleep_time:
+            if self.is_cancelled:
+                break
+            time.sleep(0.1)
+
+    def _build_headers(
+        self,
+        referer: str = "https://www.instagram.com/",
+        require_auth: bool = False,
+        is_mobile: bool = False,
+    ) -> Dict[str, str]:
+        """Construct browser-like HTTP headers with conditional cookie attachment."""
+        ua = MOBILE_USER_AGENT if is_mobile else DEFAULT_USER_AGENT
+        headers = {
+            "User-Agent": ua,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+            "X-IG-App-ID": IG_APP_ID,
+            "X-ASBD-ID": "129477",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": referer,
+            "Origin": IG_BASE_URL,
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-CH-UA": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+        }
+        if require_auth and self.cookie_str:
+            headers["Cookie"] = self.cookie_str
+            if self._csrf_token:
+                headers["X-CSRFToken"] = self._csrf_token
+        return headers
+
+    def _is_safe_response(
+        self, response_url: str, response_text: str, status_code: int
+    ) -> bool:
+        """
+        Circuit-breaker: Detects checkpoint redirects, scraping warnings, and rate limits.
+        Aborts immediately to protect the session from suspension.
+        """
+        warning_indicators = (
+            "/accounts/scraping_warning/",
+            "checkpoint_required",
+            "challenge_required",
+            "feedback_required",
+        )
+
+        final_url = response_url.lower()
+        if any(ind in final_url for ind in warning_indicators):
+            logger.error(
+                "Scraping warning/checkpoint detected in URL. Aborting worker."
+            )
+            self.status_message.emit(
+                "⚠️ Scraping warning detected by Instagram. Pausing to protect account."
+            )
+            self.cancel()
+            return False
+
+        if any(ind in response_text for ind in warning_indicators):
+            logger.error(
+                "Scraping warning/checkpoint detected in payload. Aborting worker."
+            )
+            self.status_message.emit(
+                "⚠️ Scraping warning detected in payload. Pausing to protect account."
+            )
+            self.cancel()
+            return False
+
+        if status_code == 429:
+            logger.warning(
+                "HTTP 429 Too Many Requests detected. Activating circuit breaker."
+            )
+            self.status_message.emit(
+                "⚠️ HTTP 429 (Too Many Requests). Pausing inspection to protect account."
+            )
+            self.cancel()
+            return False
+
+        if status_code in (401, 403):
+            logger.warning(f"HTTP {status_code} Forbidden/Unauthorized received.")
+            return False
+
+        return True
+
     def _make_request(
         self,
         url: str,
@@ -241,39 +294,23 @@ class InspectWorker(QThread):
         method: Optional[str] = None,
         timeout: int = DEFAULT_REQUEST_TIMEOUT,
         caller_tag: str = "",
+        require_auth: bool = False,
     ) -> Optional[Dict[str, Any]]:
+        """Centralized HTTP request handler with decompression and circuit-breaker protection."""
         if self.is_cancelled:
             return None
 
-        req_headers = dict(DEFAULT_HEADERS)
+        req_headers = self._build_headers(require_auth=require_auth)
         if headers:
             req_headers.update(headers)
-        if self.cookie_str:
-            req_headers["Cookie"] = self.cookie_str
-        if self._csrf_token:
-            req_headers["X-CSRFToken"] = self._csrf_token
-
-        req_headers["Accept-Encoding"] = "gzip, deflate"
-        req_headers.setdefault("Accept", "*/*")
-        req_headers.setdefault("Accept-Language", "en-US,en;q=0.9")
 
         req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
         try:
             with urllib.request.urlopen(
                 req, context=self._ssl_ctx, timeout=timeout
             ) as resp:
-                # Check for scraping warning or checkpoint redirects
-                final_url = resp.geturl().lower()
-                if any(
-                    k in final_url
-                    for k in ("scraping_warning", "checkpoint", "challenge")
-                ):
-                    self.status_message.emit(
-                        "⚠️ [Warning] Instagram automated behavior checkpoint detected. Pausing crawler."
-                    )
-                    self.is_cancelled = True
-                    return None
-
+                status_code = getattr(resp, "status", 200)
+                final_url = resp.geturl()
                 raw_bytes = resp.read()
 
                 # Decompress Gzip / Deflate
@@ -298,31 +335,18 @@ class InspectWorker(QThread):
                 raw = raw_bytes.decode(charset, errors="replace").strip()
                 raw = raw.lstrip("\ufeff").strip()
 
+                if not self._is_safe_response(final_url, raw, status_code):
+                    return None
+
                 if raw.startswith(("{", "[")):
-                    parsed_json = json.loads(raw)
-                    # Check for rate limit / challenge responses in JSON body
-                    if isinstance(parsed_json, dict):
-                        if (
-                            parsed_json.get("message")
-                            in ("checkpoint_required", "rate_limit_error")
-                            or parsed_json.get("status") == "fail"
-                        ):
-                            if "checkpoint" in str(
-                                parsed_json.get("checkpoint_url", "")
-                            ):
-                                self.status_message.emit(
-                                    "⚠️ [Warning] Instagram session challenge required. Pausing crawler."
-                                )
-                                self.is_cancelled = True
-                                return None
-                    return parsed_json
+                    return json.loads(raw)
                 return None
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 self.status_message.emit(
                     "⚠️ [Rate Limit] HTTP 429: Too Many Requests. Pausing to protect account."
                 )
-                self.is_cancelled = True
+                self.cancel()
             elif e.code in (400, 401, 403):
                 logger.debug(f"[{caller_tag or 'API'}] HTTP {e.code}: {e.reason}")
             return None
@@ -330,149 +354,34 @@ class InspectWorker(QThread):
             logger.debug(f"[{caller_tag or 'API'}] Request to {url} failed: {e}")
             return None
 
-    def _get_api_headers(self, username: str = "") -> dict[str, str]:
-        """Build standard Instagram web API headers with Referer and App ID."""
-        headers = {
-            "User-Agent": USER_AGENT,
-            "X-IG-App-ID": "936619743392459",
-            "X-ASBD-ID": "129477",
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-        }
-        if username:
-            headers["Referer"] = f"https://www.instagram.com/{username}/"
-        if hasattr(self, "session_cookies") and self.session_cookies:
-            headers["Cookie"] = self.session_cookies
-            csrf = self._extract_cookie_val("csrftoken")
-            if csrf:
-                headers["X-CSRFToken"] = csrf
-        return headers
-
-    def _decompress_response(self, response: urllib.response.addinfourl) -> str:
-        """Decompress Gzip/Deflate stream and strip UTF-8 BOM."""
-        raw_bytes = response.read()
-        content_encoding = response.headers.get("Content-Encoding", "").lower()
-
-        if content_encoding == "gzip":
-            decompressed = gzip.decompress(raw_bytes)
-        elif content_encoding == "deflate":
-            decompressed = zlib.decompress(raw_bytes)
-        else:
-            decompressed = raw_bytes
-
-        text = decompressed.decode("utf-8", errors="replace")
-        return text.lstrip("\ufeff")
-
-    def _fetch_web_profile_info(self, username: str) -> dict[str, Any] | None:
-        """Tier 1: Fetch user ID and initial media grid using web_profile_info."""
-        url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
-        req = urllib.request.Request(url, headers=self._get_api_headers(username))
-
-        try:
-            with urllib.request.urlopen(req, timeout=12) as response:
-                if response.status == 200:
-                    payload = self._decompress_response(response)
-                    data = json.loads(payload)
-                    return data.get("data", {}).get("user") or data.get("user")
-        except Exception:
-            # Silently handle to trigger fallback tiers
-            pass
-        return None
-
-    def _inspect_profile_pipeline(self, username: str, mode: str = "all") -> list[dict]:
-        """Execute Tier 1 -> Tier 2 -> Tier 3 -> Tier 4 extraction pipeline."""
-        extracted_items: list[dict] = []
-        seen_ids: set[str] = set()
-
-        # Tier 1: Web Profile API
-        user_data = self._fetch_web_profile_info(username)
-        user_id = (
-            str(user_data.get("id")) if user_data and user_data.get("id") else None
-        )
-
-        if user_data:
-            timeline_media = user_data.get("edge_owner_to_timeline_media", {})
-            edges = timeline_media.get("edges", [])
-            for edge in edges:
-                node = edge.get("node", {})
-                item = self._parse_node_to_media_item(node, username)
-                if item and item["id"] not in seen_ids:
-                    seen_ids.add(item["id"])
-                    extracted_items.append(item)
-                    self.media_found.emit(item)
-
-            # Tier 2: Paginate timeline GraphQL in "all" or "posts" mode
-            page_info = timeline_media.get("page_info", {})
-            has_next_page = page_info.get("has_next_page", False)
-            end_cursor = page_info.get("end_cursor", "")
-            page_count = 0
-
-            while (
-                has_next_page
-                and end_cursor
-                and page_count < MAX_PAGINATION_PAGES
-                and not self.isInterruptionRequested()
-            ):
-                page_count += 1
-                gql_data = self._fetch_timeline_graphql(user_id, end_cursor)
-                if not gql_data:
-                    break
-
-                media_data = (
-                    gql_data.get("data", {})
-                    .get("user", {})
-                    .get("edge_owner_to_timeline_media", {})
-                )
-                edges = media_data.get("edges", [])
-                if not edges:
-                    break
-
-                for edge in edges:
-                    node = edge.get("node", {})
-                    item = self._parse_node_to_media_item(node, username)
-                    if item and item["id"] not in seen_ids:
-                        seen_ids.add(item["id"])
-                        extracted_items.append(item)
-                        self.media_found.emit(item)
-
-                page_info = media_data.get("page_info", {})
-                has_next_page = page_info.get("has_next_page", False)
-                end_cursor = page_info.get("end_cursor", "")
-
-        # Tier 4: Fallback to yt-dlp flat extractor if 0 items were retrieved
-        if len(extracted_items) == 0 and not self.isInterruptionRequested():
-            fallback_items = self._run_ytdlp_flat_fallback(
-                f"https://www.instagram.com/{username}/"
-            )
-            for item in fallback_items:
-                if item["id"] not in seen_ids:
-                    seen_ids.add(item["id"])
-                    extracted_items.append(item)
-                    self.media_found.emit(item)
-
-        return extracted_items
-
     def _get_user_id(self, username: str) -> Optional[str]:
+        """Resolves username to Instagram User ID using multi-strategy fallback."""
         username = username.lower().strip().lstrip("@")
         self.status_message.emit(f"🔍 [Resolver] Fetching User ID for @{username}...")
 
         # Strategy 1: Web Profile Info Endpoint
         try:
-            url1 = IG_WEB_PROFILE_INFO_URL.format(username=username)
-            h1 = {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "X-IG-App-ID": IG_APP_ID,
-                "X-ASBD-ID": "129477",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{IG_BASE_URL}/{username}/",
-                "Origin": IG_BASE_URL,
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-origin",
-            }
-            res1 = self._make_request(url1, headers=h1, caller_tag="WebProfileInfo")
+            url1 = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+            res1 = self._make_request(
+                url1,
+                headers={
+                    "Referer": f"{IG_BASE_URL}/{username}/",
+                    "X-IG-App-ID": IG_APP_ID,
+                },
+                caller_tag="WebProfileInfo",
+                require_auth=False,
+            )
+            if not res1 and self.cookie_str:
+                res1 = self._make_request(
+                    url1,
+                    headers={
+                        "Referer": f"{IG_BASE_URL}/{username}/",
+                        "X-IG-App-ID": IG_APP_ID,
+                    },
+                    caller_tag="WebProfileInfoAuth",
+                    require_auth=True,
+                )
+
             if res1 and isinstance(res1, dict):
                 user_data = res1.get("data", {}).get("user") or res1.get("user")
                 if user_data:
@@ -487,18 +396,12 @@ class InspectWorker(QThread):
         except Exception as e:
             logger.debug(f"WebProfileInfo resolver failed: {e}")
 
-        # Strategy 2: Web HTML Scraper (สกัดจาก Script Tag กรณี API ติด Rate limit)
+        # Strategy 2: Base HTML Scraper Fallback
         try:
             profile_url = f"{IG_BASE_URL}/{username}/"
             req = urllib.request.Request(
                 profile_url,
-                headers={
-                    "User-Agent": DEFAULT_USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Cookie": self.cookie_str or "",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate",
-                },
+                headers=self._build_headers(referer=IG_BASE_URL, require_auth=False),
             )
             with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=10) as resp:
                 raw_bytes = resp.read()
@@ -506,18 +409,11 @@ class InspectWorker(QThread):
                 if "gzip" in content_encoding or (
                     len(raw_bytes) >= 2 and raw_bytes[:2] == b"\x1f\x8b"
                 ):
-                    try:
-                        raw_bytes = gzip.decompress(raw_bytes)
-                    except Exception:
-                        pass
+                    raw_bytes = gzip.decompress(raw_bytes)
                 elif "deflate" in content_encoding:
-                    try:
-                        raw_bytes = zlib.decompress(raw_bytes)
-                    except Exception:
-                        pass
+                    raw_bytes = zlib.decompress(raw_bytes)
 
                 html_text = raw_bytes.decode("utf-8", errors="replace")
-
                 patterns = [
                     r'"user_id":"(\d+)"',
                     r'"owner":\{"id":"(\d+)"',
@@ -540,12 +436,12 @@ class InspectWorker(QThread):
         # Strategy 3: TopSearch Query Endpoint
         try:
             url3 = f"https://www.instagram.com/web/search/topsearch/?query={username}"
-            h3 = {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "X-IG-App-ID": IG_APP_ID,
-                "Referer": f"{IG_BASE_URL}/{username}/",
-            }
-            res3 = self._make_request(url3, headers=h3, caller_tag="TopSearch")
+            res3 = self._make_request(
+                url3,
+                headers={"Referer": f"{IG_BASE_URL}/{username}/"},
+                caller_tag="TopSearch",
+                require_auth=False,
+            )
             if res3 and isinstance(res3, dict) and "users" in res3:
                 for item in res3["users"]:
                     u = item.get("user") or {}
@@ -559,14 +455,12 @@ class InspectWorker(QThread):
         except Exception:
             pass
 
-        self.status_message.emit(
-            f"⚠️ [Resolver] Could not resolve User ID for @{username}."
-        )
         return None
 
     def _extract_media_cards(
         self, item: Dict[str, Any], raw_target: str = "", fallback_username: str = ""
     ) -> List[Dict[str, Any]]:
+        """Parses raw Instagram media dictionaries into normalized MediaCard schema."""
         if not item or not isinstance(item, dict):
             return []
 
@@ -580,7 +474,7 @@ class InspectWorker(QThread):
             for edge in media.get("edge_sidecar_to_children", {}).get("edges", [])
         ]
 
-        # Extract caption across REST and GraphQL payloads
+        # Caption Extraction
         caption_obj = media.get("caption")
         caption_text = ""
         if isinstance(caption_obj, dict):
@@ -680,7 +574,7 @@ class InspectWorker(QThread):
             }
             return [card]
 
-        # 2. Single Post / Reel / Image
+        # 2. Single Post / Reel / Photo
         is_vid = (
             is_standalone_video(media)
             or bool(media.get("is_video"))
@@ -725,7 +619,6 @@ class InspectWorker(QThread):
             b_type = "IMAGE"
 
         title_line = first_line if first_line else f"Instagram {b_type} #{shortcode}"
-
         canonical_url = (
             raw_target
             if raw_target
@@ -759,21 +652,26 @@ class InspectWorker(QThread):
     def _inspect_single_post(
         self, shortcode: str, raw_target: str = "", media_type: str = "POST"
     ) -> List[Dict[str, Any]]:
+        """Tier 1 -> Tier 2 -> Tier 3 inspection for single post URLs."""
         target_url = raw_target or f"https://www.instagram.com/p/{shortcode}/"
 
-        # Tier 1: Instagram Mobile Media Info API
+        # Tier 1: Instagram Mobile Media Info API (Unauthenticated First)
         media_id = shortcode_to_id(shortcode)
         if media_id:
             info_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
-            h_mobile = {"User-Agent": MOBILE_USER_AGENT, "X-IG-App-ID": IG_APP_ID}
-            if self.cookie_str:
-                h_mobile["Cookie"] = self.cookie_str
-            if self._csrf_token:
-                h_mobile["X-CSRFToken"] = self._csrf_token
-
             res_mobile = self._make_request(
-                info_url, headers=h_mobile, caller_tag="MobileMediaInfo"
+                info_url,
+                caller_tag="MobileMediaInfo",
+                require_auth=False,
             )
+            # Retry with auth if unauthenticated call returned no items
+            if not res_mobile and self.cookie_str:
+                res_mobile = self._make_request(
+                    info_url,
+                    caller_tag="MobileMediaInfoAuth",
+                    require_auth=True,
+                )
+
             if res_mobile and isinstance(res_mobile, dict) and res_mobile.get("items"):
                 extracted = self._extract_media_cards(
                     res_mobile["items"][0], raw_target=target_url
@@ -785,53 +683,37 @@ class InspectWorker(QThread):
                             if cid not in self.seen_ids:
                                 self.seen_ids.add(cid)
                                 self.item_found.emit(card)
+                                self.media_found.emit(card)
                     return extracted
 
         # Tier 2: Instagram Web JSON Endpoint
         api_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
-        headers_web = {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "X-IG-App-ID": IG_APP_ID,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": "https://www.instagram.com/",
-            "Accept": "*/*",
-        }
-        if self.cookie_str:
-            headers_web["Cookie"] = self.cookie_str
-        if self._csrf_token:
-            headers_web["X-CSRFToken"] = self._csrf_token
-
-        try:
-            req = urllib.request.Request(api_url, headers=headers_web)
-            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=8) as resp:
-                if resp.status == 200:
-                    raw_data = resp.read()
-                    if len(raw_data) >= 2 and raw_data[:2] == b"\x1f\x8b":
-                        raw_data = gzip.decompress(raw_data)
-                    payload = json.loads(raw_data.decode("utf-8", errors="replace"))
-                    media_data = (
-                        payload.get("graphql", {}).get("shortcode_media")
-                        or payload.get("data", {}).get("xdt_shortcode_media")
-                        or (
-                            payload.get("items", [{}])[0]
-                            if "items" in payload and payload["items"]
-                            else None
-                        )
-                    )
-                    if media_data:
-                        extracted = self._extract_media_cards(
-                            media_data, raw_target=target_url
-                        )
-                        if extracted:
-                            with self._lock:
-                                for card in extracted:
-                                    cid = str(card["id"])
-                                    if cid not in self.seen_ids:
-                                        self.seen_ids.add(cid)
-                                        self.item_found.emit(card)
-                            return extracted
-        except Exception as e:
-            logger.debug(f"Direct API inspection failed for {shortcode}: {e}")
+        res_web = self._make_request(
+            api_url,
+            caller_tag="WebJSONPost",
+            require_auth=False,
+        )
+        if res_web and isinstance(res_web, dict):
+            media_data = (
+                res_web.get("graphql", {}).get("shortcode_media")
+                or res_web.get("data", {}).get("xdt_shortcode_media")
+                or (
+                    res_web.get("items", [{}])[0]
+                    if "items" in res_web and res_web["items"]
+                    else None
+                )
+            )
+            if media_data:
+                extracted = self._extract_media_cards(media_data, raw_target=target_url)
+                if extracted:
+                    with self._lock:
+                        for card in extracted:
+                            cid = str(card["id"])
+                            if cid not in self.seen_ids:
+                                self.seen_ids.add(cid)
+                                self.item_found.emit(card)
+                                self.media_found.emit(card)
+                    return extracted
 
         # Tier 3: Direct yt-dlp fallback
         self._inspect_via_ytdlp(target_url)
@@ -840,7 +722,7 @@ class InspectWorker(QThread):
     def _fetch_timeline_graphql(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> int:
-        """Paginates user's timeline media via GraphQL with randomized safety jitter."""
+        """Tier 2: Paginate timeline media via GraphQL with Gaussian pacing and item limits."""
         query_hash = "e769aa130647d2354c40ea6a439bfc08"
         has_next_page = True
         end_cursor: Optional[str] = None
@@ -848,6 +730,12 @@ class InspectWorker(QThread):
         found_count = 0
 
         while has_next_page and pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
+            if len(self.seen_ids) >= self.max_items_per_profile:
+                logger.info(
+                    f"Reached safe crawl cap ({self.max_items_per_profile} items) for @{username}."
+                )
+                break
+
             variables: Dict[str, Any] = {"id": str(user_id), "first": 24}
             if end_cursor:
                 variables["after"] = str(end_cursor)
@@ -855,16 +743,11 @@ class InspectWorker(QThread):
             vars_encoded = urllib.parse.quote(json.dumps(variables))
             graphql_url = f"https://www.instagram.com/graphql/query/?query_hash={query_hash}&variables={vars_encoded}"
 
-            h = {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "X-IG-App-ID": IG_APP_ID,
-                "X-ASBD-ID": "129477",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{IG_BASE_URL}/{username}/",
-                "Accept": "*/*",
-            }
             res = self._make_request(
-                graphql_url, headers=h, caller_tag="GraphQLTimeline"
+                graphql_url,
+                headers={"Referer": f"{IG_BASE_URL}/{username}/"},
+                caller_tag="GraphQLTimeline",
+                require_auth=False,
             )
             if not res or not isinstance(res, dict):
                 break
@@ -901,6 +784,7 @@ class InspectWorker(QThread):
                         if cid not in self.seen_ids:
                             self.seen_ids.add(cid)
                             self.item_found.emit(card)
+                            self.media_found.emit(card)
                             found_count += 1
 
             page_info = timeline_media.get("page_info", {})
@@ -910,15 +794,17 @@ class InspectWorker(QThread):
             self.status_message.emit(
                 f"✓ [GraphQL] Page {pages}: {len(self.seen_ids)} total items found..."
             )
-            # Randomized jitter delay between pagination requests
-            time.sleep(random.uniform(0.8, 1.5))
+
+            # Human-like Gaussian pacing
+            if has_next_page and not self.is_cancelled:
+                self._apply_gaussian_pacing()
 
         return found_count
 
     def _fetch_all_profile_media_web(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> None:
-        """Deep profile media crawler engine: harvests Web Profile, GraphQL Timeline, and Clips stream."""
+        """Tier 1 -> Tier 2 -> Tier 3 deep profile media crawler."""
         tier_label = (
             "Reels"
             if filter_mode == "reels"
@@ -928,267 +814,31 @@ class InspectWorker(QThread):
             f"🚀 [Tier 1: Web Profile] Crawling {tier_label} for @{username}..."
         )
 
-        # Tier 0: Harvest หน้าแรกจาก Cache
-        user_data = self._profile_cache.get(username)
-        if user_data:
-            # 1. Timeline Grid Media (รูปภาพเดี่ยว, Carousel, และ Reels ในหน้าโปรไฟล์)
-            timeline_edges = user_data.get("edge_owner_to_timeline_media", {}).get(
-                "edges", []
-            )
-            for edge in timeline_edges:
-                if self.is_cancelled:
-                    return
-                node = edge.get("node", {})
-                is_vid = (
-                    is_standalone_video(node)
-                    or bool(node.get("is_video"))
-                    or node.get("__typename") == "GraphVideo"
-                )
-
-                if filter_mode == "reels" and not is_vid:
-                    continue
-                if filter_mode == "photos" and is_vid:
-                    continue
-
-                for card in self._extract_media_cards(node, fallback_username=username):
-                    if filter_mode == "reels":
-                        card["media_type"] = "REEL"
-                    elif filter_mode == "photos" and is_vid:
-                        continue
-
-                    with self._lock:
-                        cid = str(card["id"])
-                        if cid not in self.seen_ids:
-                            self.seen_ids.add(cid)
-                            self.item_found.emit(card)
-
-            # 2. Felix Archive (Reels)
-            if filter_mode != "photos":
-                felix_edges = user_data.get("edge_felix_video_timeline", {}).get(
-                    "edges", []
-                )
-                for edge in felix_edges:
-                    if self.is_cancelled:
-                        return
-                    node = edge.get("node", {})
-                    for card in self._extract_media_cards(
-                        node, fallback_username=username
-                    ):
-                        card["media_type"] = "REEL"
-                        with self._lock:
-                            cid = str(card["id"])
-                            if cid not in self.seen_ids:
-                                self.seen_ids.add(cid)
-                                self.item_found.emit(card)
-
-        # Tier 1: GraphQL Timeline Pagination (ดึงรูปภาพและ Carousel หน้าถัดไปจนหมดโปรไฟล์)
-        if not self.is_cancelled:
-            self.status_message.emit(
-                f"🚀 [Tier 2: GraphQL] Crawling deep timeline media for @{username}..."
-            )
-            self._fetch_timeline_graphql(username, user_id, filter_mode=filter_mode)
-
-        # Tier 2: Dedicated Clips Stream (ดึง Reels ทั้งหมดจากแท็บ Reels)
-        if filter_mode != "photos" and not self.is_cancelled:
-            self.status_message.emit(
-                f"🚀 [Tier 3: Clips API] Crawling deep reels for @{username}..."
-            )
-            max_id: Optional[str] = None
-            pages = 0
-            while pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
-                payload = {
-                    "target_user_id": str(user_id),
-                    "page_size": str(DEFAULT_PAGE_SIZE),
-                    "include_feed_video": "true",
-                    "container_module": "clips_viewer_user",
-                }
-                if max_id:
-                    payload["max_id"] = str(max_id)
-
-                encoded_data = urllib.parse.urlencode(payload).encode("utf-8")
-                h = {
-                    "User-Agent": DEFAULT_USER_AGENT,
-                    "X-IG-App-ID": IG_APP_ID,
-                    "X-ASBD-ID": "129477",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": f"{IG_BASE_URL}/{username}/reels/",
-                }
-                res = self._make_request(
-                    IG_CLIPS_USER_URL,
-                    headers=h,
-                    data=encoded_data,
-                    method="POST",
-                    caller_tag="ClipsAPI",
-                )
-                if not res or not isinstance(res, dict):
-                    break
-
-                items = res.get("items") or res.get("grid_items") or []
-                if not items:
-                    break
-
-                for item in items:
-                    if self.is_cancelled:
-                        return
-                    media_item = item.get("media", item)
-                    for card in self._extract_media_cards(
-                        media_item, fallback_username=username
-                    ):
-                        card["media_type"] = "REEL"
-                        with self._lock:
-                            cid = str(card["id"])
-                            if cid not in self.seen_ids:
-                                self.seen_ids.add(cid)
-                                self.item_found.emit(card)
-
-                pages += 1
-                paging_info = res.get("paging_info", {})
-                next_max_id = paging_info.get("max_id") or res.get("next_max_id")
-                more_available = bool(paging_info.get("more_available", False))
-
-                self.status_message.emit(
-                    f"✓ [Clips Stream] Page {pages}: {len(self.seen_ids)} items found so far..."
-                )
-                if not more_available or not next_max_id or next_max_id == max_id:
-                    break
-                max_id = next_max_id
-                time.sleep(random.uniform(0.7, 1.3))
-
-    def _fetch_timeline_graphql(
-        self, user_id: str, end_cursor: str = ""
-    ) -> dict[str, Any] | None:
-        """Tier 2: Paginate timeline grid (Photos, Carousels, Videos) via GraphQL."""
-        variables = {"id": str(user_id), "first": 50, "after": end_cursor}
-        query_hash = "e769aa130647d2354c40ea6a439bfc08"
-        url = f"https://www.instagram.com/graphql/query/?query_hash={query_hash}&variables={urllib.parse.quote(json.dumps(variables))}"
-
-        req = urllib.request.Request(url, headers=self._get_api_headers())
-        try:
-            with urllib.request.urlopen(req, timeout=12) as response:
-                if response.status == 200:
-                    payload = self._decompress_response(response)
-                    return json.loads(payload)
-        except Exception:
-            pass
-        return None
-
-    def _fetch_timeline_graphql(
-        self, username: str, user_id: str, filter_mode: str = "all"
-    ) -> int:
-        """Paginates user's timeline media (Photos, Carousels, Videos) via Web GraphQL Query."""
-        query_hash = "e769aa130647d2354c40ea6a439bfc08"
-        has_next_page = True
-        end_cursor: Optional[str] = None
-        pages = 0
-        found_count = 0
-
-        while has_next_page and pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
-            variables: Dict[str, Any] = {"id": str(user_id), "first": 50}
-            if end_cursor:
-                variables["after"] = str(end_cursor)
-
-            vars_encoded = urllib.parse.quote(json.dumps(variables))
-            graphql_url = f"https://www.instagram.com/graphql/query/?query_hash={query_hash}&variables={vars_encoded}"
-
-            h = {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "X-IG-App-ID": IG_APP_ID,
-                "X-ASBD-ID": "129477",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{IG_BASE_URL}/{username}/",
-                "Accept": "*/*",
-            }
-            res = self._make_request(
-                graphql_url, headers=h, caller_tag="GraphQLTimeline"
-            )
-            if not res or not isinstance(res, dict):
-                break
-
-            user_data = res.get("data", {}).get("user", {})
-            timeline_media = user_data.get("edge_owner_to_timeline_media", {})
-            edges = timeline_media.get("edges", [])
-            if not edges:
-                break
-
-            for edge in edges:
-                if self.is_cancelled:
-                    return found_count
-                node = edge.get("node", {})
-                is_vid = (
-                    is_standalone_video(node)
-                    or bool(node.get("is_video"))
-                    or node.get("__typename") == "GraphVideo"
-                )
-
-                if filter_mode == "reels" and not is_vid:
-                    continue
-                if filter_mode == "photos" and is_vid:
-                    continue
-
-                for card in self._extract_media_cards(node, fallback_username=username):
-                    if filter_mode == "reels":
-                        card["media_type"] = "REEL"
-                    elif filter_mode == "photos" and is_vid:
-                        continue
-
-                    with self._lock:
-                        cid = str(card["id"])
-                        if cid not in self.seen_ids:
-                            self.seen_ids.add(cid)
-                            self.item_found.emit(card)
-                            found_count += 1
-
-            page_info = timeline_media.get("page_info", {})
-            has_next_page = bool(page_info.get("has_next_page", False))
-            end_cursor = page_info.get("end_cursor")
-            pages += 1
-            self.status_message.emit(
-                f"✓ [GraphQL] Page {pages}: {len(self.seen_ids)} total items found..."
-            )
-            time.sleep(0.08)
-
-        return found_count
-
-    def _fetch_all_profile_media_web(
-        self, username: str, user_id: str, filter_mode: str = "all"
-    ) -> None:
-        """Deep profile media crawler engine: harvests Web Profile, Web Timeline Feed, GraphQL, and Clips stream."""
-        tier_label = (
-            "Reels"
-            if filter_mode == "reels"
-            else ("Photos" if filter_mode == "photos" else "Profile Media")
-        )
-        self.status_message.emit(
-            f"🚀 [Tier 1: Web Profile] Crawling {tier_label} for @{username}..."
-        )
-
-        # Tier 0: Direct Web Profile Harvest (Grid Media & Felix Archive)
+        # Tier 1: Direct Web Profile Harvest (Initial Grid & Felix Archive)
         user_data = self._profile_cache.get(username)
         if not user_data:
             try:
                 url_profile = IG_WEB_PROFILE_INFO_URL.format(username=username)
-                h_profile = {
-                    "User-Agent": DEFAULT_USER_AGENT,
-                    "X-IG-App-ID": IG_APP_ID,
-                    "X-ASBD-ID": "129477",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": f"{IG_BASE_URL}/{username}/",
-                }
-                if self.cookie_str:
-                    h_profile["Cookie"] = self.cookie_str
-                if self._csrf_token:
-                    h_profile["X-CSRFToken"] = self._csrf_token
-
                 res_p = self._make_request(
-                    url_profile, headers=h_profile, caller_tag="WebProfileMedia"
+                    url_profile,
+                    headers={"Referer": f"{IG_BASE_URL}/{username}/"},
+                    caller_tag="WebProfileMedia",
+                    require_auth=False,
                 )
+                if not res_p and self.cookie_str:
+                    res_p = self._make_request(
+                        url_profile,
+                        headers={"Referer": f"{IG_BASE_URL}/{username}/"},
+                        caller_tag="WebProfileMediaAuth",
+                        require_auth=True,
+                    )
                 if res_p and isinstance(res_p, dict):
                     user_data = res_p.get("data", {}).get("user") or res_p.get("user")
             except Exception as e:
-                logger.debug(f"Web profile media lookup failed: {e}")
+                logger.debug(f"Web profile lookup failed: {e}")
 
         if user_data:
-            # 1. Timeline Grid Media (Includes photos, carousels, and grid reels)
+            # 1. Timeline Grid Media
             timeline_edges = user_data.get("edge_owner_to_timeline_media", {}).get(
                 "edges", []
             )
@@ -1218,6 +868,7 @@ class InspectWorker(QThread):
                         if cid not in self.seen_ids:
                             self.seen_ids.add(cid)
                             self.item_found.emit(card)
+                            self.media_found.emit(card)
 
             # 2. Felix Video / Reels Archive
             if filter_mode != "photos":
@@ -1237,26 +888,30 @@ class InspectWorker(QThread):
                             if cid not in self.seen_ids:
                                 self.seen_ids.add(cid)
                                 self.item_found.emit(card)
+                                self.media_found.emit(card)
 
-        # Tier 1: Web Timeline Feed API Pagination (Photos, Carousels, Videos)
-        if not self.is_cancelled:
+        # Tier 2: GraphQL Timeline Pagination (Photos & Carousels)
+        if not self.is_cancelled and len(self.seen_ids) < self.max_items_per_profile:
             self.status_message.emit(
-                f"🚀 [Tier 2: Timeline Stream] Crawling feed media for @{username}..."
+                f"🚀 [Tier 2: GraphQL] Crawling timeline media for @{username}..."
             )
-            self._fetch_timeline_feed_web(username, user_id, filter_mode=filter_mode)
-
-        # Tier 2: GraphQL Deep Timeline Pagination
-        if not self.is_cancelled:
             self._fetch_timeline_graphql(username, user_id, filter_mode=filter_mode)
 
-        # Tier 3: Dedicated Clips Stream (Reels Tab only)
-        if filter_mode != "photos" and not self.is_cancelled:
+        # Tier 3: Dedicated Clips Stream (Reels Tab)
+        if (
+            filter_mode != "photos"
+            and not self.is_cancelled
+            and len(self.seen_ids) < self.max_items_per_profile
+        ):
             self.status_message.emit(
-                f"🚀 [Tier 3: Clips API] Crawling deep reels for @{username}..."
+                f"🚀 [Tier 3: Clips API] Crawling Reels stream for @{username}..."
             )
             max_id: Optional[str] = None
             pages = 0
             while pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
+                if len(self.seen_ids) >= self.max_items_per_profile:
+                    break
+
                 payload = {
                     "target_user_id": str(user_id),
                     "page_size": str(DEFAULT_PAGE_SIZE),
@@ -1267,33 +922,21 @@ class InspectWorker(QThread):
                     payload["max_id"] = str(max_id)
 
                 encoded_data = urllib.parse.urlencode(payload).encode("utf-8")
-                h = {
+                h_clips = {
                     "User-Agent": MOBILE_USER_AGENT,
                     "X-IG-App-ID": IG_APP_ID,
-                    "X-ASBD-ID": "129477",
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Referer": f"{IG_BASE_URL}/{username}/reels/",
                 }
-                if self.cookie_str:
-                    h["Cookie"] = self.cookie_str
-                if self._csrf_token:
-                    h["X-CSRFToken"] = self._csrf_token
 
                 res = self._make_request(
                     IG_CLIPS_USER_URL,
-                    headers=h,
+                    headers=h_clips,
                     data=encoded_data,
                     method="POST",
                     caller_tag="ClipsAPI",
+                    require_auth=True,
                 )
-                if not res or not isinstance(res, dict):
-                    params_str = urllib.parse.urlencode(payload)
-                    res = self._make_request(
-                        f"{IG_CLIPS_USER_URL}?{params_str}",
-                        headers=h,
-                        caller_tag="ClipsAPI_GET",
-                    )
-
                 if not res or not isinstance(res, dict):
                     break
 
@@ -1314,6 +957,7 @@ class InspectWorker(QThread):
                             if cid not in self.seen_ids:
                                 self.seen_ids.add(cid)
                                 self.item_found.emit(card)
+                                self.media_found.emit(card)
 
                 pages += 1
                 paging_info = res.get("paging_info", {})
@@ -1321,23 +965,31 @@ class InspectWorker(QThread):
                 more_available = bool(paging_info.get("more_available", False))
 
                 self.status_message.emit(
-                    f"✓ [Clips Stream] Page {pages}: {len(self.seen_ids)} items found so far..."
+                    f"✓ [Clips Stream] Page {pages}: {len(self.seen_ids)} items found..."
                 )
                 if not more_available or not next_max_id or next_max_id == max_id:
                     break
                 max_id = next_max_id
-                time.sleep(0.05)
+                self._apply_gaussian_pacing()
 
     def _inspect_via_ytdlp(
         self, url: str, default_username: str = "", filter_mode: str = "all"
     ) -> None:
+        """Tier 4: yt-dlp flat extractor fallback with sanitized base profile URLs."""
         if yt_dlp is None:
             self.error.emit("yt-dlp engine is not available.")
             return
 
         try:
+            # yt-dlp requires the base profile URL (https://www.instagram.com/{username}/)
+            if default_username:
+                clean_url = f"{IG_BASE_URL}/{default_username}/"
+            else:
+                raw_clean = normalize_url(url) or url
+                clean_url = re.sub(r"/(?:reels|reel|tagged)/?.*$", "/", raw_clean)
+
             self.status_message.emit(
-                f"⚙️ [Engine Fallback] Running deep crawler for {url}..."
+                f"⚙️ [Tier 4: Engine Fallback] Running yt-dlp extraction for {clean_url}..."
             )
             ydl_opts = {
                 "extract_flat": "in_playlist",
@@ -1357,12 +1009,6 @@ class InspectWorker(QThread):
             if cfile and os.path.exists(cfile):
                 ydl_opts["cookiefile"] = cfile
 
-            clean_url = normalize_url(url) or url
-            if filter_mode == "reels" and default_username:
-                clean_url = f"{IG_BASE_URL}/{default_username}/reels/"
-            elif filter_mode != "reels":
-                clean_url = re.sub(r"/(?:reels|reel)/?.*$", "/", clean_url)
-
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(clean_url, download=False)
                 if not info or not isinstance(info, dict):
@@ -1370,19 +1016,9 @@ class InspectWorker(QThread):
 
                 entries = info.get("entries") or [info]
                 entries = [e for e in entries if e and isinstance(e, dict)]
-                total = len(entries)
                 if not entries:
                     return
 
-                is_single_post = any(
-                    x in url.lower() for x in ("/p/", "/reel/", "/reels/", "/tv/")
-                ) and not any(x in url.lower() for x in ("/stories/", "/highlights/"))
-
-                code = str(
-                    info.get("id")
-                    or entries[0].get("id")
-                    or clean_url.rstrip("/").split("/")[-1]
-                )
                 uploader = (
                     info.get("uploader")
                     or entries[0].get("uploader")
@@ -1390,66 +1026,8 @@ class InspectWorker(QThread):
                     or "instagram"
                 )
 
-                # Single Carousel Post Fallback
-                if is_single_post and total > 1:
-                    if filter_mode == "reels":
-                        return
-                    slides = []
-                    for idx, entry in enumerate(entries, start=1):
-                        has_vid = bool(
-                            entry.get("video_ext")
-                            or (entry.get("vcodec") and entry.get("vcodec") != "none")
-                            or entry.get("ext") == "mp4"
-                        )
-                        direct_u = entry.get("url") or ""
-                        thumb_u = entry.get("thumbnail") or ""
-                        slides.append(
-                            {
-                                "index": idx,
-                                "id": f"{code}_{idx}",
-                                "is_video": has_vid,
-                                "video_url": direct_u if has_vid else "",
-                                "download_url": direct_u or thumb_u,
-                                "thumbnail_url": thumb_u,
-                            }
-                        )
-
-                    with self._lock:
-                        if code in self.seen_ids:
-                            return
-                        self.seen_ids.add(code)
-
-                    card = {
-                        "id": code,
-                        "shortcode": code,
-                        "title": info.get("title")
-                        or entries[0].get("title")
-                        or f"Instagram Carousel #{code}",
-                        "username": uploader,
-                        "url": clean_url,
-                        "thumbnail_url": slides[0]["thumbnail_url"] if slides else "",
-                        "video_url": "",
-                        "download_url": clean_url,
-                        "caption": info.get("description")
-                        or entries[0].get("description")
-                        or "",
-                        "duration": 0.0,
-                        "view_count": int(info.get("view_count") or 0),
-                        "like_count": int(info.get("like_count") or 0),
-                        "media_type": f"CAROUSEL ({total})",
-                        "carousel_count": total,
-                        "slides": slides,
-                        "quality": self.quality_preset,
-                        "selected": True,
-                        "status": "ready",
-                    }
-                    self.item_found.emit(card)
-                    return
-
-                # Profile list or standalone post items
                 for idx, entry in enumerate(entries, start=1):
                     item_code = str(entry.get("id") or f"media_{idx}")
-                    item_uploader = entry.get("uploader") or uploader
                     entry_url = entry.get("webpage_url") or entry.get("url") or ""
 
                     has_video = bool(
@@ -1457,28 +1035,14 @@ class InspectWorker(QThread):
                         or (entry.get("vcodec") and entry.get("vcodec") != "none")
                         or entry.get("ext") == "mp4"
                         or "/reel/" in entry_url.lower()
-                        or "/reels/" in clean_url.lower()
                         or filter_mode == "reels"
                     )
 
-                    badge_type = (
-                        "REEL"
-                        if (
-                            "/reel/" in entry_url.lower()
-                            or "/reels/" in clean_url.lower()
-                            or filter_mode == "reels"
-                            or has_video
-                        )
-                        else "IMAGE"
-                    )
+                    badge_type = "REEL" if has_video else "IMAGE"
 
-                    if (
-                        filter_mode == "reels"
-                        and badge_type != "REEL"
-                        and not has_video
-                    ):
+                    if filter_mode == "reels" and not has_video:
                         continue
-                    if filter_mode == "photos" and (badge_type == "REEL" or has_video):
+                    if filter_mode == "photos" and has_video:
                         continue
 
                     with self._lock:
@@ -1501,7 +1065,7 @@ class InspectWorker(QThread):
                         "shortcode": item_code,
                         "title": entry.get("title")
                         or f"Instagram {badge_type} #{item_code}",
-                        "username": item_uploader,
+                        "username": entry.get("uploader") or uploader,
                         "url": card_url,
                         "thumbnail_url": entry.get("thumbnail") or "",
                         "video_url": entry.get("url") if has_video else "",
@@ -1518,8 +1082,57 @@ class InspectWorker(QThread):
                         "status": "ready",
                     }
                     self.item_found.emit(card)
+                    self.media_found.emit(card)
         except Exception as ex:
             logger.debug(f"yt-dlp fallback error: {ex}")
+
+    def _fetch_stories_web(self, username: str, user_id: str) -> None:
+        """Fetches active user stories using authenticated endpoints."""
+        found_any = False
+        endpoints = [
+            f"https://i.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
+            f"https://i.instagram.com/api/v1/feed/user/{user_id}/story/",
+        ]
+
+        for ep in endpoints:
+            if self.is_cancelled:
+                return
+            res = self._make_request(
+                ep,
+                caller_tag="StoriesAPI",
+                require_auth=True,
+            )
+            if not res or not isinstance(res, dict):
+                continue
+
+            items = []
+            if "reels" in res and isinstance(res["reels"], dict):
+                items = (res["reels"].get(str(user_id)) or {}).get("items", [])
+            elif "reels_media" in res and res["reels_media"]:
+                items = res["reels_media"][0].get("items", [])
+            elif "items" in res:
+                items = res["items"]
+
+            if items:
+                for idx, item in enumerate(items, start=1):
+                    cards = self._extract_media_cards(item, fallback_username=username)
+                    with self._lock:
+                        for card in cards:
+                            cid = str(card["id"])
+                            card["media_type"] = "STORY"
+                            card["title"] = f"@{username} Story ({idx}/{len(items)})"
+                            if cid not in self.seen_ids:
+                                self.seen_ids.add(cid)
+                                self.item_found.emit(card)
+                                self.media_found.emit(card)
+                                found_any = True
+                if found_any:
+                    return
+
+        if not found_any and not self.is_cancelled:
+            self._inspect_via_ytdlp(
+                f"{IG_BASE_URL}/stories/{username}/", default_username=username
+            )
 
     def _inspect_single_target(self, raw_target: str) -> None:
         """Inspects an individual target URL across chained tiers."""
@@ -1559,88 +1172,54 @@ class InspectWorker(QThread):
         else:
             self._inspect_via_ytdlp(raw_target)
 
-    def _fetch_stories_web(self, username: str, user_id: str) -> None:
-        found_any = False
-        endpoints = [
-            f"https://i.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
-            f"https://i.instagram.com/api/v1/feed/user/{user_id}/story/",
-        ]
-        h = {"User-Agent": MOBILE_USER_AGENT, "X-IG-App-ID": IG_APP_ID}
-        if self.cookie_str:
-            h["Cookie"] = self.cookie_str
-        if self._csrf_token:
-            h["X-CSRFToken"] = self._csrf_token
-
-        for ep in endpoints:
-            if self.is_cancelled:
-                return
-            res = self._make_request(ep, headers=h, caller_tag="StoriesAPI")
-            if not res or not isinstance(res, dict):
-                continue
-
-            items = []
-            if "reels" in res and isinstance(res["reels"], dict):
-                items = (res["reels"].get(str(user_id)) or {}).get("items", [])
-            elif "reels_media" in res and res["reels_media"]:
-                items = res["reels_media"][0].get("items", [])
-            elif "items" in res:
-                items = res["items"]
-
-            if items:
-                for idx, item in enumerate(items, start=1):
-                    cards = self._extract_media_cards(item, fallback_username=username)
-                    with self._lock:
-                        for card in cards:
-                            cid = str(card["id"])
-                            card["media_type"] = "STORY"
-                            card["title"] = f"@{username} Story ({idx}/{len(items)})"
-                            if cid not in self.seen_ids:
-                                self.seen_ids.add(cid)
-                                self.item_found.emit(card)
-                                found_any = True
-                if found_any:
-                    return
-
-        if not found_any and not self.is_cancelled:
-            self._inspect_via_ytdlp(
-                f"{IG_BASE_URL}/stories/{username}/", default_username=username
-            )
-
     def run(self) -> None:
-        """Parallel concurrent execution loop across input targets."""
+        """Sequential rate-limited execution loop across input targets."""
         try:
             total = len(self.targets)
             if total == 0:
                 self.finished.emit(0)
+                self.inspection_finished.emit(0)
                 return
 
             self.progress.emit(10)
-            completed = 0
 
-            workers = min(self.MAX_CONCURRENT_INSPECTS, total)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                self._executor = executor
-                future_to_url = {
-                    executor.submit(self._inspect_single_target, target): target
-                    for target in self.targets
-                }
+            for idx, target in enumerate(self.targets):
+                if self.is_cancelled:
+                    break
 
-                for future in concurrent.futures.as_completed(future_to_url):
-                    if self.is_cancelled:
-                        break
-                    completed += 1
-                    pct = int(10 + (completed / total) * 85)
-                    self.progress.emit(pct)
+                self.status_message.emit(f"Inspecting ({idx + 1}/{total}): {target}")
+                self._inspect_single_target(target)
+
+                pct = int(10 + ((idx + 1) / total) * 85)
+                self.progress.emit(pct)
+
+                # Inter-target cooldown pause to protect account between multiple links
+                if idx < total - 1 and not self.is_cancelled:
+                    cooldown = random.uniform(
+                        INTER_TARGET_COOLDOWN_MIN, INTER_TARGET_COOLDOWN_MAX
+                    )
+                    start_t = time.time()
+                    while time.time() - start_t < cooldown:
+                        if self.is_cancelled:
+                            break
+                        rem = max(0.0, cooldown - (time.time() - start_t))
+                        self.status_message.emit(
+                            f"⏳ Cooldown {rem:.1f}s before next target..."
+                        )
+                        time.sleep(0.5)
 
             self.progress.emit(100)
             with self._lock:
                 total_found = len(self.seen_ids)
                 if total_found <= 4 and not self.cookie_str:
                     self.status_message.emit(
-                        f"Done: {total_found} items found. (Tip: Import logged-in cookies to scrape beyond Instagram's 4-item public limit)."
+                        f"Done: {total_found} items found. (Tip: Import cookies to crawl beyond Instagram's 4-item public limit)."
                     )
                 self.finished.emit(total_found)
+                self.inspection_finished.emit(total_found)
         except Exception as e:
             self.error.emit(f"Inspection error: {str(e)}")
+            self.error_occurred.emit(f"Inspection error: {str(e)}")
             with self._lock:
                 self.finished.emit(len(self.seen_ids))
+                self.inspection_finished.emit(len(self.seen_ids))

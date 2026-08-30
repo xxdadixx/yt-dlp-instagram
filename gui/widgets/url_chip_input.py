@@ -78,21 +78,34 @@ class UrlChipItem(QFrame):
         layout.addWidget(self.url_lbl, 1)
 
         self.del_btn = QPushButton("✕", self)
-        self.del_btn.setFixedSize(20, 20)
+        self.del_btn.setObjectName("ChipDeleteButton")
+        self.del_btn.setFixedSize(22, 22)
         self.del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.del_btn.setStyleSheet(
             """
-            QPushButton {
-                background: rgba(255, 255, 255, 0.05);
+            QPushButton#ChipDeleteButton {
+                background: rgba(255, 255, 255, 0.04);
                 color: #A0A0B2;
-                border: none;
+                border: 1px solid rgba(255, 255, 255, 0.06);
                 font-size: 8pt;
                 font-weight: bold;
-                border-radius: 10px;
+                border-radius: 11px;
+                padding: 0px;
             }
-            QPushButton:hover {
-                background-color: rgba(225, 48, 108, 0.3);
-                color: #FF7597;
+            QPushButton#ChipDeleteButton:hover {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #EF4444,
+                    stop: 1 #DC2626
+                );
+                color: #FFFFFF;
+                border: 1px solid #FFA5A5;
+            }
+            QPushButton#ChipDeleteButton:pressed {
+                background: #991B1B;
+                color: #FECACA;
+                border: 1px solid #7F1D1D;
+                padding-top: 1px;
             }
         """
         )
@@ -163,25 +176,46 @@ class URLChipInput(QObject := QWidget):
         layout.addWidget(self.input_edit, 1)
 
         self.btn_add = QPushButton("+ Add", self.input_widget)
+        self.btn_add.setObjectName("AddUrlButton")
         self.btn_add.setFixedHeight(36)
         self.btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_add.clicked.connect(self._handle_manual_entry)
         self.btn_add.setStyleSheet(
             """
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #833AB4, stop:0.5 #E1306C, stop:1 #F56040);
+            QPushButton#AddUrlButton {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #833AB4,
+                    stop: 0.5 #E1306C,
+                    stop: 1 #F56040
+                );
                 color: #FFFFFF;
-                border: none;
+                border: 1px solid rgba(255, 255, 255, 0.2);
                 border-radius: 8px;
-                padding: 0 16px;
+                padding: 0 18px;
                 font-weight: 700;
                 font-size: 8.5pt;
             }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #9546CD, stop:0.5 #EE3E7A, stop:1 #F77254);
+            QPushButton#AddUrlButton:hover {
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #9546CD,
+                    stop: 0.5 #EE3E7A,
+                    stop: 1 #F77254
+                );
+                border: 1px solid #FFFFFF;
+            }
+            QPushButton#AddUrlButton:pressed {
+                background: #B82556;
+                padding-top: 2px;
+            }
+            QPushButton#AddUrlButton:disabled {
+                background: #1A1822 !important;
+                color: #4B4B5A !important;
+                border: 1px solid rgba(255, 255, 255, 0.04) !important;
             }
         """
         )
-        self.btn_add.clicked.connect(self._handle_manual_entry)
         layout.addWidget(self.btn_add)
 
     def _init_list_view(self) -> None:

@@ -92,6 +92,15 @@ class MainWindow(QMainWindow):
         self.setup_clipboard_monitor()
         self.update_cookie_status()
 
+    def get_all_media_cards(self) -> list[MediaCard]:
+        """Return all active MediaCard widgets currently present in the queue."""
+        if hasattr(self, "cards") and isinstance(self.cards, list):
+            return self.cards
+        if hasattr(self, "media_cards") and isinstance(self.media_cards, list):
+            return self.media_cards
+        # Dynamic fallback: retrieve all child MediaCard instances
+        return self.findChildren(MediaCard)
+
     def tr_text(self, key: str, **kwargs) -> str:
         lang_dict = TRANSLATIONS.get(self.current_lang, TRANSLATIONS["en"])
         val = lang_dict.get(key, TRANSLATIONS["en"].get(key, key))
@@ -138,6 +147,7 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.lbl_cookie_status)
 
         self.btn_import_cookie = QPushButton(self)
+        self.btn_import_cookie.setObjectName("GlassActionButton")
         self._set_button_icon(self.btn_import_cookie, "key", "#FCAF45", 12)
         self.btn_import_cookie.setFixedHeight(28)
         self.btn_import_cookie.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -223,18 +233,19 @@ class MainWindow(QMainWindow):
         queue_bar.addStretch()
 
         self.btn_select_all = QPushButton(self)
+        self.btn_select_all.setObjectName("GlassActionButton")
         self._set_button_icon(self.btn_select_all, "select_all", "#10B981", 12)
-        self.btn_select_all.clicked.connect(self.select_all_cards)
+        self.btn_select_all.clicked.connect(self.toggle_select_all)
         queue_bar.addWidget(self.btn_select_all)
 
         self.btn_delete_selected = QPushButton(self)
         self.btn_delete_selected.setObjectName("DestructiveButton")
         self._set_button_icon(self.btn_delete_selected, "trash", "#FF6B6B", 12)
-        self.btn_delete_selected.setText("Clear All")
-        self.btn_delete_selected.clicked.connect(self.clear_all_cards)
+        self.btn_delete_selected.clicked.connect(self.delete_selected_cards)
         queue_bar.addWidget(self.btn_delete_selected)
 
         self.btn_clear_completed = QPushButton(self)
+        self.btn_clear_completed.setObjectName("GlassActionButton")
         self._set_button_icon(self.btn_clear_completed, "check_double", "#70C5FF", 12)
         self.btn_clear_completed.clicked.connect(self.clear_completed_cards)
         queue_bar.addWidget(self.btn_clear_completed)
@@ -265,11 +276,13 @@ class MainWindow(QMainWindow):
         bot_bar.setSpacing(8)
 
         self.btn_change_folder = QPushButton(self)
+        self.btn_change_folder.setObjectName("GlassActionButton")
         self._set_button_icon(self.btn_change_folder, "folder", "#FCAF45", 13)
         self.btn_change_folder.clicked.connect(self.browse_save_folder)
         bot_bar.addWidget(self.btn_change_folder)
 
         self.btn_open_folder = QPushButton(self)
+        self.btn_open_folder.setObjectName("GlassActionButton")
         self._set_button_icon(self.btn_open_folder, "folder_open", "#F56040", 13)
         self.btn_open_folder.clicked.connect(self.open_save_folder)
         bot_bar.addWidget(self.btn_open_folder)
@@ -476,49 +489,77 @@ class MainWindow(QMainWindow):
         self._update_action_button_states()
         self.smooth_scroll_queue_to_bottom()
 
-    def _on_card_clicked(self, card: MediaCard, modifiers: Qt.KeyboardModifier) -> None:
-        """
-        Handles queue card selection:
-        - Regular Click: Toggles card selection (Selected <-> Deselected).
-        - Shift + Click: Selects range from last anchor card to target card.
-        - Ctrl + Click: Toggles card selection.
-        """
-        if not hasattr(self, "media_cards") or not self.media_cards:
+    def _connect_card_signals(self, card: MediaCard) -> None:
+        """Connect individual card signals."""
+        card.card_clicked.connect(self._on_card_clicked)
+        card.selection_changed.connect(self.update_selection_counter)
+
+    def _on_card_clicked(
+        self, card: MediaCard, modifiers: Optional[Qt.KeyboardModifier] = None
+    ) -> None:
+        """Handle media card toggle, multi-select, and range selection."""
+        if modifiers is None:
+            modifiers = Qt.KeyboardModifier.NoModifier
+
+        cards = self.get_all_media_cards()
+        if not cards or card not in cards:
             return
 
-        if modifiers & Qt.KeyboardModifier.ShiftModifier and getattr(
-            self, "_last_selected_card", None
-        ):
-            try:
-                start_idx = self.media_cards.index(self._last_selected_card)
-                end_idx = self.media_cards.index(card)
-                low, high = min(start_idx, end_idx), max(start_idx, end_idx)
-                for i, c in enumerate(self.media_cards):
-                    c.set_selected(low <= i <= high)
-            except ValueError:
+        # Shift + Click (Range Selection)
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            last_card = getattr(self, "_last_selected_card", None)
+            if last_card and last_card in cards:
+                idx1 = cards.index(last_card)
+                idx2 = cards.index(card)
+                start, end = min(idx1, idx2), max(idx1, idx2)
+                target_state = not card.is_selected
+                for i in range(start, end + 1):
+                    cards[i].set_selected(target_state)
+            else:
                 card.toggle_selected()
-                self._last_selected_card = card
+        # Plain Click or Ctrl + Click -> Toggle Selection
         else:
             card.toggle_selected()
-            self._last_selected_card = card
 
-        self._update_queue_action_buttons()
+        self._last_selected_card = card
+        self.update_selection_counter()
 
-    def _toggle_select_all(self) -> None:
+    def _update_selection_ui(self):
+        """Update header selection counter and download button availability."""
+        cards = self.get_all_media_cards()
+        total_count = len(cards)
+        selected_count = sum(1 for c in cards if c.is_selected)
+
+        # Update queue header label
+        self.queue_header_label.setText(
+            f"Media Queue ({selected_count}/{total_count} Selected)"
+        )
+
+        # Enable/Disable download action button based on active selection
+        self.download_button.setEnabled(selected_count > 0)
+
+        # Sync Select All button text state
+        if total_count > 0 and selected_count == total_count:
+            self.select_all_btn.setText(self.tr("Deselect All"))
+        else:
+            self.select_all_btn.setText(self.tr("Select All"))
+
+    def toggle_select_all(self) -> None:
         """
         Toggles all cards between Selected and Deselected.
         If all are currently selected, deselects all; otherwise selects all.
         """
-        if not hasattr(self, "media_cards") or not self.media_cards:
+        cards = self.get_all_media_cards()
+        if not cards:
             return
 
-        all_selected = all(card.is_selected for card in self.media_cards)
+        all_selected = all(card.is_selected for card in cards)
         new_state = not all_selected
 
-        for card in self.media_cards:
+        for card in cards:
             card.set_selected(new_state)
 
-        self._update_queue_action_buttons()
+        self.update_selection_counter()
 
     def _update_queue_action_buttons(self) -> None:
         """
@@ -676,19 +717,34 @@ class MainWindow(QMainWindow):
             self.remove_card(card)
 
     def update_selection_counter(self) -> None:
-        total = len(self.cards)
-        selected = len([c for c in self.cards if c.is_selected])
+        """Update header selection counter, tab title, and action buttons."""
+        cards = self.get_all_media_cards()
+        total = len(cards)
+        selected = sum(1 for c in cards if c.is_selected)
+
         self.lbl_queue_count.setText(f"Media Queue ({selected}/{total} Selected)")
         self.tab_widget.setTabText(0, f"Media Queue ({selected}/{total})")
+
+        if total > 0 and selected == total:
+            self.btn_select_all.setText(
+                self.tr_text("btn_deselect_all")
+                if "btn_deselect_all" in TRANSLATIONS.get(self.current_lang, {})
+                else "Deselect All"
+            )
+        else:
+            self.btn_select_all.setText(self.tr_text("btn_select_all"))
+
         self._update_action_button_states()
 
     def select_all_cards(self) -> None:
-        for card in self.cards:
+        """Explicitly select all cards in the queue."""
+        for card in self.get_all_media_cards():
             card.set_selected(True)
         self.update_selection_counter()
 
     def deselect_all_cards(self) -> None:
-        for card in self.cards:
+        """Explicitly deselect all cards in the queue."""
+        for card in self.get_all_media_cards():
             card.set_selected(False)
         self.update_selection_counter()
 
@@ -704,14 +760,33 @@ class MainWindow(QMainWindow):
             self.update_selection_counter()
 
     def delete_selected_cards(self) -> None:
-        selected_cards = [c for c in self.cards if c.is_selected]
+        """Remove only the actively selected media cards from the queue."""
+        selected_cards = [c for c in list(self.cards) if c.is_selected]
+        if not selected_cards:
+            self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
+            return
+
         for card in selected_cards:
             self.remove_card(card)
 
     def clear_completed_cards(self) -> None:
-        for card in list(self.cards):
-            if getattr(card, "is_finished", False):
-                self.remove_card(card)
+        """Remove all cards that have finished downloading."""
+        completed_cards = [
+            c
+            for c in list(self.cards)
+            if getattr(c, "status", "").lower() == "finished"
+            or getattr(c, "is_finished", False)
+        ]
+        if not completed_cards:
+            self.show_toast(
+                self.tr_text("toast_no_completed")
+                if "toast_no_completed" in TRANSLATIONS.get(self.current_lang, {})
+                else "No completed items to clear."
+            )
+            return
+
+        for card in completed_cards:
+            self.remove_card(card)
 
     def update_cookie_status(self) -> None:
         if self.cookie_manager.has_cookies():
@@ -809,24 +884,68 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _update_action_button_states(self) -> None:
-        """Enforces mutual safety states between Inspection and Download operations."""
+        """Central state machine enforcing disabled/enabled safety rules across all buttons."""
         is_inspecting = bool(self.inspect_worker and self.inspect_worker.isRunning())
         is_downloading = bool(self.download_worker and self.download_worker.isRunning())
-        has_items = len(self.cards) > 0
 
-        # Inspect button state: Disabled during downloading
+        cards = self.get_all_media_cards()
+        total_count = len(cards)
+        selected_count = sum(1 for c in cards if c.is_selected)
+        completed_count = sum(
+            1
+            for c in cards
+            if getattr(c, "status", "").lower() == "finished"
+            or getattr(c, "is_finished", False)
+        )
+
+        # 1. Inspect Button
         if is_downloading:
             self.btn_inspect.setEnabled(False)
         else:
             self.btn_inspect.setEnabled(True)
 
-        # Download button state: Disabled during inspection or when queue is empty
+        # 2. Download Button
         if is_downloading:
             self.btn_download_all.setEnabled(True)
             self.btn_download_all.setText(self.tr_text("btn_cancel_download"))
-        elif is_inspecting or not has_items:
+        elif is_inspecting or selected_count == 0:
             self.btn_download_all.setEnabled(False)
             self.btn_download_all.setText(self.tr_text("btn_download_selected"))
         else:
             self.btn_download_all.setEnabled(True)
             self.btn_download_all.setText(self.tr_text("btn_download_selected"))
+
+        # 3. Queue Action Buttons
+        if hasattr(self, "btn_select_all"):
+            self.btn_select_all.setEnabled(total_count > 0 and not is_downloading)
+
+        if hasattr(self, "btn_delete_selected"):
+            self.btn_delete_selected.setEnabled(
+                selected_count > 0 and not is_downloading
+            )
+
+        if hasattr(self, "btn_clear_completed"):
+            self.btn_clear_completed.setEnabled(
+                completed_count > 0 and not is_downloading
+            )
+
+        # 4. Settings & Environment Controls
+        if hasattr(self, "btn_import_cookie"):
+            self.btn_import_cookie.setEnabled(not is_inspecting and not is_downloading)
+
+        if hasattr(self, "btn_change_folder"):
+            self.btn_change_folder.setEnabled(not is_downloading)
+
+        if hasattr(self, "combo_profile_mode"):
+            self.combo_profile_mode.setEnabled(not is_inspecting and not is_downloading)
+
+        # 5. URL Input Bar Actions
+        if hasattr(self, "url_container"):
+            url_count = self.url_container.count()
+            self.url_container.btn_clear_all.setEnabled(
+                url_count > 0 and not is_inspecting
+            )
+
+            # Disable adding during inspection
+            input_has_text = bool(self.url_container.input_edit.text().strip())
+            self.url_container.btn_add.setEnabled(input_has_text and not is_inspecting)

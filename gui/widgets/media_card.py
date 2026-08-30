@@ -4,15 +4,26 @@ gui/widgets/media_card.py - Instagram-styled Media Card with interactive hover z
 
 from __future__ import annotations
 
+from __future__ import annotations
+
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
-from PyQt6.QtCore import QByteArray, QPoint, Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QPainter, QPainterPath, QPixmap
+from PyQt6.QtCore import QByteArray, QPoint, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+    QRadialGradient,
+    QLinearGradient,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -25,36 +36,69 @@ from gui.widgets.thumbnail_loader import ThumbnailLoader
 
 logger = logging.getLogger(__name__)
 
+TYPE_STYLES = {
+    "CAROUSEL": {
+        "bg": "rgba(245, 96, 64, 0.16)",
+        "color": "#F56040",
+        "border": "rgba(245, 96, 64, 0.40)",
+    },
+    "REEL": {
+        "bg": "rgba(225, 48, 108, 0.18)",
+        "color": "#E1306C",
+        "border": "rgba(225, 48, 108, 0.45)",
+    },
+    "VIDEO": {
+        "bg": "rgba(168, 85, 247, 0.16)",
+        "color": "#A855F7",
+        "border": "rgba(168, 85, 247, 0.40)",
+    },
+    "IMAGE": {
+        "bg": "rgba(56, 189, 248, 0.16)",
+        "color": "#38BDF8",
+        "border": "rgba(56, 189, 248, 0.40)",
+    },
+    "PHOTO": {
+        "bg": "rgba(56, 189, 248, 0.16)",
+        "color": "#38BDF8",
+        "border": "rgba(56, 189, 248, 0.40)",
+    },
+    "STORY": {
+        "bg": "rgba(236, 72, 153, 0.16)",
+        "color": "#F472B6",
+        "border": "rgba(236, 72, 153, 0.40)",
+    },
+}
+
 STATUS_STYLES = {
     "ready": {
         "text": "READY",
-        "bg": "rgba(255, 255, 255, 0.06)",
-        "color": "#A0A0B2",
-        "border": "rgba(255, 255, 255, 0.1)",
+        "bg": "rgba(255, 255, 255, 0.05)",
+        "color": "#94A3B8",
+        "border": "rgba(255, 255, 255, 0.12)",
     },
     "queued": {
         "text": "QUEUED",
-        "bg": "rgba(252, 175, 69, 0.18)",
+        "bg": "rgba(252, 175, 69, 0.16)",
         "color": "#FCAF45",
-        "border": "rgba(252, 175, 69, 0.4)",
+        "border": "rgba(252, 175, 69, 0.45)",
     },
     "downloading": {
         "text": "DOWNLOADING",
         "bg": "rgba(225, 48, 108, 0.22)",
         "color": "#FF7597",
-        "border": "rgba(225, 48, 108, 0.5)",
+        "border": "rgba(225, 48, 108, 0.55)",
     },
     "finished": {
         "text": "COMPLETED",
-        "bg": "rgba(16, 185, 129, 0.22)",
-        "color": "#6EE7B7",
-        "border": "rgba(16, 185, 129, 0.5)",
+        "bg": "rgba(16, 185, 129, 0.18)",
+        "color": "#34D399",
+        "border": "rgba(16, 185, 129, 0.50)",
     },
     "error": {
         "text": "FAILED",
-        "bg": "rgba(239, 68, 68, 0.22)",
-        "color": "#FF6B6B",
-        "border": "rgba(239, 68, 68, 0.5)",
+        "bg": "rgba(239, 68, 68, 0.18)",
+        "color": "#F87171",
+        "border": "rgba(239, 68, 68, 0.50)",
     },
 }
 
@@ -62,9 +106,7 @@ logger = logging.getLogger(__name__)
 
 
 class ThumbnailHoverPopup(QWidget):
-    """
-    Floating enlarged thumbnail preview popup with drop shadow and Instagram styling.
-    """
+    """Floating enlarged thumbnail preview popup with Liquid Glass rim and deep drop shadow."""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(
@@ -72,173 +114,231 @@ class ThumbnailHoverPopup(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self._init_ui()
 
-    def _init_ui(self) -> None:
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(14)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
 
-        # 1. Rounded Thumbnail Preview (Clickable Lightbox)
-        self.lbl_thumb = QLabel("Loading...", self)
-        self.lbl_thumb.setFixedSize(64, 64)
-        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.lbl_thumb.setStyleSheet(
-            "background-color: #21212B; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08); color: #71717A;"
+        self.frame = QFrame(self)
+        self.frame.setStyleSheet(
+            """
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1A1728, stop:1 #100E1A);
+                border: 1.5px solid rgba(225, 48, 108, 0.6);
+                border-radius: 14px;
+            }
+        """
         )
-        self.lbl_thumb.setFont(self._get_app_font(size=8))
-        self.lbl_thumb.mousePressEvent = lambda e: self.open_image_gallery()
-        layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
+        frame_layout = QVBoxLayout(self.frame)
+        frame_layout.setContentsMargins(8, 8, 8, 8)
 
-        # 2. Details Column (Title & Metadata)
-        details_layout = QVBoxLayout()
-        details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.setSpacing(5)
+        self.lbl_image = QLabel(self.frame)
+        self.lbl_image.setFixedSize(224, 298)
+        self.lbl_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_image.setStyleSheet("border-radius: 10px; background-color: #0B0A11;")
+        frame_layout.addWidget(self.lbl_image)
 
-        raw_title = str(
-            self.item_data.get("title")
-            or self.item_data.get("caption")
-            or "Instagram Media"
-        ).strip()
-        display_title = raw_title.splitlines()[0] if raw_title else "Instagram Media"
-        if len(display_title) > 95:
-            display_title = display_title[:92] + "..."
+        layout.addWidget(self.frame)
 
-        self.lbl_title = QLabel(display_title, self)
-        self.lbl_title.setObjectName("CardTitle")
-        self.lbl_title.setFont(self._get_app_font(size=10, bold=True))
-        self.lbl_title.setStyleSheet("color: #FFFFFF;")
-        details_layout.addWidget(self.lbl_title)
-
-        meta_row = QHBoxLayout()
-        meta_row.setContentsMargins(0, 0, 0, 0)
-        meta_row.setSpacing(8)
-
-        # Username Tag
-        raw_username = str(self.item_data.get("username") or "instagram").strip()
-        display_username = (
-            f"@{raw_username}" if not raw_username.startswith("@") else raw_username
-        )
-        self.lbl_username = QLabel(display_username, self)
-        self.lbl_username.setObjectName("CardUsername")
-        self.lbl_username.setFont(self._get_app_font(size=9, bold=True))
-        self.lbl_username.setStyleSheet("color: #38BDF8;")
-        meta_row.addWidget(self.lbl_username)
-
-        # Media Type Capsule Badge
-        badge_type = str(self.item_data.get("media_type") or "MEDIA").upper()
-        self.lbl_badge = QLabel(badge_type, self)
-        self.lbl_badge.setObjectName("CardBadge")
-        self.lbl_badge.setFont(self._get_app_font(size=8, bold=True))
-        self.lbl_badge.setStyleSheet(
-            "background-color: rgba(245, 96, 64, 0.18); color: #F56040; border-radius: 4px; padding: 2px 6px;"
-        )
-        meta_row.addWidget(self.lbl_badge)
-
-        # Likes / Views Metadata
-        likes = self.item_data.get("like_count") or 0
-        views = self.item_data.get("view_count") or 0
-        meta_parts = []
-        if likes > 0:
-            meta_parts.append(f"❤️ {likes:,}")
-        if views > 0:
-            meta_parts.append(f"👁️ {views:,}")
-        meta_str = " • ".join(meta_parts) if meta_parts else f"ID: {self.item_id[:12]}"
-
-        self.lbl_meta = QLabel(meta_str, self)
-        self.lbl_meta.setObjectName("CardMeta")
-        self.lbl_meta.setFont(self._get_app_font(size=9))
-        self.lbl_meta.setStyleSheet("color: #94A3B8;")
-        meta_row.addWidget(self.lbl_meta)
-        meta_row.addStretch()
-
-        details_layout.addLayout(meta_row)
-        layout.addLayout(details_layout, stretch=1)
-
-        # 3. Status Badge & Quick Remove Button
-        action_col = QHBoxLayout()
-        action_col.setContentsMargins(0, 0, 0, 0)
-        action_col.setSpacing(8)
-        action_col.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-
-        self.lbl_status = QLabel(self.status.upper(), self)
-        self.lbl_status.setObjectName("StatusPillReady")
-        self.lbl_status.setFont(self._get_app_font(size=8, bold=True))
-        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status.setStyleSheet(
-            "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
-        )
-        action_col.addWidget(self.lbl_status)
-
-        self.btn_delete = QPushButton("✕", self)
-        self.btn_delete.setFixedSize(24, 24)
-        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_delete.setFont(self._get_app_font(size=9, bold=True))
-        self.btn_delete.setStyleSheet(
-            "QPushButton { background-color: transparent; color: #71717A; border: none; border-radius: 12px; }"
-            "QPushButton:hover { background-color: rgba(239, 68, 68, 0.2); color: #EF4444; }"
-        )
-        self.btn_delete.clicked.connect(self.deleted.emit)
-        action_col.addWidget(self.btn_delete)
-
-        layout.addLayout(action_col)
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(0, 0, 0, 200))
+        self.frame.setGraphicsEffect(shadow)
 
     def set_preview_pixmap(self, pixmap: QPixmap) -> None:
         if pixmap and not pixmap.isNull():
+            target_w, target_h = 224, 298
             scaled = pixmap.scaled(
-                210,
-                280,
+                target_w,
+                target_h,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            cw, ch = scaled.width(), scaled.height()
-            cropped = scaled.copy(
-                max(0, (cw - 210) // 2), max(0, (ch - 280) // 2), 210, 280
-            )
-            self.lbl_image.setPixmap(cropped)
+            crop_x = max(0, (scaled.width() - target_w) // 2)
+            crop_y = max(0, (scaled.height() - target_h) // 2)
+            cropped = scaled.copy(crop_x, crop_y, target_w, target_h)
+
+            rounded = QPixmap(target_w, target_h)
+            rounded.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(rounded)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, target_w, target_h), 10.0, 10.0)
+            painter.setClipPath(path)
+            painter.drawPixmap(0, 0, cropped)
+            painter.end()
+
+            self.lbl_image.setPixmap(rounded)
 
 
-class HoverThumbnailLabel(QLabel):
+class Elevated3DThumbnail(QLabel):
     """
-    Interactive thumbnail widget that shows a floating enlarged preview on hover.
+    Top Layer (Z=24px): 3D Elevated Thumbnail casting ambient occlusion shadows
+    onto the liquid glass card base plate.
     """
 
-    def __init__(self, item_data: Dict[str, Any], parent: Optional[QWidget] = None):
+    clicked = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.item_data: Dict[str, Any] = item_data or {}
-        self.item_id: str = str(
-            self.item_data.get("id")
-            or self.item_data.get("shortcode")
-            or self.item_data.get("url")
-            or "item"
-        )
-        self.is_selected: bool = bool(self.item_data.get("selected", True))
-        self.status: str = str(self.item_data.get("status", "ready"))
-        self.thumb_loader: Optional[ThumbnailLoader] = None
+        self._raw_pixmap: Optional[QPixmap] = None
+        self._preview_popup: Optional[ThumbnailHoverPopup] = None
 
-        self.setObjectName("MediaCardFrame")
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-        self._init_ui()
-        self._load_thumbnail()
+        self.setFixedSize(68, 68)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setText("...")
+        self.setStyleSheet(
+            """
+            QLabel {
+                background-color: #171522;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 10px;
+                color: #64748B;
+            }
+        """
+        )
+
+        # 3D Elevation Ambient Occlusion Drop Shadow
+        self._elev_shadow = QGraphicsDropShadowEffect(self)
+        self._elev_shadow.setBlurRadius(14)
+        self._elev_shadow.setOffset(0, 4)
+        self._elev_shadow.setColor(QColor(0, 0, 0, 160))
+        self.setGraphicsEffect(self._elev_shadow)
 
     def set_thumbnail_pixmap(self, pixmap: QPixmap) -> None:
         self._raw_pixmap = pixmap
-        if pixmap and not pixmap.isNull():
-            scaled = pixmap.scaled(
-                44,
-                54,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            cw, ch = scaled.width(), scaled.height()
-            cropped = scaled.copy(
-                max(0, (cw - 44) // 2), max(0, (ch - 54) // 2), 44, 54
-            )
-            self.setPixmap(cropped)
-            self.setText("")
+        if not pixmap or pixmap.isNull():
+            self.setText("NO IMG")
+            return
+
+        scaled = pixmap.scaled(
+            68,
+            68,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        crop_x = max(0, (scaled.width() - 68) // 2)
+        crop_y = max(0, (scaled.height() - 68) // 2)
+        cropped = scaled.copy(crop_x, crop_y, 68, 68)
+
+        rounded = QPixmap(68, 68)
+        rounded.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(rounded)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, 68, 68), 10.0, 10.0)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, cropped)
+        painter.end()
+
+        self.setText("")
+        self.setPixmap(rounded)
+
+    def enterEvent(self, event) -> None:
+        self._elev_shadow.setBlurRadius(20)
+        self._elev_shadow.setOffset(0, 6)
+        self._elev_shadow.setColor(QColor(225, 48, 108, 110))
+
+        if self._raw_pixmap and not self._raw_pixmap.isNull():
+            if not self._preview_popup:
+                self._preview_popup = ThumbnailHoverPopup()
+
+            self._preview_popup.set_preview_pixmap(self._raw_pixmap)
+            global_pos = self.mapToGlobal(QPoint(self.width() + 16, -115))
+            screen = QApplication.primaryScreen()
+            if screen:
+                screen_geom = screen.availableGeometry()
+                if global_pos.x() + 250 > screen_geom.right():
+                    global_pos.setX(self.mapToGlobal(QPoint(0, 0)).x() - 260)
+                if global_pos.y() + 330 > screen_geom.bottom():
+                    global_pos.setY(screen_geom.bottom() - 335)
+                if global_pos.y() < screen_geom.top():
+                    global_pos.setY(screen_geom.top() + 10)
+
+            self._preview_popup.move(global_pos)
+            self._preview_popup.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._elev_shadow.setBlurRadius(14)
+        self._elev_shadow.setOffset(0, 4)
+        self._elev_shadow.setColor(QColor(0, 0, 0, 160))
+        if self._preview_popup:
+            self._preview_popup.hide()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._preview_popup:
+                self._preview_popup.hide()
+            self.clicked.emit()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+
+class HoverThumbnailLabel(QLabel):
+    """Interactive thumbnail widget that shows an enlarged floating preview on hover."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._raw_pixmap: Optional[QPixmap] = None
+        self._preview_popup: Optional[ThumbnailHoverPopup] = None
+
+        self.setFixedSize(66, 66)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setText("...")
+        self.setStyleSheet(
+            """
+            QLabel {
+                background-color: #1a1a24;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+                color: #64748B;
+            }
+            QLabel:hover {
+                border: 1px solid rgba(225, 48, 108, 0.6);
+            }
+        """
+        )
+
+    def set_thumbnail_pixmap(self, pixmap: QPixmap) -> None:
+        self._raw_pixmap = pixmap
+        if not pixmap or pixmap.isNull():
+            self.setText("NO IMG")
+            return
+
+        scaled = pixmap.scaled(
+            66,
+            66,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        crop_x = max(0, (scaled.width() - 66) // 2)
+        crop_y = max(0, (scaled.height() - 66) // 2)
+        cropped = scaled.copy(crop_x, crop_y, 66, 66)
+
+        rounded = QPixmap(66, 66)
+        rounded.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(rounded)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, 66, 66), 8.0, 8.0)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, cropped)
+        painter.end()
+
+        self.setText("")
+        self.setPixmap(rounded)
 
     def enterEvent(self, event) -> None:
         if self._raw_pixmap and not self._raw_pixmap.isNull():
@@ -247,14 +347,15 @@ class HoverThumbnailLabel(QLabel):
 
             self._preview_popup.set_preview_pixmap(self._raw_pixmap)
 
-            global_pos = self.mapToGlobal(QPoint(self.width() + 12, -110))
+            # Position popup to the right with screen boundary bounds checking
+            global_pos = self.mapToGlobal(QPoint(self.width() + 14, -110))
             screen = QApplication.primaryScreen()
             if screen:
                 screen_geom = screen.availableGeometry()
-                if global_pos.x() + 230 > screen_geom.right():
-                    global_pos.setX(self.mapToGlobal(QPoint(0, 0)).x() - 240)
-                if global_pos.y() + 300 > screen_geom.bottom():
-                    global_pos.setY(screen_geom.bottom() - 305)
+                if global_pos.x() + 250 > screen_geom.right():
+                    global_pos.setX(self.mapToGlobal(QPoint(0, 0)).x() - 255)
+                if global_pos.y() + 320 > screen_geom.bottom():
+                    global_pos.setY(screen_geom.bottom() - 325)
                 if global_pos.y() < screen_geom.top():
                     global_pos.setY(screen_geom.top() + 10)
 
@@ -268,91 +369,122 @@ class HoverThumbnailLabel(QLabel):
             self._preview_popup.hide()
         super().leaveEvent(event)
 
-    def hide_popup(self) -> None:
-        if self._preview_popup:
-            self._preview_popup.hide()
-            self._preview_popup.deleteLater()
-            self._preview_popup = None
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._preview_popup:
+                self._preview_popup.hide()
+            self.clicked.emit()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
 
 class MediaCard(QFrame):
-    card_clicked = pyqtSignal(object, object)  # Emits (self, Qt.KeyboardModifier)
-    deleted = pyqtSignal()
-    selection_changed = pyqtSignal()
+    """
+    2.5D Liquid Glass Media Card Container with dynamic cursor-tracking caustics
+    and specular light reflections.
+    """
 
-    def __init__(self, item_data: Dict[str, Any], parent: Optional[QWidget] = None):
+    card_clicked = pyqtSignal(object, Qt.KeyboardModifier)
+    clicked = card_clicked
+    selection_changed = pyqtSignal(bool)
+    deleted = pyqtSignal(object)
+
+    def __init__(self, media_item: dict, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.item_data: Dict[str, Any] = item_data or {}
+        self.item_data: Dict[str, Any] = media_item or {}
+        self._is_selected: bool = bool(self.item_data.get("selected", True))
         self.item_id: str = str(
             self.item_data.get("id")
             or self.item_data.get("shortcode")
             or self.item_data.get("url")
             or "item"
         )
-        self.is_selected: bool = bool(self.item_data.get("selected", True))
         self.status: str = str(self.item_data.get("status", "ready"))
         self.thumb_loader: Optional[ThumbnailLoader] = None
 
-        self.setObjectName("MediaCardFrame")
-        self.setFrameShape(QFrame.Shape.StyledPanel)
+        # Interaction & Specular Physics Tracking
+        self._cursor_pos: QPointF = QPointF(-100, -100)
+        self._is_hovered: bool = False
+        self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("LiquidMediaCard")
+        self.setFixedHeight(88)
+
+        # Ambient Base Tray Glow
+        self._tray_glow = QGraphicsDropShadowEffect(self)
+        self._tray_glow.setOffset(0, 4)
+        self.setGraphicsEffect(self._tray_glow)
 
         self._init_ui()
-        self._update_selection_style()
+        self._set_children_transparent()
+        self.update_style()
         self._load_thumbnail()
 
-    def _get_app_font(self, size: int = 9, bold: bool = False) -> QFont:
-        valid_size = max(8, int(size))
-        font = QFont("Segoe UI", valid_size)
+    @property
+    def is_selected(self) -> bool:
+        return self._is_selected
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status.lower() == "finished"
+
+    def _get_app_font(
+        self, size: int = 9, bold: bool = False, weight: Optional[QFont.Weight] = None
+    ) -> QFont:
+        font = QFont("Segoe UI Variable Display", max(8, int(size)))
         font.setFamilies(
-            ["Segoe UI", "Leelawadee UI", "Tahoma", "Noto Sans Thai", "sans-serif"]
+            [
+                "-apple-system",
+                "SF Pro Display",
+                "Segoe UI Variable Display",
+                "Segoe UI",
+                "sans-serif",
+            ]
         )
-        if bold:
+        if weight is not None:
+            font.setWeight(weight)
+        elif bold:
             font.setWeight(QFont.Weight.Bold)
         return font
 
     def _init_ui(self) -> None:
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(12, 10, 14, 10)
         layout.setSpacing(14)
 
-        # 1. Rounded Thumbnail Preview (Clickable Lightbox)
-        self.lbl_thumb = QLabel(self)
-        self.lbl_thumb.setText("Loading...")
-        self.lbl_thumb.setFixedSize(64, 64)
-        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.lbl_thumb.setStyleSheet(
-            "background-color: #21212B; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08); color: #71717A;"
-        )
-        self.lbl_thumb.setFont(self._get_app_font(size=8))
-        self.lbl_thumb.mousePressEvent = lambda e: self.open_image_gallery()
+        # 1. Top Layer: Elevated 3D Thumbnail (Z=24)
+        self.lbl_thumb = Elevated3DThumbnail(self)
+        self.lbl_thumb.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_thumb.clicked.connect(self.open_image_gallery)
         layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        # 2. Details Column (Title & Metadata)
+        # 2. Middle Layer: Etched Metadata Surface
         details_layout = QVBoxLayout()
-        details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.setSpacing(5)
+        details_layout.setContentsMargins(0, 2, 0, 2)
+        details_layout.setSpacing(6)
 
+        # Title
         raw_title = str(
             self.item_data.get("title")
             or self.item_data.get("caption")
             or "Instagram Media"
         ).strip()
         display_title = raw_title.splitlines()[0] if raw_title else "Instagram Media"
-        if len(display_title) > 95:
-            display_title = display_title[:92] + "..."
+        if len(display_title) > 92:
+            display_title = display_title[:89] + "..."
 
         self.lbl_title = QLabel(display_title, self)
         self.lbl_title.setObjectName("CardTitle")
-        self.lbl_title.setFont(self._get_app_font(size=10, bold=True))
-        self.lbl_title.setStyleSheet("color: #FFFFFF;")
-        self.lbl_title.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        self.lbl_title.setFont(
+            self._get_app_font(size=10, weight=QFont.Weight.DemiBold)
+        )
+        self.lbl_title.setStyleSheet(
+            "color: #F8FAFC; background: transparent; border: none;"
         )
         details_layout.addWidget(self.lbl_title)
 
+        # Metadata Badges Row
         meta_row = QHBoxLayout()
         meta_row.setContentsMargins(0, 0, 0, 0)
         meta_row.setSpacing(8)
@@ -365,26 +497,45 @@ class MediaCard(QFrame):
         self.lbl_username = QLabel(display_username, self)
         self.lbl_username.setObjectName("CardUsername")
         self.lbl_username.setFont(self._get_app_font(size=9, bold=True))
-        self.lbl_username.setStyleSheet("color: #38BDF8;")
-        self.lbl_username.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        self.lbl_username.setStyleSheet(
+            "color: #38BDF8; background: transparent; border: none;"
         )
         meta_row.addWidget(self.lbl_username)
 
-        # Media Type Capsule Badge
+        # Etched Pill Badge
         badge_type = str(self.item_data.get("media_type") or "MEDIA").upper()
-        self.lbl_badge = QLabel(badge_type, self)
+        slides_count = len(self.item_data.get("slides") or [])
+        badge_label_text = (
+            f"{badge_type} ({slides_count})"
+            if "CAROUSEL" in badge_type and slides_count > 0
+            else badge_type
+        )
+
+        style_info = TYPE_STYLES.get(
+            badge_type.split()[0],
+            {
+                "bg": "rgba(255, 255, 255, 0.08)",
+                "color": "#E2E8F0",
+                "border": "rgba(255, 255, 255, 0.15)",
+            },
+        )
+        self.lbl_badge = QLabel(badge_label_text, self)
         self.lbl_badge.setObjectName("CardBadge")
         self.lbl_badge.setFont(self._get_app_font(size=8, bold=True))
         self.lbl_badge.setStyleSheet(
-            "background-color: rgba(245, 96, 64, 0.18); color: #F56040; border-radius: 4px; padding: 2px 6px;"
-        )
-        self.lbl_badge.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+            f"""
+            QLabel {{
+                background-color: {style_info['bg']};
+                color: {style_info['color']};
+                border: 1px solid {style_info['border']};
+                border-radius: 5px;
+                padding: 1px 7px;
+            }}
+        """
         )
         meta_row.addWidget(self.lbl_badge)
 
-        # Likes / Views Metadata
+        # Engagement Stats
         likes = self.item_data.get("like_count") or 0
         views = self.item_data.get("view_count") or 0
         meta_parts = []
@@ -397,9 +548,8 @@ class MediaCard(QFrame):
         self.lbl_meta = QLabel(meta_str, self)
         self.lbl_meta.setObjectName("CardMeta")
         self.lbl_meta.setFont(self._get_app_font(size=9))
-        self.lbl_meta.setStyleSheet("color: #94A3B8;")
-        self.lbl_meta.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        self.lbl_meta.setStyleSheet(
+            "color: #94A3B8; background: transparent; border: none;"
         )
         meta_row.addWidget(self.lbl_meta)
         meta_row.addStretch()
@@ -407,84 +557,204 @@ class MediaCard(QFrame):
         details_layout.addLayout(meta_row)
         layout.addLayout(details_layout, stretch=1)
 
-        # 3. Status Badge & Quick Remove Button
+        # 3. Liquid Status Capsule & Crimson Bevel Delete
         action_col = QHBoxLayout()
         action_col.setContentsMargins(0, 0, 0, 0)
-        action_col.setSpacing(8)
+        action_col.setSpacing(10)
         action_col.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
 
-        self.lbl_status = QLabel(self.status.upper(), self)
-        self.lbl_status.setObjectName("StatusPillReady")
+        self.lbl_status = QLabel(self)
+        self.lbl_status.setObjectName("CardStatusPill")
         self.lbl_status.setFont(self._get_app_font(size=8, bold=True))
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status.setStyleSheet(
-            "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
-        )
-        self.lbl_status.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
-        )
+        self.set_status(self.status)
         action_col.addWidget(self.lbl_status)
 
         self.btn_delete = QPushButton("✕", self)
-        self.btn_delete.setFixedSize(24, 24)
+        self.btn_delete.setObjectName("CardDeleteButton")
+        self.btn_delete.setFixedSize(26, 26)
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_delete.setFont(self._get_app_font(size=9, bold=True))
         self.btn_delete.setStyleSheet(
-            "QPushButton { background-color: transparent; color: #71717A; border: none; border-radius: 12px; }"
-            "QPushButton:hover { background-color: rgba(239, 68, 68, 0.2); color: #EF4444; }"
+            """
+            QPushButton#CardDeleteButton {
+                background-color: rgba(255, 255, 255, 0.03);
+                color: #71717A;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 13px;
+                padding: 0px;
+            }
+            QPushButton#CardDeleteButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #EF4444, stop:1 #DC2626);
+                color: #FFFFFF;
+                border: 1px solid #FFA5A5;
+            }
+            QPushButton#CardDeleteButton:pressed {
+                background: #991B1B;
+                color: #FECACA;
+                padding-top: 1px;
+            }
+            QPushButton#CardDeleteButton:disabled {
+                background-color: transparent !important;
+                color: #383842 !important;
+                border: 1px solid rgba(255, 255, 255, 0.02) !important;
+            }
+        """
         )
-        self.btn_delete.clicked.connect(self.deleted.emit)
+        self.btn_delete.clicked.connect(lambda: self.deleted.emit(self))
         action_col.addWidget(self.btn_delete)
 
         layout.addLayout(action_col)
 
-    def _update_selection_style(self) -> None:
-        self.setProperty("selected", self.is_selected)
-        if self.is_selected:
-            self.setStyleSheet(
-                """
-                QFrame#MediaCardFrame, #MediaCardFrame {
-                    background-color: #232334 !important;
-                    border: 1.5px solid #E1306C !important;
-                    border-radius: 10px;
-                }
-                """
-            )
-        else:
-            self.setStyleSheet(
-                """
-                QFrame#MediaCardFrame, #MediaCardFrame {
-                    background-color: #171720 !important;
-                    border: 1px solid #282836 !important;
-                    border-radius: 10px;
-                }
-                QFrame#MediaCardFrame:hover, #MediaCardFrame:hover {
-                    background-color: #1E1E2A !important;
-                    border: 1px solid #3E3E52 !important;
-                }
-                """
-            )
-        self.style().unpolish(self)
-        self.style().polish(self)
+    def _set_children_transparent(self) -> None:
+        """Permit mouse movement tracking through child labels for caustics calculation."""
+        for label in (
+            self.lbl_title,
+            self.lbl_username,
+            self.lbl_badge,
+            self.lbl_meta,
+            self.lbl_status,
+        ):
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """Track cursor position across the card surface for specular highlights."""
+        self._cursor_pos = event.position()
         self.update()
+        super().mouseMoveEvent(event)
 
-    def set_selected(self, selected: bool) -> None:
-        self.is_selected = bool(selected)
-        self.item_data["selected"] = self.is_selected
-        self._update_selection_style()
-        self.selection_changed.emit()
+    def enterEvent(self, event) -> None:
+        self._is_hovered = True
+        self.update_style()
+        super().enterEvent(event)
 
-    def toggle_selected(self) -> None:
-        self.set_selected(not self.is_selected)
+    def leaveEvent(self, event) -> None:
+        self._is_hovered = False
+        self._cursor_pos = QPointF(-100, -100)
+        self.update_style()
+        self.update()
+        super().leaveEvent(event)
 
-    def mousePressEvent(self, event) -> None:
+    def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.card_clicked.emit(self, event.modifiers())
             event.accept()
         else:
             super().mousePressEvent(event)
+
+    def paintEvent(self, event) -> None:
+        """
+        Custom Liquid Glass Painter:
+        1. Frosted acrylic base plate.
+        2. Mouse-tracked dynamic specular caustics shine.
+        3. Light-source top-bevel gradient border.
+        """
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = float(self.width()), float(self.height())
+        rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+        card_path = QPainterPath()
+        card_path.addRoundedRect(rect, 12.0, 12.0)
+
+        # 1. Base Glass Tray Fill
+        base_grad = QLinearGradient(0, 0, w, h)
+        if self._is_selected:
+            base_grad.setColorAt(0.0, QColor(32, 24, 46, 210))
+            base_grad.setColorAt(1.0, QColor(20, 17, 30, 230))
+        else:
+            base_grad.setColorAt(0.0, QColor(24, 22, 34, 180))
+            base_grad.setColorAt(1.0, QColor(14, 13, 20, 210))
+
+        painter.fillPath(card_path, base_grad)
+
+        # 2. Specular Caustics Follow Light (Hover Radial Flare)
+        if self._is_hovered and self._cursor_pos.x() >= 0:
+            specular = QRadialGradient(self._cursor_pos, 160.0)
+            specular_color = (
+                QColor(255, 255, 255, 28)
+                if not self._is_selected
+                else QColor(255, 117, 151, 40)
+            )
+            specular.setColorAt(0.0, specular_color)
+            specular.setColorAt(1.0, QColor(255, 255, 255, 0))
+
+            painter.save()
+            painter.setClipPath(card_path)
+            painter.fillPath(card_path, specular)
+            painter.restore()
+
+        # 3. Polished Glass Gradient Border (Light on Top-Left -> Dark Bottom-Right)
+        border_grad = QLinearGradient(0, 0, w, h)
+        if self._is_selected:
+            border_grad.setColorAt(0.0, QColor(255, 60, 120, 240))
+            border_grad.setColorAt(0.5, QColor(225, 48, 108, 180))
+            border_grad.setColorAt(1.0, QColor(131, 58, 180, 120))
+            border_width = 1.6
+        else:
+            if self._is_hovered:
+                border_grad.setColorAt(0.0, QColor(255, 255, 255, 90))
+                border_grad.setColorAt(0.6, QColor(255, 255, 255, 30))
+                border_grad.setColorAt(1.0, QColor(255, 255, 255, 10))
+                border_width = 1.2
+            else:
+                border_grad.setColorAt(0.0, QColor(255, 255, 255, 45))
+                border_grad.setColorAt(0.7, QColor(255, 255, 255, 15))
+                border_grad.setColorAt(1.0, QColor(255, 255, 255, 5))
+                border_width = 1.0
+
+        painter.strokePath(card_path, painter.pen().color().fromRgb(0, 0, 0, 0))
+        pen = painter.pen()
+        pen.setBrush(border_grad)
+        pen.setWidthF(border_width)
+        painter.setPen(pen)
+        painter.drawPath(card_path)
+
+        painter.end()
+        super().paintEvent(event)
+
+    def set_selected(self, selected: bool) -> None:
+        if self._is_selected != selected:
+            self._is_selected = selected
+            self.item_data["selected"] = selected
+            self.update_style()
+            self.selection_changed.emit(self._is_selected)
+
+    def toggle_selected(self) -> None:
+        self.set_selected(not self._is_selected)
+
+    def update_style(self) -> None:
+        """Update neon ambient shadow glow based on selection and hover elevation."""
+        if self._is_selected:
+            self._tray_glow.setBlurRadius(20 if self._is_hovered else 14)
+            self._tray_glow.setColor(
+                QColor(225, 48, 108, 90 if self._is_hovered else 65)
+            )
+        else:
+            self._tray_glow.setBlurRadius(12 if self._is_hovered else 8)
+            self._tray_glow.setColor(QColor(0, 0, 0, 140 if self._is_hovered else 100))
+        self.update()
+
+    def set_status(self, status: str) -> None:
+        self.status = status
+        self.item_data["status"] = status
+        cfg = STATUS_STYLES.get(status.lower(), STATUS_STYLES["ready"])
+        self.lbl_status.setText(cfg["text"])
+        self.lbl_status.setStyleSheet(
+            f"""
+            QLabel#CardStatusPill {{
+                background-color: {cfg['bg']};
+                color: {cfg['color']};
+                border: 1px solid {cfg['border']};
+                border-radius: 5px;
+                padding: 3px 10px;
+            }}
+        """
+        )
+        if hasattr(self, "btn_delete"):
+            self.btn_delete.setEnabled(status.lower() != "downloading")
 
     def _load_thumbnail(self) -> None:
         thumb_url = self.item_data.get("thumbnail_url")
@@ -494,7 +764,7 @@ class MediaCard(QFrame):
                 thumb_url = slides[0].get("thumbnail_url")
 
         if not thumb_url:
-            self.lbl_thumb.setText("No Image")
+            self.lbl_thumb.setText("NO IMG")
             return
 
         self.thumb_loader = ThumbnailLoader(thumb_url, self)
@@ -504,57 +774,20 @@ class MediaCard(QFrame):
     def _set_thumbnail_pixmap(self, raw_bytes: bytes) -> None:
         pix = QPixmap()
         if not pix.loadFromData(QByteArray(raw_bytes)):
-            self.lbl_thumb.setText("No Image")
+            self.lbl_thumb.setText("NO IMG")
             return
-
-        scaled = pix.scaled(
-            64,
-            64,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        crop_x = max(0, (scaled.width() - 64) // 2)
-        crop_y = max(0, (scaled.height() - 64) // 2)
-        cropped = scaled.copy(crop_x, crop_y, 64, 64)
-
-        rounded = QPixmap(64, 64)
-        rounded.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(rounded)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        path = QPainterPath()
-        path.addRoundedRect(0.0, 0.0, 64.0, 64.0, 8.0, 8.0)
-        painter.setClipPath(path)
-        painter.drawPixmap(0, 0, cropped)
-        painter.end()
-
-        self.lbl_thumb.setText("")
-        self.lbl_thumb.setPixmap(rounded)
-
-    def set_status(self, status: str) -> None:
-        self.status = status
-        self.item_data["status"] = status
-        self.lbl_status.setText(status.upper())
-        if status == "finished":
-            self.lbl_status.setStyleSheet(
-                "color: #10B981; background-color: rgba(16, 185, 129, 0.15); border-radius: 4px; padding: 3px 8px;"
-            )
-        elif status == "downloading":
-            self.lbl_status.setStyleSheet(
-                "color: #FF7597; background-color: rgba(225, 48, 108, 0.2); border-radius: 4px; padding: 3px 8px;"
-            )
-        elif status == "error":
-            self.lbl_status.setStyleSheet(
-                "color: #EF4444; background-color: rgba(239, 68, 68, 0.15); border-radius: 4px; padding: 3px 8px;"
-            )
-        else:
-            self.lbl_status.setStyleSheet(
-                "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
-            )
+        self.lbl_thumb.set_thumbnail_pixmap(pix)
 
     def get_item_data(self) -> Dict[str, Any]:
         return self.item_data
 
     def cleanup(self) -> None:
+        if hasattr(self, "lbl_thumb") and getattr(
+            self.lbl_thumb, "_preview_popup", None
+        ):
+            self.lbl_thumb._preview_popup.hide()
+            self.lbl_thumb._preview_popup.deleteLater()
+            self.lbl_thumb._preview_popup = None
         if self.thumb_loader and self.thumb_loader.isRunning():
             self.thumb_loader.wait(200)
 
