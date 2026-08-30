@@ -1,143 +1,116 @@
 """
-gui/widgets/thumbnail_loader.py - Asynchronous Instagram thumbnail downloader.
-Handles Instagram CDN headers, SSL certificate tolerance, and in-memory caching.
+gui/widgets/thumbnail_loader.py - Asynchronous thumbnail downloader with QThreadPool and byte caching.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import urllib.request
-from typing import Any, Dict, List, Optional, Callable
+from typing import Callable, Dict, Optional
 
-from PyQt6.QtCore import (
-    QByteArray,
-    QPoint,
-    Qt,
-    QObject,
-    QRunnable,
-    QThreadPool,
-    pyqtSignal,
-)
-from PyQt6.QtGui import QFont, QPainter, QPainterPath, QPixmap
-from PyQt6.QtWidgets import (
-    QApplication,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
-
-from gui.widgets.image_viewer_dialog import ImageViewerDialog
-from gui.widgets.thumbnail_loader import ThumbnailLoader
+from PyQt6.QtCore import QObject, QRunnable, QThread, QThreadPool, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QPixmap
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache for fetched thumbnail bytes
+# Global in-memory raw byte cache (URL -> bytes)
 _THUMBNAIL_BYTE_CACHE: Dict[str, bytes] = {}
 
-# Global shared pool capped at 4 concurrent downloads to prevent IP throttling
-_THUMB_POOL = QThreadPool()
-_THUMB_POOL.setMaxThreadCount(4)
+# Bounded global thread pool for thumbnail downloads (max 4 workers)
+_THUMBNAIL_POOL = QThreadPool.globalInstance()
+_THUMBNAIL_POOL.setMaxThreadCount(4)
+
+
+class ThumbnailTaskSignals(QObject):
+    """Signals for background runnable tasks."""
+
+    loaded = pyqtSignal(bytes)
+    error = pyqtSignal(str)
 
 
 class ThumbnailTask(QRunnable):
     """
-    Background worker thread to fetch Instagram thumbnail bytes
-    with headers matching Instagram's CDN expectations.
+    Background worker task running on QThreadPool.
+    Downloads raw image bytes without creating QPixmap on background threads.
     """
 
-    loaded = pyqtSignal(bytes)
-
-    def __init__(self, url: str, signals: ThumbnailLoaderSignals):
+    def __init__(self, url: str):
         super().__init__()
         self.url = url
-        self.signals = signals
-        self.is_cancelled: bool = False
+        self.signals = ThumbnailTaskSignals()
+        self.setAutoDelete(True)
 
-    def cancel(self) -> None:
-        self.is_cancelled = True
-
+    @pyqtSlot()
     def run(self) -> None:
-        if self.is_cancelled or not self.url or not self.url.startswith("http"):
-            self.signals.failed.emit()
+        if not self.url:
             return
 
         if self.url in _THUMBNAIL_BYTE_CACHE:
             self.signals.loaded.emit(_THUMBNAIL_BYTE_CACHE[self.url])
             return
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-        }
-        req = urllib.request.Request(self.url, headers=headers)
         try:
+            req = urllib.request.Request(
+                self.url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
             with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    raw_data = resp.read()
-                    _THUMBNAIL_BYTE_CACHE[self.url] = raw_data
-                    self.signals.loaded.emit(raw_data)
-                    return
+                data = resp.read()
+                if data:
+                    _THUMBNAIL_BYTE_CACHE[self.url] = data
+                    self.signals.loaded.emit(data)
         except Exception as e:
-            logger.debug(f"Thumbnail fetch failed: {e}")
-
-        self.signals.failed.emit()
-
-    @classmethod
-    def load_async(
-        cls,
-        url: str,
-        callback: Callable[[QPixmap], None],
-        parent: Optional[QObject] = None,
-    ) -> Optional[ThumbnailLoader]:
-        """Convenience method to asynchronously fetch thumbnail and invoke callback with QPixmap."""
-        if not url:
-            return None
-
-        if url in _THUMBNAIL_BYTE_CACHE:
-            pix = QPixmap()
-            if pix.loadFromData(_THUMBNAIL_BYTE_CACHE[url]):
-                callback(pix)
-                return None
-
-        loader = ThumbnailLoader(url, parent=parent)
-
-        def _on_loaded(raw_bytes: bytes):
-            pix = QPixmap()
-            if pix.loadFromData(raw_bytes) and not pix.isNull():
-                callback(pix)
-
-        loader.loaded.connect(_on_loaded)
-        loader.start()
-        return loader
+            logger.debug("Failed to fetch thumbnail %s: %s", self.url, e)
+            self.signals.error.emit(str(e))
 
 
-class ThumbnailLoader(QObject):
+class ThumbnailLoader(QThread):
+    """
+    QThread-based thumbnail loader maintaining backwards compatibility with MediaCard.
+    Emits raw bytes to ensure Qt thread safety.
+    """
+
     loaded = pyqtSignal(bytes)
-    failed = pyqtSignal()
 
     def __init__(self, url: str, parent: Optional[QObject] = None):
         super().__init__(parent)
         self.url = url
-        self.signals = ThumbnailLoaderSignals()
-        self.signals.loaded.connect(self.loaded.emit)
-        self.signals.failed.connect(self.failed.emit)
+        self._is_cancelled = False
 
-    def start(self) -> None:
-        task = ThumbnailTask(self.url, self.signals)
-        _THUMB_POOL.start(task)
+    def run(self) -> None:
+        if not self.url or self._is_cancelled:
+            return
 
-    def isRunning(self) -> bool:
+        if self.url in _THUMBNAIL_BYTE_CACHE:
+            self.loaded.emit(_THUMBNAIL_BYTE_CACHE[self.url])
+            return
+
+        try:
+            req = urllib.request.Request(
+                self.url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if self._is_cancelled:
+                    return
+                data = resp.read()
+                if data:
+                    _THUMBNAIL_BYTE_CACHE[self.url] = data
+                    self.loaded.emit(data)
+        except Exception as e:
+            logger.debug("Failed to load thumbnail %s: %s", self.url, e)
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
+
+    @staticmethod
+    def load_cached_pixmap(url: str, callback: Callable[[QPixmap], None]) -> bool:
+        """
+        Helper for main GUI thread to quickly resolve cached pixmaps without worker dispatch.
+        """
+        if url in _THUMBNAIL_BYTE_CACHE:
+            pix = QPixmap()
+            if pix.loadFromData(_THUMBNAIL_BYTE_CACHE[url]):
+                callback(pix)
+                return True
         return False
-
-    def wait(self, msecs: int = 200) -> None:
-        pass
-
-
-class ThumbnailLoaderSignals(QObject):
-    loaded = pyqtSignal(bytes)
-    failed = pyqtSignal()

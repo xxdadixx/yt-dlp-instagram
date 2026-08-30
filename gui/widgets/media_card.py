@@ -8,9 +8,10 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from PyQt6.QtCore import QByteArray, Qt, pyqtSignal
+from PyQt6.QtCore import QByteArray, QPoint, Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -273,11 +274,6 @@ class HoverThumbnailLabel(QLabel):
             self._preview_popup.deleteLater()
             self._preview_popup = None
 
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.card_clicked.emit(self, event.modifiers())
-        super().mousePressEvent(event)
-
 
 class MediaCard(QFrame):
     card_clicked = pyqtSignal(object, object)  # Emits (self, Qt.KeyboardModifier)
@@ -320,124 +316,8 @@ class MediaCard(QFrame):
         layout.setSpacing(14)
 
         # 1. Rounded Thumbnail Preview (Clickable Lightbox)
-        self.lbl_thumb = QLabel("Loading...", self)
-        self.lbl_thumb.setFixedSize(64, 64)
-        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.lbl_thumb.setStyleSheet(
-            "background-color: #21212B; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08); color: #71717A;"
-        )
-        self.lbl_thumb.setFont(self._get_app_font(size=8))
-        self.lbl_thumb.mousePressEvent = lambda e: self.open_image_gallery()
-        layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
-
-        # 2. Details Column (Title & Metadata)
-        details_layout = QVBoxLayout()
-        details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.setSpacing(5)
-
-        raw_title = str(
-            self.item_data.get("title")
-            or self.item_data.get("caption")
-            or "Instagram Media"
-        ).strip()
-        display_title = raw_title.splitlines()[0] if raw_title else "Instagram Media"
-        if len(display_title) > 95:
-            display_title = display_title[:92] + "..."
-
-        self.lbl_title = QLabel(display_title, self)
-        self.lbl_title.setObjectName("CardTitle")
-        self.lbl_title.setFont(self._get_app_font(size=10, bold=True))
-        self.lbl_title.setStyleSheet("color: #FFFFFF;")
-        self.lbl_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        details_layout.addWidget(self.lbl_title)
-
-        meta_row = QHBoxLayout()
-        meta_row.setContentsMargins(0, 0, 0, 0)
-        meta_row.setSpacing(8)
-
-        # Username Tag
-        raw_username = str(self.item_data.get("username") or "instagram").strip()
-        display_username = (
-            f"@{raw_username}" if not raw_username.startswith("@") else raw_username
-        )
-        self.lbl_username = QLabel(display_username, self)
-        self.lbl_username.setObjectName("CardUsername")
-        self.lbl_username.setFont(self._get_app_font(size=9, bold=True))
-        self.lbl_username.setStyleSheet("color: #38BDF8;")
-        self.lbl_username.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        meta_row.addWidget(self.lbl_username)
-
-        # Media Type Capsule Badge
-        badge_type = str(self.item_data.get("media_type") or "MEDIA").upper()
-        self.lbl_badge = QLabel(badge_type, self)
-        self.lbl_badge.setObjectName("CardBadge")
-        self.lbl_badge.setFont(self._get_app_font(size=8, bold=True))
-        self.lbl_badge.setStyleSheet(
-            "background-color: rgba(245, 96, 64, 0.18); color: #F56040; border-radius: 4px; padding: 2px 6px;"
-        )
-        self.lbl_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        meta_row.addWidget(self.lbl_badge)
-
-        # Likes / Views Metadata
-        likes = self.item_data.get("like_count") or 0
-        views = self.item_data.get("view_count") or 0
-        meta_parts = []
-        if likes > 0:
-            meta_parts.append(f"❤️ {likes:,}")
-        if views > 0:
-            meta_parts.append(f"👁️ {views:,}")
-        meta_str = " • ".join(meta_parts) if meta_parts else f"ID: {self.item_id[:12]}"
-
-        self.lbl_meta = QLabel(meta_str, self)
-        self.lbl_meta.setObjectName("CardMeta")
-        self.lbl_meta.setFont(self._get_app_font(size=9))
-        self.lbl_meta.setStyleSheet("color: #94A3B8;")
-        self.lbl_meta.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        meta_row.addWidget(self.lbl_meta)
-        meta_row.addStretch()
-
-        details_layout.addLayout(meta_row)
-        layout.addLayout(details_layout, stretch=1)
-
-        # 3. Status Badge & Quick Remove Button
-        action_col = QHBoxLayout()
-        action_col.setContentsMargins(0, 0, 0, 0)
-        action_col.setSpacing(8)
-        action_col.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-
-        self.lbl_status = QLabel(self.status.upper(), self)
-        self.lbl_status.setObjectName("StatusPillReady")
-        self.lbl_status.setFont(self._get_app_font(size=8, bold=True))
-        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status.setStyleSheet(
-            "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
-        )
-        self.lbl_status.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        action_col.addWidget(self.lbl_status)
-
-        self.btn_delete = QPushButton("✕", self)
-        self.btn_delete.setFixedSize(24, 24)
-        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_delete.setFont(self._get_app_font(size=9, bold=True))
-        self.btn_delete.setStyleSheet(
-            "QPushButton { background-color: transparent; color: #71717A; border: none; border-radius: 12px; }"
-            "QPushButton:hover { background-color: rgba(239, 68, 68, 0.2); color: #EF4444; }"
-        )
-        self.btn_delete.clicked.connect(self.deleted.emit)
-        action_col.addWidget(self.btn_delete)
-
-        layout.addLayout(action_col)
-
-    def _init_ui(self) -> None:
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(14)
-
-        # 1. Rounded Thumbnail Preview (Clickable Lightbox)
         self.lbl_thumb = QLabel(self)
+        self.lbl_thumb.setText("Loading...")
         self.lbl_thumb.setFixedSize(64, 64)
         self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_thumb.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -445,7 +325,6 @@ class MediaCard(QFrame):
             "background-color: #21212B; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.08); color: #71717A;"
         )
         self.lbl_thumb.setFont(self._get_app_font(size=8))
-        self.lbl_thumb.setText("Loading...")
         self.lbl_thumb.mousePressEvent = lambda e: self.open_image_gallery()
         layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
 
@@ -467,6 +346,9 @@ class MediaCard(QFrame):
         self.lbl_title.setObjectName("CardTitle")
         self.lbl_title.setFont(self._get_app_font(size=10, bold=True))
         self.lbl_title.setStyleSheet("color: #FFFFFF;")
+        self.lbl_title.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
         details_layout.addWidget(self.lbl_title)
 
         meta_row = QHBoxLayout()
@@ -482,6 +364,9 @@ class MediaCard(QFrame):
         self.lbl_username.setObjectName("CardUsername")
         self.lbl_username.setFont(self._get_app_font(size=9, bold=True))
         self.lbl_username.setStyleSheet("color: #38BDF8;")
+        self.lbl_username.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
         meta_row.addWidget(self.lbl_username)
 
         # Media Type Capsule Badge
@@ -491,6 +376,9 @@ class MediaCard(QFrame):
         self.lbl_badge.setFont(self._get_app_font(size=8, bold=True))
         self.lbl_badge.setStyleSheet(
             "background-color: rgba(245, 96, 64, 0.18); color: #F56040; border-radius: 4px; padding: 2px 6px;"
+        )
+        self.lbl_badge.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
         )
         meta_row.addWidget(self.lbl_badge)
 
@@ -508,6 +396,9 @@ class MediaCard(QFrame):
         self.lbl_meta.setObjectName("CardMeta")
         self.lbl_meta.setFont(self._get_app_font(size=9))
         self.lbl_meta.setStyleSheet("color: #94A3B8;")
+        self.lbl_meta.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
         meta_row.addWidget(self.lbl_meta)
         meta_row.addStretch()
 
@@ -529,6 +420,9 @@ class MediaCard(QFrame):
         self.lbl_status.setStyleSheet(
             "color: #A0A0B2; background-color: #262633; border-radius: 4px; padding: 3px 8px;"
         )
+        self.lbl_status.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
         action_col.addWidget(self.lbl_status)
 
         self.btn_delete = QPushButton("✕", self)
@@ -543,6 +437,13 @@ class MediaCard(QFrame):
         action_col.addWidget(self.btn_delete)
 
         layout.addLayout(action_col)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.card_clicked.emit(self, event.modifiers())
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
     def _on_check_toggled(self, checked: bool) -> None:
         self.is_selected = checked
@@ -555,7 +456,7 @@ class MediaCard(QFrame):
                 """
                 QFrame#MediaCardFrame {
                     background-color: #232334;
-                    border: 1.5px solid #E1306C;
+                    border: 2px solid #E1306C;
                     border-radius: 10px;
                 }
                 """
@@ -574,6 +475,9 @@ class MediaCard(QFrame):
                 }
                 """
             )
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
 
     def _load_thumbnail(self) -> None:
         thumb_url = self.item_data.get("thumbnail_url")
@@ -686,6 +590,9 @@ class MediaCard(QFrame):
         self._update_selection_style()
         self.selection_changed.emit()
 
+    def toggle_selected(self) -> None:
+        self.set_selected(not self.is_selected)
+
     def _on_toggle_select(self, state: int) -> None:
         self.is_selected = state == 2 or state is True
         self._update_selection_style()
@@ -705,8 +612,17 @@ class MediaCard(QFrame):
         if slides and isinstance(slides, list):
             for s in slides:
                 if not s.get("is_video"):
-                    u = s.get("download_url") or s.get("thumbnail_url") or s.get("display_url")
-                    if u and isinstance(u, str) and u.startswith("http") and u not in images:
+                    u = (
+                        s.get("download_url")
+                        or s.get("thumbnail_url")
+                        or s.get("display_url")
+                    )
+                    if (
+                        u
+                        and isinstance(u, str)
+                        and u.startswith("http")
+                        and u not in images
+                    ):
                         images.append(u)
 
         if not images:
@@ -715,13 +631,19 @@ class MediaCard(QFrame):
                 or self.item_data.get("download_url")
                 or self.item_data.get("display_url")
             )
-            if single_img and isinstance(single_img, str) and single_img.startswith("http"):
+            if (
+                single_img
+                and isinstance(single_img, str)
+                and single_img.startswith("http")
+            ):
                 images.append(single_img)
 
         if images:
             dlg = ImageViewerDialog(
                 image_urls=images,
-                title=str(self.item_data.get("title") or self.item_data.get("caption") or ""),
+                title=str(
+                    self.item_data.get("title") or self.item_data.get("caption") or ""
+                ),
                 parent=self.window(),
             )
             dlg.exec()

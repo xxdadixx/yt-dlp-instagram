@@ -477,26 +477,40 @@ class MainWindow(QMainWindow):
         self.smooth_scroll_queue_to_bottom()
 
     def _on_card_clicked(self, card: MediaCard, modifiers: Qt.KeyboardModifier) -> None:
-        """Handles Single Click toggle, Shift + Click range selection, and Ctrl + Click toggle."""
-        if card not in self.cards:
+        """
+        Handles queue card selection:
+        - Regular Click: Toggles the individual card's selection state (Selected <-> Deselected).
+        - Ctrl + Click: Toggles the individual card without resetting the anchor.
+        - Shift + Click: Selects a range between the anchor card and the target card.
+        """
+        if not hasattr(self, "media_cards") or not self.media_cards:
             return
 
-        current_idx = self.cards.index(card)
-
-        # Shift + Click: Continuous range selection
-        if (
-            modifiers & Qt.KeyboardModifier.ShiftModifier
-        ) and self._last_selected_index != -1:
-            start = min(self._last_selected_index, current_idx)
-            end = max(self._last_selected_index, current_idx)
-            for idx, c in enumerate(self.cards):
-                c.set_selected(start <= idx <= end)
+        if modifiers & Qt.KeyboardModifier.ShiftModifier and getattr(
+            self, "_last_selected_card", None
+        ):
+            try:
+                start_idx = self.media_cards.index(self._last_selected_card)
+                end_idx = self.media_cards.index(card)
+                low, high = min(start_idx, end_idx), max(start_idx, end_idx)
+                for i, c in enumerate(self.media_cards):
+                    c.set_selected(low <= i <= high)
+            except ValueError:
+                card.toggle_selected()
+                self._last_selected_card = card
         else:
-            # Single click or Ctrl + Click toggles selection on the clicked card
-            card.set_selected(not card.is_selected)
-            self._last_selected_index = current_idx
+            # Direct toggle on click (supports deselecting checked items)
+            card.toggle_selected()
+            self._last_selected_card = card
 
-        self.update_selection_counter()
+        self._update_queue_action_buttons()
+
+    def _create_media_card(self, item_data: dict) -> MediaCard:
+        card = MediaCard(item_data, parent=self)
+        card.card_clicked.connect(self._on_card_clicked)
+        card.selection_changed.connect(self._update_queue_action_buttons)
+        card.deleted.connect(lambda: self._on_card_deleted(card))
+        return card
 
     def smooth_scroll_queue_to_bottom(self) -> None:
         v_bar = self.scroll_area.verticalScrollBar()
