@@ -1,12 +1,10 @@
-"""
-gui/widgets/url_chip_input.py - URL input controller and tab-embeddable chip list view.
-"""
-
+# gui/widgets/url_chip_input.py
 from __future__ import annotations
 
 import re
 from typing import Dict, List, Optional
-from PyQt6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, Qt, pyqtSignal
+
+from PyQt6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -21,113 +19,158 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.parser import parse_instagram_url
-from gui.styles import MEDIA_TYPE_COLORS
+from core.parser import extract_instagram_urls, parse_instagram_url
+from gui.icons import get_icon
 
 
-class UrlChipItem(QFrame):
-    removed = pyqtSignal(str)
+class URLItemCard(QFrame):
+    """
+    Glassmorphic card for individual URL targets, matching the exact visual
+    hierarchy and Dark Apple aesthetic of MediaCard in the Media Queue tab.
+    """
 
-    def __init__(self, raw_url: str, parent: Optional[QWidget] = None):
+    deleted = pyqtSignal(str)
+
+    def __init__(
+        self, url: str, target_type: str = "MEDIA", parent: Optional[QWidget] = None
+    ) -> None:
         super().__init__(parent)
-        self.raw_url = raw_url
+        self.url = url.strip()
+        self.target_type = target_type.upper()
+        self.setObjectName("URLItemCard")
+        self.setFixedHeight(50)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._init_ui()
 
+    def _get_badge_palette(self) -> tuple[str, str, str]:
+        """Returns (background_rgba, border_rgba, text_color) based on target media type."""
+        palette = {
+            "PROFILE": (
+                "rgba(56, 189, 248, 0.15)",
+                "rgba(56, 189, 248, 0.35)",
+                "#38BDF8",
+            ),
+            "REEL": ("rgba(244, 63, 94, 0.15)", "rgba(244, 63, 94, 0.35)", "#FB7185"),
+            "STORY": (
+                "rgba(245, 158, 11, 0.15)",
+                "rgba(245, 158, 11, 0.35)",
+                "#FBBF24",
+            ),
+            "POST": ("rgba(16, 185, 129, 0.15)", "rgba(16, 185, 129, 0.35)", "#34D399"),
+            "IMAGE": (
+                "rgba(16, 185, 129, 0.15)",
+                "rgba(16, 185, 129, 0.35)",
+                "#34D399",
+            ),
+            "CAROUSEL": (
+                "rgba(139, 92, 246, 0.15)",
+                "rgba(139, 92, 246, 0.35)",
+                "#A78BFA",
+            ),
+            "TV": ("rgba(168, 85, 247, 0.15)", "rgba(168, 85, 247, 0.35)", "#C084FC"),
+        }
+        return palette.get(
+            self.target_type,
+            ("rgba(112, 197, 255, 0.15)", "rgba(112, 197, 255, 0.30)", "#70C5FF"),
+        )
+
     def _init_ui(self) -> None:
-        self.setObjectName("urlChipItem")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(34)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 2, 8, 2)
-        layout.setSpacing(10)
-
-        meta = parse_instagram_url(self.raw_url)
-        ttype = str(meta.get("type") or "LINK").upper()
-        badge_style = MEDIA_TYPE_COLORS.get("POST")
-        for prefix, style in MEDIA_TYPE_COLORS.items():
-            if ttype.startswith(prefix):
-                badge_style = style
-                break
-
-        self.badge_lbl = QLabel(ttype, self)
-        self.badge_lbl.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-        self.badge_lbl.setStyleSheet(
-            f"""
-            background-color: {badge_style['bg']};
-            color: {badge_style['fg']};
-            border: 1px solid {badge_style['border']};
-            border-radius: 4px;
-            padding: 1px 6px;
-            font-size: 7.5pt;
-        """
-        )
-        layout.addWidget(self.badge_lbl)
-
-        clean_text = (
-            self.raw_url.replace("https://", "")
-            .replace("http://", "")
-            .replace("www.", "")
-        )
-        self.url_lbl = QLabel(
-            clean_text[:60] + ("..." if len(clean_text) > 60 else ""), self
-        )
-        self.url_lbl.setToolTip(self.raw_url)
-        self.url_lbl.setFont(QFont("Segoe UI", 8))
-        self.url_lbl.setStyleSheet("color: #E2E2EA; background: transparent;")
-        layout.addWidget(self.url_lbl, 1)
-
-        self.del_btn = QPushButton("✕", self)
-        self.del_btn.setObjectName("ChipDeleteButton")
-        self.del_btn.setFixedSize(22, 22)
-        self.del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.del_btn.setStyleSheet(
-            """
-            QPushButton#ChipDeleteButton {
-                background: rgba(255, 255, 255, 0.04);
-                color: #A0A0B2;
-                border: 1px solid rgba(255, 255, 255, 0.06);
-                font-size: 8pt;
-                font-weight: bold;
-                border-radius: 11px;
-                padding: 0px;
-            }
-            QPushButton#ChipDeleteButton:hover {
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 1, y2: 0,
-                    stop: 0 #EF4444,
-                    stop: 1 #DC2626
-                );
-                color: #FFFFFF;
-                border: 1px solid #FFA5A5;
-            }
-            QPushButton#ChipDeleteButton:pressed {
-                background: #991B1B;
-                color: #FECACA;
-                border: 1px solid #7F1D1D;
-                padding-top: 1px;
-            }
-        """
-        )
-        self.del_btn.clicked.connect(lambda: self.removed.emit(self.raw_url))
-        layout.addWidget(self.del_btn)
+        bg_col, border_col, text_col = self._get_badge_palette()
 
         self.setStyleSheet(
             """
-            QFrame#urlChipItem {
-                background-color: #1A1A24;
+            QFrame#URLItemCard {
+                background-color: rgba(22, 22, 32, 0.72);
                 border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
+                border-radius: 10px;
             }
-            QFrame#urlChipItem:hover {
-                border: 1px solid rgba(225, 48, 108, 0.4);
-                background-color: #222230;
+            QFrame#URLItemCard:hover {
+                background-color: rgba(30, 30, 46, 0.88);
+                border: 1px solid rgba(225, 48, 108, 0.35);
             }
-        """
+            """
         )
 
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 6, 10, 6)
+        layout.setSpacing(12)
 
-class URLChipInput(QObject := QWidget):
+        # 1. Type Pill Badge (Matches MediaCard format)
+        self.lbl_type = QLabel(self.target_type, self)
+        self.lbl_type.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.lbl_type.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_type.setFixedWidth(78)
+        self.lbl_type.setFixedHeight(26)
+        self.lbl_type.setStyleSheet(
+            f"""
+            QLabel {{
+                background-color: {bg_col};
+                color: {text_col};
+                border: 1px solid {border_col};
+                border-radius: 6px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+            }}
+            """
+        )
+        layout.addWidget(self.lbl_type)
+
+        # 2. Clean URL Target Text
+        display_url = (
+            self.url.replace("https://www.", "")
+            .replace("http://www.", "")
+            .replace("https://", "")
+            .replace("http://", "")
+        )
+        self.lbl_url = QLabel(display_url, self)
+        self.lbl_url.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        self.lbl_url.setStyleSheet("color: #E2E8F0; background: transparent;")
+        self.lbl_url.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.lbl_url.setToolTip(self.url)
+        layout.addWidget(self.lbl_url, stretch=1)
+
+        # 3. Glassmorphic Delete Button (Matches MediaCard top-right action buttons)
+        self.btn_delete = QPushButton(self)
+        self.btn_delete.setObjectName("CardDeleteButton")
+        self.btn_delete.setFixedSize(30, 30)
+        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete.setToolTip("Remove target")
+
+        del_icon = get_icon("trash", color="#94A3B8", size=13) or get_icon(
+            "close", color="#94A3B8", size=12
+        )
+        if del_icon:
+            self.btn_delete.setIcon(del_icon)
+            self.btn_delete.setIconSize(QSize(13, 13))
+        else:
+            self.btn_delete.setText("✕")
+
+        self.btn_delete.setStyleSheet(
+            """
+            QPushButton#CardDeleteButton {
+                background-color: rgba(255, 255, 255, 0.04);
+                color: #A0A0B2;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 7px;
+            }
+            QPushButton#CardDeleteButton:hover {
+                background-color: rgba(239, 68, 68, 0.22);
+                border: 1px solid rgba(239, 68, 68, 0.40);
+                color: #FFFFFF;
+            }
+            QPushButton#CardDeleteButton:pressed {
+                background-color: rgba(185, 28, 28, 0.40);
+                padding-top: 1px;
+            }
+            """
+        )
+        self.btn_delete.clicked.connect(lambda: self.deleted.emit(self.url))
+        layout.addWidget(self.btn_delete)
+
+
+class URLChipInput(QWidget):
     """
     Manages URL input text entry and provides the embeddable chip list view for the tab container.
     """
@@ -137,7 +180,7 @@ class URLChipInput(QObject := QWidget):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._urls: List[str] = []
-        self._chip_widgets: Dict[str, UrlChipItem] = {}
+        self._chip_widgets: Dict[str, URLItemCard] = {}
         self._scroll_anim: Optional[QPropertyAnimation] = None
 
         self._init_input_bar()
@@ -145,7 +188,7 @@ class URLChipInput(QObject := QWidget):
 
     def _init_input_bar(self) -> None:
         """Constructs the top input bar widget."""
-        self.input_widget = QWidget()
+        self.input_widget = QWidget(self)
         layout = QHBoxLayout(self.input_widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -169,7 +212,7 @@ class URLChipInput(QObject := QWidget):
                 border: 1px solid #E1306C;
                 background-color: #1C1C28;
             }
-        """
+            """
         )
         self.input_edit.returnPressed.connect(self._handle_manual_entry)
         self.input_edit.installEventFilter(self)
@@ -214,27 +257,28 @@ class URLChipInput(QObject := QWidget):
                 color: #4B4B5A !important;
                 border: 1px solid rgba(255, 255, 255, 0.04) !important;
             }
-        """
+            """
         )
         layout.addWidget(self.btn_add)
 
     def _init_list_view(self) -> None:
         """Constructs the tab-embeddable chip list view widget."""
-        self.list_widget = QWidget()
+        self.list_widget = QWidget(self)
         main_layout = QVBoxLayout(self.list_widget)
         main_layout.setContentsMargins(10, 8, 10, 8)
         main_layout.setSpacing(6)
 
         # Tab Header Bar
         header_bar = QHBoxLayout()
-        self.lbl_list_count = QLabel("URL Links (0 items)", self.list_widget)
+        self.lbl_list_count = QLabel("URL Links (0)", self.list_widget)
         self.lbl_list_count.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.lbl_list_count.setStyleSheet("color: #FFFFFF;")
         header_bar.addWidget(self.lbl_list_count)
         header_bar.addStretch()
 
-        self.btn_clear_all = QPushButton("Clear All Links", self.list_widget)
+        self.btn_clear_all = QPushButton("Clear All", self.list_widget)
         self.btn_clear_all.setObjectName("DestructiveButton")
+        self.btn_clear_all.setFixedHeight(28)
         self.btn_clear_all.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_clear_all.clicked.connect(self.clear)
         header_bar.addWidget(self.btn_clear_all)
@@ -276,10 +320,7 @@ class URLChipInput(QObject := QWidget):
         if not text:
             return False
 
-        ig_regex = re.compile(
-            r'https?://(?:www\.)?instagram\.com/[^\s"\'<>]+', re.IGNORECASE
-        )
-        matches = ig_regex.findall(text)
+        matches = extract_instagram_urls(text)
         tokens = matches if matches else re.split(r"[\r\n\t,;\s]+", text.strip())
         found_any = False
 
@@ -288,29 +329,43 @@ class URLChipInput(QObject := QWidget):
             if not token:
                 continue
             clean_url = re.sub(r"([?&])img_index=\d+(&?)", r"\1\2", token).rstrip("?&#")
-            if clean_url in self._urls:
-                continue
-            self._add_chip(clean_url)
-            found_any = True
+            if self.add_url_chip(clean_url):
+                found_any = True
 
         if found_any:
             self.input_edit.clear()
-            self._sync_state()
             self.smooth_scroll_to_bottom()
             return True
         return False
 
-    def _add_chip(self, url: str) -> None:
-        chip = UrlChipItem(url, self.list_container)
-        chip.removed.connect(self.remove_url)
-        self._urls.append(url)
-        self._chip_widgets[url] = chip
-        self.list_layout.insertWidget(self.list_layout.count() - 1, chip)
+    def add_url_chip(self, url: str) -> bool:
+        """Adds a URL item card with normalized badge type. Returns True if newly added."""
+        clean_url = url.strip()
+        if not clean_url or clean_url in self._urls:
+            return False
 
-    def add_url_chip(self, url: str) -> None:
-        self._process_raw_text(url)
+        parsed = parse_instagram_url(clean_url)
+        target_type = str(parsed.get("type") or "MEDIA").upper()
+
+        card = URLItemCard(
+            clean_url, target_type=target_type, parent=self.list_container
+        )
+        card.deleted.connect(self.remove_url)
+
+        self._urls.append(clean_url)
+        self._chip_widgets[clean_url] = card
+
+        count = self.list_layout.count()
+        if count > 0:
+            self.list_layout.insertWidget(count - 1, card)
+        else:
+            self.list_layout.addWidget(card)
+
+        self._sync_state()
+        return True
 
     def remove_url(self, url: str) -> None:
+        """Removes a URL item card and synchronizes state."""
         if url in self._urls:
             self._urls.remove(url)
         if url in self._chip_widgets:
@@ -320,9 +375,14 @@ class URLChipInput(QObject := QWidget):
             widget.deleteLater()
         self._sync_state()
 
+    def remove_url_chip(self, url: str) -> None:
+        """Alias for remove_url."""
+        self.remove_url(url)
+
     def _sync_state(self) -> None:
         count = len(self._urls)
-        self.lbl_list_count.setText(f"URL Links ({count} items)")
+        self.lbl_list_count.setText(f"URL Links ({count})")
+        self.btn_clear_all.setEnabled(count > 0)
         self.urls_changed.emit()
 
     def smooth_scroll_to_bottom(self) -> None:
@@ -357,5 +417,7 @@ class URLChipInput(QObject := QWidget):
         self._sync_state()
 
 
+# Backward Compatibility Aliases
+UrlChipItem = URLItemCard
 UrlChipInput = URLChipInput
-URLChip = UrlChipItem
+URLChip = URLItemCard

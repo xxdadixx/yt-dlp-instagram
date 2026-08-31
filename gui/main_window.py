@@ -96,7 +96,7 @@ class MainWindow(QMainWindow):
         self.update_cookie_status()
 
     def _setup_crawl_limit_selector(self) -> None:
-        """Initializes preset limit selector supporting extended batch sizes."""
+        """Initializes preset limit selector with clean items, integer userData, and no eliding."""
         self.combo_batch_limit.blockSignals(True)
         self.combo_batch_limit.clear()
 
@@ -236,7 +236,9 @@ class MainWindow(QMainWindow):
         )
         action_strip.addWidget(self.combo_profile_mode)
 
-        # Crawl Limit Dropdown
+        # -----------------------------------------------------------------
+        # >>> CRAWL LIMIT SELECTOR <<<
+        # -----------------------------------------------------------------
         self.lbl_batch_limit = QLabel("Crawl Limit:", self)
         self.lbl_batch_limit.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
         self.lbl_batch_limit.setStyleSheet("color: #A0A0B2;")
@@ -246,6 +248,7 @@ class MainWindow(QMainWindow):
         self.combo_batch_limit.setFixedHeight(32)
         self._setup_crawl_limit_selector()
         action_strip.addWidget(self.combo_batch_limit)
+        # -----------------------------------------------------------------
 
         self.btn_inspect = QPushButton(self)
         self.btn_inspect.setObjectName("PrimaryActionButton")
@@ -745,9 +748,28 @@ class MainWindow(QMainWindow):
             self._update_action_button_states()
             return
 
-        selected_cards = [c for c in self.cards if c.is_selected]
+        selected_cards = [
+            c
+            for c in self.cards
+            if c.is_selected
+            and getattr(c, "status", "").lower() != "finished"
+            and not getattr(c, "is_finished", False)
+        ]
+
         if not selected_cards:
-            self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
+            # Check if user had cards selected but all of them were already downloaded
+            already_done = any(
+                c.is_selected
+                and (
+                    getattr(c, "status", "").lower() == "finished"
+                    or getattr(c, "is_finished", False)
+                )
+                for c in self.cards
+            )
+            if already_done:
+                self.show_toast("Selected items are already downloaded.")
+            else:
+                self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
             return
 
         items = [c.get_item_data() for c in selected_cards]
@@ -790,6 +812,9 @@ class MainWindow(QMainWindow):
             )
             if cid == str(item_id):
                 card.set_status("finished" if ok else "error")
+                if ok:
+                    # Automatically uncheck completed items from active selection
+                    card.set_selected(False)
         self.update_selection_counter()
 
     def _on_download_finished(self, success_count: int) -> None:

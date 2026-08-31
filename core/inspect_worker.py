@@ -284,7 +284,12 @@ class InspectWorker(QThread):
         self.seen_ids: Set[str] = set()
         self._csrf_token: Optional[str] = self._extract_csrf_token()
         self._anon_cookies: Dict[str, str] = {}
-        self._ssl_ctx = ssl._create_unverified_context()
+        try:
+            import certifi
+
+            self._ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            self._ssl_ctx = ssl.create_default_context()
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._profile_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -523,28 +528,36 @@ class InspectWorker(QThread):
         """
         warning_indicators = (
             "/accounts/scraping_warning/",
+            "/accounts/login/",
             "checkpoint_required",
             "challenge_required",
             "feedback_required",
+            "consent_required",
         )
 
         final_url = response_url.lower()
         if any(ind in final_url for ind in warning_indicators):
-            logger.error(
-                "Scraping warning/checkpoint detected in URL. Aborting worker."
-            )
+            logger.error("Scraping warning/checkpoint detected in URL: %s", final_url)
             self.status_message.emit(
-                "⚠️ Scraping warning detected by Instagram. Pausing to protect account."
+                "⚠️ Safety checkpoint triggered. Inspection paused to safeguard account."
             )
             self.cancel()
             return False
 
-        if any(ind in response_text for ind in warning_indicators):
+        if any(
+            ind in response_text
+            for ind in (
+                "checkpoint_required",
+                "challenge_required",
+                "feedback_required",
+                "consent_required",
+            )
+        ):
             logger.error(
                 "Scraping warning/checkpoint detected in payload. Aborting worker."
             )
             self.status_message.emit(
-                "⚠️ Scraping warning detected in payload. Pausing to protect account."
+                "⚠️ Safety checkpoint triggered in payload. Aborting to protect account."
             )
             self.cancel()
             return False

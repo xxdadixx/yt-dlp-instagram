@@ -8,9 +8,26 @@ import shutil
 import sys
 
 
-def sanitize_filename(filename: str) -> str:
-    """ทำความสะอาดชื่อไฟล์ ตัดอักขระต้องห้ามของระบบปฏิบัติการ Windows"""
-    return re.sub(r'[\\/*?:"<>|]', "", filename).strip()
+def sanitize_filesystem_name(name: str, max_length: int = 120) -> str:
+    """
+    Sanitizes string components to prevent path traversal and illegal OS characters.
+    """
+    if not name:
+        return "unnamed_media"
+
+    # 1. Remove directory traversal sequences
+    cleaned = str(name).replace("../", "").replace("..\\", "")
+
+    # 2. Strip illegal Windows / POSIX file characters
+    cleaned = re.sub(r'[\\/*?:"<>|]', "_", cleaned)
+
+    # 3. Strip non-printable control characters and boundary whitespace/periods
+    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", cleaned).strip(" .")
+
+    if not cleaned:
+        cleaned = "unnamed_media"
+
+    return cleaned[:max_length]
 
 
 def get_app_dir() -> str:

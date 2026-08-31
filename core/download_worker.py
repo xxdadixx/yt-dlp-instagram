@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -111,23 +111,60 @@ class DownloadWorker(QThread):
         cleaned = re.sub(r'[\\/*?:"<>|\r\n\t]', "", str(value)).strip()
         return cleaned or fallback
 
+    def _build_filename(
+        self,
+        item_or_username: Union[Dict[str, Any], str],
+        shortcode: Optional[str] = None,
+        ext: str = "mp4",
+        slide_index: Optional[int] = None,
+    ) -> str:
+        """
+        Constructs a sanitized filename adhering strictly to:
+        {username}_{shortcode}[_{slide_index}].{ext}
+
+        Accepts either an item dictionary or positional strings.
+        """
+        from utils.file_utils import sanitize_filesystem_name
+
+        if isinstance(item_or_username, dict):
+            raw_user = item_or_username.get("username") or "instagram"
+            raw_code = (
+                item_or_username.get("shortcode")
+                or item_or_username.get("id")
+                or "media"
+            )
+            slide_idx = item_or_username.get("slide_index") or item_or_username.get(
+                "index"
+            )
+        else:
+            raw_user = item_or_username or "instagram"
+            raw_code = shortcode or "media"
+            slide_idx = slide_index
+
+        clean_user = sanitize_filesystem_name(str(raw_user), max_length=64)
+        clean_code = sanitize_filesystem_name(str(raw_code), max_length=64)
+        clean_ext = re.sub(r"[^a-zA-Z0-9]", "", ext).lower() or "mp4"
+
+        if slide_idx is not None:
+            return f"{clean_user}_{clean_code}_{slide_idx}.{clean_ext}"
+        return f"{clean_user}_{clean_code}.{clean_ext}"
+
     def _build_filepath(
         self,
-        username: str,
-        shortcode: str,
+        item_or_username: Union[Dict[str, Any], str],
+        shortcode: Optional[str] = None,
+        ext: str = "mp4",
         slide_index: Optional[int] = None,
-        ext: str = "jpg",
     ) -> str:
-        """Constructs: {username}_{shortcode}[_{slide_index}].{ext} (No captions)."""
-        clean_user = self._sanitize_name(username, fallback="instagram_user")
-        clean_code = self._sanitize_name(shortcode, fallback="media")
-        clean_ext = ext.lstrip(".").lower() or "jpg"
-
-        if slide_index is not None:
-            filename = f"{clean_user}_{clean_code}_{slide_index}.{clean_ext}"
-        else:
-            filename = f"{clean_user}_{clean_code}.{clean_ext}"
-
+        """
+        Resolves the absolute destination file path within self.save_folder.
+        """
+        filename = self._build_filename(
+            item_or_username=item_or_username,
+            shortcode=shortcode,
+            ext=ext,
+            slide_index=slide_index,
+        )
         return os.path.join(self.save_folder, filename)
 
     def _get_download_headers(self, url: str) -> Dict[str, str]:
