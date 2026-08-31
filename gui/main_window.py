@@ -95,6 +95,26 @@ class MainWindow(QMainWindow):
         self.setup_clipboard_monitor()
         self.update_cookie_status()
 
+    def _setup_crawl_limit_selector(self) -> None:
+        """Initializes preset limit selector supporting extended batch sizes with userData."""
+        self.combo_batch_limit.clear()
+
+        presets = [
+            ("36 items (Fast)", 36),
+            ("72 items (Safe)", 72),
+            ("120 items (Deep)", 120),
+            ("240 items (Macro-Paced)", 240),
+            ("480 items (Deep Crawl)", 480),
+            ("960 items (High Capacity)", 960),
+            ("All Available (Full Profile)", 0),
+        ]
+
+        for label, limit_val in presets:
+            self.combo_batch_limit.addItem(label, userData=limit_val)
+
+        # Default to 72 items (Index 1)
+        self.combo_batch_limit.setCurrentIndex(1)
+
     def get_all_media_cards(self) -> list[MediaCard]:
         """Return all active MediaCard widgets currently present in the queue."""
         if hasattr(self, "cards") and isinstance(self.cards, list):
@@ -213,6 +233,8 @@ class MainWindow(QMainWindow):
 
         self.combo_batch_limit = NoScrollComboBox(self)
         self.combo_batch_limit.setFixedHeight(32)
+        self._setup_crawl_limit_selector()
+        action_strip.addWidget(self.combo_batch_limit)
         self.combo_batch_limit.addItems(
             [
                 "36 items (Fast)",
@@ -489,18 +511,13 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.setCurrentIndex(0)
 
-        # -----------------------------------------------------------------
-        # >>> READ AND MAP THE DROPDOWN SELECTION TO ITEM COUNT <<<
-        # -----------------------------------------------------------------
-        limit_map = {0: 36, 1: 72, 2: 120, 3: 240}
-        selected_limit = limit_map.get(
-            (
-                self.combo_batch_limit.currentIndex()
-                if hasattr(self, "combo_batch_limit")
-                else 1
-            ),
-            72,
+        # Retrieve integer limit value stored in the item's userData
+        limit_data = (
+            self.combo_batch_limit.currentData()
+            if hasattr(self, "combo_batch_limit")
+            else 72
         )
+        selected_limit = int(limit_data) if limit_data is not None else 72
 
         self.inspect_worker = InspectWorker(
             targets=targets,

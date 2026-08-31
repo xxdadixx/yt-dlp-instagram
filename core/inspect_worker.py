@@ -20,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+import math
 from typing import Any, Dict, List, Optional, Set
 
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -69,22 +70,30 @@ except ImportError:
     IG_USER_INFO_MOBILE_URL = "https://i.instagram.com/api/v1/users/{user_id}/info/"
     MAX_PAGINATION_PAGES = 15
 
-# --- Anti-Scraping Protection & Pacing Defaults ---
+# --- Anti-Scraping Protection & Adaptive Pacing Defaults ---
 DEFAULT_MAX_ITEMS_PER_PROFILE = 36  # Safe default threshold (~3 grid pages)
-PROFILE_PAGING_MEAN_DELAY = 2.8  # Gaussian mean delay (seconds)
-PROFILE_PAGING_STD_DEV = 0.5  # Gaussian standard deviation
-MIN_PAGING_DELAY = 1.8  # Lower bound floor for pagination
-MAX_PAGING_DELAY = 5.0  # Upper bound ceiling for pagination
 
-INTER_TARGET_COOLDOWN_MIN = 10.0  # Rest cooldown between distinct targets (seconds)
-INTER_TARGET_COOLDOWN_MAX = 18.0
+# 1. Profile Crawl Pacing (Deep cursor-based pagination stream)
+PROFILE_PAGING_MEAN_DELAY = 2.85
+PROFILE_PAGING_STD_DEV = 0.25
+MIN_PROFILE_PAGING_DELAY = 2.5
+MAX_PROFILE_PAGING_DELAY = 3.2
+PROFILE_MACRO_DWELL_INTERVAL = 4  # pages (~48 items)
+PROFILE_MACRO_DWELL_MIN = 15.0
+PROFILE_MACRO_DWELL_MAX = 22.0
 
-from core.parser import (
-    is_standalone_video,
-    normalize_url,
-    parse_instagram_url,
-    shortcode_to_id,
-)
+# 2. Direct Media Inspection Pacing (Point-lookup single URLs)
+DIRECT_INSPECT_MEAN_DELAY = 0.85
+DIRECT_INSPECT_STD_DEV = 0.15
+MIN_DIRECT_INSPECT_DELAY = 0.60
+MAX_DIRECT_INSPECT_DELAY = 1.25
+DIRECT_MACRO_DWELL_INTERVAL = 36  # items before brief micro-rest
+DIRECT_MACRO_DWELL_MIN = 3.0
+DIRECT_MACRO_DWELL_MAX = 5.0
+
+# 3. Inter-Profile Cooldown (Between full profile scrapes)
+INTER_PROFILE_COOLDOWN_MIN = 10.0
+INTER_PROFILE_COOLDOWN_MAX = 18.0
 
 from core.client_engine import ResilientSession
 from core.parser import (
@@ -101,15 +110,12 @@ logger = logging.getLogger("InspectWorker")
 
 class InstagramReelsResolver:
     """Handles multi-tier Reels querying with persisted doc_id failover
-
     and public timeline fallback.
     """
 
-    # Primary: Modern Polaris Reels Tab Root Query
     DOC_ID_REELS_PRIMARY = "7423376721066795"
     FRIENDLY_NAME_REELS = "PolarisProfileReelsTabRootQuery"
 
-    # Secondary: Modern Profile Posts/Timeline (Accessible anonymously)
     DOC_ID_POSTS_TIMELINE = "6915638531862590"
     FRIENDLY_NAME_POSTS = "PolarisProfilePostsQuery"
 
@@ -125,10 +131,7 @@ class InstagramReelsResolver:
     ) -> list[NormalizedMedia]:
         results: list[NormalizedMedia] = []
 
-        # -------------------------------------------------------------
         # Tier 2: Dedicated GraphQL Clips Connection
-        # -------------------------------------------------------------
-        # Meta schema requires target_user_id as string inside data envelope
         variables_nested = {
             "data": {
                 "include_feed_video": True,
@@ -167,7 +170,6 @@ class InstagramReelsResolver:
                     node = edge.get("node")
                     if not isinstance(node, dict):
                         continue
-                    # Clips edges wrap the media entity under 'media'
                     media_payload = (
                         node.get("media")
                         if isinstance(node.get("media"), dict)
@@ -188,12 +190,10 @@ class InstagramReelsResolver:
                 exc,
             )
 
-        # -------------------------------------------------------------
         # Tier 2.1 Fallback: Query Profile Posts and Filter for Videos
-        # -------------------------------------------------------------
         variables_timeline = {
             "after": cursor,
-            "first": max_items * 2,  # Over-fetch to account for image post filtering
+            "first": max_items * 2,
             "id": str(target_user_id),
         }
 
@@ -223,7 +223,6 @@ class InstagramReelsResolver:
                     if not isinstance(node, dict):
                         continue
 
-                    # Filter strictly for video entities (Reels / Clips / Video posts)
                     is_video = bool(node.get("is_video") or node.get("media_type") == 2)
                     if is_video:
                         normalized = UnifiedInstagramParser.parse_graphql_node(node)
@@ -267,7 +266,7 @@ class InspectWorker(QThread):
         targets: List[str],
         cookie_str: Optional[str] = None,
         cookie_file: Optional[str] = None,
-        profile_mode: str = "all",  # "all", "reels", "photos"
+        profile_mode: str = "all",
         quality_preset: str = "best_video",
         max_items_per_profile: int = DEFAULT_MAX_ITEMS_PER_PROFILE,
         parent=None,
@@ -308,6 +307,18 @@ class InspectWorker(QThread):
             logger.info("Session initialized: Authenticated cookies ACTIVE.")
         else:
             logger.warning("Session initialized: Running in UNAUTHENTICATED mode.")
+
+    def _get_max_pages_ceiling(self, page_size: int = 24) -> int:
+        """
+        Computes the dynamic maximum pagination limit based on target item count.
+        Returns a large upper bound (1000 pages) when crawling in unlimited mode (0).
+        """
+        if self.max_items_per_profile <= 0:
+            return 1000  # Unlimited mode (~24,000 items)
+
+        # Calculate required pages with a 2-page safety buffer for tombstoned/filtered items
+        needed_pages = math.ceil(self.max_items_per_profile / page_size) + 2
+        return max(MAX_PAGINATION_PAGES, needed_pages)
 
     def _bootstrap_anonymous_session(self) -> None:
         """Handshakes with Instagram root to obtain mid, ig_did, datr, and csrftoken."""
@@ -378,35 +389,82 @@ class InspectWorker(QThread):
             logger.debug(f"Failed to ensure cookie file: {e}")
         return None
 
-    def _apply_gaussian_pacing(self) -> None:
-        """Applies a human-like Gaussian randomized delay between page requests."""
-        delay = random.gauss(PROFILE_PAGING_MEAN_DELAY, PROFILE_PAGING_STD_DEV)
-        sleep_time = max(MIN_PAGING_DELAY, min(delay, MAX_PAGING_DELAY))
-
-        start = time.time()
-        while time.time() - start < sleep_time:
+    def _sleep_interruptible(
+        self, duration: float, status_msg: Optional[str] = None
+    ) -> None:
+        """Sleeps in small increments allowing responsive thread cancellation."""
+        start_t = time.time()
+        while time.time() - start_t < duration:
             if self.is_cancelled:
                 break
+            if status_msg:
+                rem = max(0.0, duration - (time.time() - start_t))
+                self.status_message.emit(f"{status_msg} ({rem:.1f}s remaining)...")
             time.sleep(0.1)
 
+    def _apply_gaussian_pacing(self) -> None:
+        """Applies a human-like Gaussian randomized delay between profile page requests."""
+        if self.is_cancelled:
+            return
+        delay = random.gauss(PROFILE_PAGING_MEAN_DELAY, PROFILE_PAGING_STD_DEV)
+        sleep_time = max(MIN_PROFILE_PAGING_DELAY, min(delay, MAX_PROFILE_PAGING_DELAY))
+        self._sleep_interruptible(sleep_time)
+
     def _apply_macro_pacing(self, page_number: int) -> None:
-        """Enforces a natural dwell pause every 4 pages (~48 items) to break sustained velocity."""
-        if page_number > 0 and page_number % 4 == 0:
-            rest_seconds = random.uniform(14.0, 22.0)
+        """
+        Enforces two-tiered natural dwell pauses:
+        1. Standard dwell every 4 pages (15-22s).
+        2. Deep rate-limiter bucket drain every 12 pages (40-60s) for batch sizes >240.
+        """
+        if self.is_cancelled or page_number <= 0:
+            return
+
+        # Tier-2 Deep Rest for extended crawl depth
+        if page_number % 12 == 0:
+            deep_rest = random.uniform(40.0, 60.0)
+            logger.info(
+                "Deep session cooldown at page %d. Draining velocity bucket for %.1fs...",
+                page_number,
+                deep_rest,
+            )
+            self._sleep_interruptible(
+                deep_rest,
+                status_msg=f"🛡️ Deep crawl velocity cooldown (page {page_number})",
+            )
+            return
+
+        # Tier-1 Standard Macro Rest
+        if page_number % PROFILE_MACRO_DWELL_INTERVAL == 0:
+            rest_seconds = random.uniform(
+                PROFILE_MACRO_DWELL_MIN, PROFILE_MACRO_DWELL_MAX
+            )
             logger.info(
                 "Macro rest triggered at page %d. Resting for %.1fs...",
                 page_number,
                 rest_seconds,
             )
-            start_t = time.time()
-            while time.time() - start_t < rest_seconds:
-                if self.is_cancelled:
-                    break
-                rem = max(0.0, rest_seconds - (time.time() - start_t))
-                self.status_message.emit(
-                    f"☕ Natural dwell rest: {rem:.1f}s remaining (page {page_number})..."
-                )
-                time.sleep(0.5)
+            self._sleep_interruptible(
+                rest_seconds,
+                status_msg=f"☕ Natural dwell rest (page {page_number})",
+            )
+
+    def _apply_direct_item_pacing(self, item_index: int) -> None:
+        """Fast, calibrated micro-jitter for direct URL lookups with batch rest intervals."""
+        if self.is_cancelled:
+            return
+        if item_index > 0 and item_index % DIRECT_MACRO_DWELL_INTERVAL == 0:
+            rest_duration = random.uniform(
+                DIRECT_MACRO_DWELL_MIN, DIRECT_MACRO_DWELL_MAX
+            )
+            self._sleep_interruptible(
+                rest_duration,
+                status_msg=f"⏳ Direct lookup micro-rest (item {item_index})",
+            )
+            return
+
+        delay = random.gauss(DIRECT_INSPECT_MEAN_DELAY, DIRECT_INSPECT_STD_DEV)
+        sleep_time = max(MIN_DIRECT_INSPECT_DELAY, min(delay, MAX_DIRECT_INSPECT_DELAY))
+        self._sleep_interruptible(sleep_time)
 
     def _build_headers(
         self,
@@ -425,7 +483,6 @@ class InspectWorker(QThread):
                 "X-FB-HTTP-Engine": "Liger",
                 "Connection": "keep-alive",
             }
-            # Strictly DO NOT attach web cookies (sessionid, datr) to mobile headers
             return headers
 
         headers = {
@@ -443,7 +500,6 @@ class InspectWorker(QThread):
             "Sec-Fetch-Site": "same-origin",
         }
 
-        # Attach Web session credentials exclusively to web surfaces
         if require_auth and self.cookie_str:
             headers["Cookie"] = self.cookie_str
             if self._csrf_token:
@@ -706,10 +762,14 @@ class InspectWorker(QThread):
         max_id: Optional[str] = None
         pages = 0
         found_count = 0
+        max_pages = self._get_max_pages_ceiling(page_size=24)
         anon_uuid = f"android-{''.join(random.choices('0123456789abcdef', k=16))}"
 
-        while has_next_page and pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
-            if len(self.seen_ids) >= max_items:
+        while has_next_page and pages < max_pages and not self.is_cancelled:
+            if (
+                self.max_items_per_profile > 0
+                and len(self.seen_ids) >= self.max_items_per_profile
+            ):
                 break
 
             post_params: Dict[str, Any] = {
@@ -723,7 +783,6 @@ class InspectWorker(QThread):
 
             encoded_payload = urllib.parse.urlencode(post_params).encode("utf-8")
 
-            # Surface rule: Mobile endpoints are queried unauthenticated to protect user cookies
             res = self._make_request(
                 url,
                 headers=headers,
@@ -775,13 +834,13 @@ class InspectWorker(QThread):
 
             if has_next_page and not self.is_cancelled:
                 self._apply_gaussian_pacing()
+                self._apply_macro_pacing(pages)
 
         return found_count
 
     def _fetch_user_feed_mobile(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> int:
-        """Paginated Mobile Timeline Feed API with micro-jitter and macro-cooldowns."""
         headers = self._build_headers(is_mobile=True)
         headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
 
@@ -789,8 +848,9 @@ class InspectWorker(QThread):
         next_max_id: Optional[str] = None
         pages = 0
         found_count = 0
+        max_pages = self._get_max_pages_ceiling(page_size=12)
 
-        while has_next_page and pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
+        while has_next_page and pages < max_pages and not self.is_cancelled:
             if (
                 self.max_items_per_profile > 0
                 and len(self.seen_ids) >= self.max_items_per_profile
@@ -857,9 +917,7 @@ class InspectWorker(QThread):
             )
 
             if has_next_page and not self.is_cancelled:
-                # 1. Micro pacing between standard pages
                 self._apply_gaussian_pacing()
-                # 2. Macro dwell rest every 4 pages (~48 items)
                 self._apply_macro_pacing(pages)
 
         return found_count
@@ -1127,7 +1185,6 @@ class InspectWorker(QThread):
                 caller_tag="MobileMediaInfo",
                 require_auth=False,
             )
-            # Retry with auth if unauthenticated call returned no items
             if not res_mobile and self.cookie_str:
                 res_mobile = self._make_request(
                     info_url,
@@ -1206,9 +1263,13 @@ class InspectWorker(QThread):
         end_cursor: Optional[str] = None
         pages = 0
         found_count = 0
+        max_pages = self._get_max_pages_ceiling(page_size=24)
 
-        while has_next_page and pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
-            if len(self.seen_ids) >= self.max_items_per_profile:
+        while has_next_page and pages < max_pages and not self.is_cancelled:
+            if (
+                self.max_items_per_profile > 0
+                and len(self.seen_ids) >= self.max_items_per_profile
+            ):
                 logger.info(
                     "Reached safe crawl cap (%d items) for @%s.",
                     self.max_items_per_profile,
@@ -1318,6 +1379,7 @@ class InspectWorker(QThread):
 
             if has_next_page and not self.is_cancelled:
                 self._apply_gaussian_pacing()
+                self._apply_macro_pacing(pages)
 
         return found_count
 
@@ -1334,7 +1396,7 @@ class InspectWorker(QThread):
             f"🚀 [Tier 1: Web Profile] Crawling {tier_label} for @{username}..."
         )
 
-        # Tier 1: Dedicated GraphQL Reels Tab (Fastest if authenticated)
+        # Tier 1: Dedicated GraphQL Reels Tab
         if filter_mode in ("reels", "all") and not self.is_cancelled:
             self.status_message.emit(
                 f"🚀 [Tier 2: GraphQL Reels] Querying dedicated Reels connection for @{username}..."
@@ -1347,7 +1409,7 @@ class InspectWorker(QThread):
         if len(self.seen_ids) == 0 and not self.is_cancelled:
             self._fetch_timeline_graphql(username, user_id, filter_mode=filter_mode)
 
-        # Tier 3: Mobile Dedicated Clips API (High-resiliency unauthenticated endpoint)
+        # Tier 3: Mobile Dedicated Clips API
         if (
             len(self.seen_ids) == 0
             and filter_mode in ("reels", "all")
@@ -1367,7 +1429,7 @@ class InspectWorker(QThread):
             )
             self._fetch_user_feed_mobile(username, user_id, filter_mode=filter_mode)
 
-        # Tier 4: Unauthenticated guidance notification
+        # Tier 4: Guidance notification
         if len(self.seen_ids) == 0 and not self.cookie_str:
             self.status_message.emit(
                 "💡 [Notice] 0 items found. User Reels feeds are login-gated by Instagram. Click 'Import Cookie' to enable full feed crawling."
@@ -1387,7 +1449,6 @@ class InspectWorker(QThread):
             cfile = self._ensure_cookie_file()
             has_cookies = bool(cfile and os.path.exists(cfile))
 
-            # Strip /reels/ to base profile URL when unauthenticated to prevent HTTP 302 login redirects
             if default_username:
                 if filter_mode == "reels" and has_cookies:
                     clean_url = f"{IG_BASE_URL}/{default_username}/reels/"
@@ -1558,24 +1619,21 @@ class InspectWorker(QThread):
     def _fetch_reels_graphql(
         self, username: str, user_id: str, max_items: int = 120
     ) -> int:
-        """Dedicated GraphQL Reels crawler using PolarisProfileReelsTabRootQuery.
-        Executes successfully when valid authenticated cookies are present.
-        """
         DOC_ID_REELS_PRIMARY = "7423376721066795"
         FRIENDLY_NAME = "PolarisProfileReelsTabRootQuery"
         has_next_page = True
         end_cursor: Optional[str] = None
         pages = 0
         found_count = 0
+        max_pages = self._get_max_pages_ceiling(page_size=24)
 
-        while has_next_page and pages < MAX_PAGINATION_PAGES and not self.is_cancelled:
+        while has_next_page and pages < max_pages and not self.is_cancelled:
             if (
                 self.max_items_per_profile > 0
                 and len(self.seen_ids) >= self.max_items_per_profile
             ):
                 break
 
-            # Meta Polaris GraphQL AST structure for user clips connection
             variables: Dict[str, Any] = {
                 "data": {
                     "include_feed_video": True,
@@ -1606,7 +1664,7 @@ class InspectWorker(QThread):
                 data=encoded_data,
                 method="POST",
                 caller_tag="GraphQLReelsTab",
-                require_auth=True,  # Attaches sessionid and X-CSRFToken
+                require_auth=True,
             )
 
             if not isinstance(res, dict):
@@ -1664,6 +1722,7 @@ class InspectWorker(QThread):
 
             if has_next_page and not self.is_cancelled:
                 self._apply_gaussian_pacing()
+                self._apply_macro_pacing(pages)
 
         return found_count
 
@@ -1697,7 +1756,6 @@ class InspectWorker(QThread):
                     raw_target, default_username=username, filter_mode=effective_mode
                 )
 
-            # Fallback to yt-dlp flat extractor if 0 items were retrieved via API
             if len(self.seen_ids) == 0 and not self.is_cancelled:
                 self._inspect_via_ytdlp(
                     raw_target, default_username=username, filter_mode=effective_mode
@@ -1716,30 +1774,51 @@ class InspectWorker(QThread):
 
             self.progress.emit(10)
 
-            for idx, target in enumerate(self.targets):
+            for idx, raw_target in enumerate(self.targets):
                 if self.is_cancelled:
                     break
 
-                self.status_message.emit(f"Inspecting ({idx + 1}/{total}): {target}")
-                self._inspect_single_target(target)
+                # Apply adaptive inter-item delay prior to inspecting subsequent items
+                if idx > 0:
+                    prev_target_info = parse_instagram_url(self.targets[idx - 1])
+                    curr_target_info = parse_instagram_url(raw_target)
+
+                    is_prev_direct = prev_target_info.get("type") in (
+                        "reel",
+                        "post",
+                        "carousel",
+                        "tv",
+                    )
+                    is_curr_direct = curr_target_info.get("type") in (
+                        "reel",
+                        "post",
+                        "carousel",
+                        "tv",
+                    )
+
+                    if is_prev_direct and is_curr_direct:
+                        # Direct URL lookups use fast Gaussian micro-jitter
+                        self._apply_direct_item_pacing(idx)
+                    else:
+                        # Deep profile crawls trigger full inter-target profile cooldown
+                        cooldown = random.uniform(
+                            INTER_PROFILE_COOLDOWN_MIN, INTER_PROFILE_COOLDOWN_MAX
+                        )
+                        self._sleep_interruptible(
+                            cooldown,
+                            status_msg="⏳ Inter-target profile cooldown",
+                        )
+
+                if self.is_cancelled:
+                    break
+
+                self.status_message.emit(
+                    f"Inspecting ({idx + 1}/{total}): {raw_target}"
+                )
+                self._inspect_single_target(raw_target)
 
                 pct = int(10 + ((idx + 1) / total) * 85)
                 self.progress.emit(pct)
-
-                # Inter-target cooldown pause to protect account between multiple links
-                if idx < total - 1 and not self.is_cancelled:
-                    cooldown = random.uniform(
-                        INTER_TARGET_COOLDOWN_MIN, INTER_TARGET_COOLDOWN_MAX
-                    )
-                    start_t = time.time()
-                    while time.time() - start_t < cooldown:
-                        if self.is_cancelled:
-                            break
-                        rem = max(0.0, cooldown - (time.time() - start_t))
-                        self.status_message.emit(
-                            f"⏳ Cooldown {rem:.1f}s before next target..."
-                        )
-                        time.sleep(0.5)
 
             self.progress.emit(100)
             with self._lock:

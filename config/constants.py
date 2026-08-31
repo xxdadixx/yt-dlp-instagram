@@ -91,14 +91,38 @@ REQUEST_DELAY_SECONDS: float = 0.5
 DEFAULT_REQUEST_TIMEOUT: int = 15
 
 # --- Anti-Scraping & Account Protection Constants ---
-DEFAULT_MAX_ITEMS_PER_PROFILE = 120      # Approx. 3 grid pages per crawl
-PROFILE_PAGING_MEAN_DELAY = 3.0         # Gaussian mean delay (seconds)
-PROFILE_PAGING_STD_DEV = 0.6            # Gaussian standard deviation
-MIN_PAGING_DELAY = 2.0                  # Lower bound floor for pagination
-MAX_PAGING_DELAY = 5.5                  # Upper bound ceiling for pagination
+DEFAULT_MAX_ITEMS_PER_PROFILE = 120  # Approx. 3 grid pages per crawl
+PROFILE_PAGING_MEAN_DELAY = 3.0  # Gaussian mean delay (seconds)
+PROFILE_PAGING_STD_DEV = 0.6  # Gaussian standard deviation
+MIN_PAGING_DELAY = 2.0  # Lower bound floor for pagination
+MAX_PAGING_DELAY = 5.5  # Upper bound ceiling for pagination
 
-INTER_TARGET_COOLDOWN_MIN = 12.0        # Rest interval between multiple URLs (seconds)
+INTER_TARGET_COOLDOWN_MIN = 12.0  # Rest interval between multiple URLs (seconds)
 INTER_TARGET_COOLDOWN_MAX = 20.0
+
+# Profile Crawl (deep pagination cursor traversal)
+PROFILE_PAGING_JITTER_MIN = 2.5
+PROFILE_PAGING_JITTER_MAX = 3.2
+PROFILE_MACRO_DWELL_MIN = 15.0
+PROFILE_MACRO_DWELL_MAX = 22.0
+PROFILE_MACRO_DWELL_INTERVAL = 4  # pages
+
+# Direct URL / Multi-Link Inspection (point-lookup resolution)
+DIRECT_INSPECT_JITTER_MEAN = 0.85
+DIRECT_INSPECT_JITTER_STDDEV = 0.15
+DIRECT_INSPECT_JITTER_MIN = 0.60
+DIRECT_INSPECT_JITTER_MAX = 1.25
+DIRECT_MACRO_DWELL_INTERVAL = 36  # point items before micro-rest
+DIRECT_MICRO_REST_MIN = 3.0
+DIRECT_MICRO_REST_MAX = 5.0
+
+# UI Batch Limit Presets (0 represents 'All / Unlimited')
+CRAWL_LIMIT_PRESETS: list[int] = [36, 72, 120, 240, 480, 960, 0]
+
+# Deep Crawl Protection (for profiles exceeding 240 items)
+DEEP_CRAWL_PAGE_THRESHOLD = 12  # Trigger deep cooldown every 12 pages (~288 items)
+DEEP_CRAWL_REST_MIN = 40.0
+DEEP_CRAWL_REST_MAX = 60.0
 
 DOMAINS_RE_STR = (
     r"(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am|ig\.me)"
