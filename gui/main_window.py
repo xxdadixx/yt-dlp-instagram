@@ -203,6 +203,28 @@ class MainWindow(QMainWindow):
         )
         action_strip.addWidget(self.combo_profile_mode)
 
+        # -----------------------------------------------------------------
+        # >>> ADD CRAWL LIMIT SELECTOR HERE <<<
+        # -----------------------------------------------------------------
+        self.lbl_batch_limit = QLabel("Crawl Limit:", self)
+        self.lbl_batch_limit.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        self.lbl_batch_limit.setStyleSheet("color: #A0A0B2;")
+        action_strip.addWidget(self.lbl_batch_limit)
+
+        self.combo_batch_limit = NoScrollComboBox(self)
+        self.combo_batch_limit.setFixedHeight(32)
+        self.combo_batch_limit.addItems(
+            [
+                "36 items (Fast)",
+                "72 items (Safe)",
+                "120 items (Deep)",
+                "240 items (Macro-Paced)",
+            ]
+        )
+        self.combo_batch_limit.setCurrentIndex(1)  # Default: 72 items
+        action_strip.addWidget(self.combo_batch_limit)
+        # -----------------------------------------------------------------
+
         self.btn_inspect = QPushButton(self)
         self.btn_inspect.setObjectName("PrimaryActionButton")
         self.btn_inspect.setFixedHeight(34)
@@ -467,12 +489,26 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.setCurrentIndex(0)
 
+        # -----------------------------------------------------------------
+        # >>> READ AND MAP THE DROPDOWN SELECTION TO ITEM COUNT <<<
+        # -----------------------------------------------------------------
+        limit_map = {0: 36, 1: 72, 2: 120, 3: 240}
+        selected_limit = limit_map.get(
+            (
+                self.combo_batch_limit.currentIndex()
+                if hasattr(self, "combo_batch_limit")
+                else 1
+            ),
+            72,
+        )
+
         self.inspect_worker = InspectWorker(
             targets=targets,
             cookie_str=self.cookie_manager.get_cookie_string(),
             cookie_file=self.cookie_manager.get_cookie_file_path(),
             profile_mode=self.profile_mode,
             quality_preset=self.quality_preset,
+            max_items_per_profile=selected_limit,
             parent=self,
         )
         self.inspect_worker.item_found.connect(self.add_card)
@@ -490,7 +526,7 @@ class MainWindow(QMainWindow):
         self.inspect_worker.finished.connect(self.on_inspection_finished)
 
         logger.info(
-            f"Starting inspection for {len(targets)} target(s) with mode='{self.profile_mode}'"
+            f"Starting inspection for {len(targets)} target(s) with mode='{self.profile_mode}' (limit: {selected_limit})"
         )
         self.inspect_worker.start()
         self._update_action_button_states()
@@ -983,6 +1019,9 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "combo_profile_mode"):
             self.combo_profile_mode.setEnabled(not is_inspecting and not is_downloading)
+
+        if hasattr(self, "combo_batch_limit"):
+            self.combo_batch_limit.setEnabled(not is_inspecting and not is_downloading)
 
         # 5. URL Input Bar Actions
         if hasattr(self, "url_container"):

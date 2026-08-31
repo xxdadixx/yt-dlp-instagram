@@ -91,7 +91,7 @@ REQUEST_DELAY_SECONDS: float = 0.5
 DEFAULT_REQUEST_TIMEOUT: int = 15
 
 # --- Anti-Scraping & Account Protection Constants ---
-DEFAULT_MAX_ITEMS_PER_PROFILE = 36      # Approx. 3 grid pages per crawl
+DEFAULT_MAX_ITEMS_PER_PROFILE = 120      # Approx. 3 grid pages per crawl
 PROFILE_PAGING_MEAN_DELAY = 3.0         # Gaussian mean delay (seconds)
 PROFILE_PAGING_STD_DEV = 0.6            # Gaussian standard deviation
 MIN_PAGING_DELAY = 2.0                  # Lower bound floor for pagination

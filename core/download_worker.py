@@ -1,24 +1,27 @@
+# core/download_worker.py
+from __future__ import annotations
+
+import logging
 import os
 import re
 import time
-import math
-import logging
+from typing import Any, Dict, List, Optional
 import requests
-from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
-from typing import List, Dict, Any, Optional
+from urllib3.util import Retry
 from PyQt6.QtCore import QThread, pyqtSignal
 
-import yt_dlp
-from utils.file_utils import sanitize_filename
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
 
-# Fallback-safe constant resolution
 try:
     from config.constants import DEFAULT_USER_AGENT
 except (ImportError, AttributeError):
     DEFAULT_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     )
 
 try:
@@ -33,17 +36,15 @@ logger = logging.getLogger("DownloadWorker")
 
 
 class DownloadWorker(QThread):
-    """
-    High-Performance Sequential Download Worker with Abort / Cancel capabilities.
-    Processes media items strictly 1-by-1 to prevent race conditions and skipped items,
-    utilizing persistent socket connection pools and 256 KB streaming buffers.
+    """Sequential media download worker with persistent socket connection pools,
+
+    256 KB streaming buffers, and strict username_shortcode filename formatting.
     """
 
-    # Signals expected by MainWindow
-    progress = pyqtSignal(int)  # Overall queue progress percent (0-100)
-    item_started = pyqtSignal(str)  # item_id
-    item_finished = pyqtSignal(str, bool)  # item_id, is_success
-    finished = pyqtSignal(int)  # success_count
+    progress = pyqtSignal(int)
+    item_started = pyqtSignal(str)
+    item_finished = pyqtSignal(str, bool)
+    finished = pyqtSignal(int)
 
     def __init__(
         self,
@@ -57,12 +58,17 @@ class DownloadWorker(QThread):
     ):
         super().__init__(parent)
         self.items: List[Dict[str, Any]] = items or queue_items or []
-        self.save_folder: str = save_folder or output_directory or "downloads"
-        self.cookie_file: Optional[str] = cookie_file
+        self.save_folder: str = os.path.abspath(
+            save_folder or output_directory or "downloads"
+        )
+        self.cookie_file: Optional[str] = (
+            cookie_file if cookie_file and os.path.exists(cookie_file) else None
+        )
         self.cookie_str: Optional[str] = cookie_str
         self._is_cancelled: bool = False
+        os.makedirs(self.save_folder, exist_ok=True)
 
-        # Configure high-throughput HTTP session with connection pooling and automated retries
+        # Connection-pooled HTTP session for high-throughput streaming
         self.session = requests.Session()
         retries = Retry(
             total=3,
@@ -92,151 +98,39 @@ class DownloadWorker(QThread):
         self.session.headers.update(headers)
 
     def cancel(self) -> None:
-        """Signals the worker to abort current and future downloads immediately."""
+        """Signals the worker to abort active downloads immediately."""
         self._is_cancelled = True
         try:
             self.session.close()
         except Exception:
             pass
 
-    def run(self) -> None:
-        """Main sequential execution loop."""
-        total_items = len(self.items)
-        if total_items == 0:
-            self.progress.emit(100)
-            self.finished.emit(0)
-            return
+    @staticmethod
+    def _sanitize_name(value: str, fallback: str = "media") -> str:
+        """Strips invalid filesystem characters, emojis, and whitespace."""
+        cleaned = re.sub(r'[\\/*?:"<>|\r\n\t]', "", str(value)).strip()
+        return cleaned or fallback
 
-        success_count = 0
-        logger.info(f"Starting sequential download queue ({total_items} items)")
-
-        for index, item in enumerate(self.items):
-            if self._is_cancelled:
-                logger.warning("Download queue cancelled by user.")
-                break
-
-            item_id = str(
-                item.get("id") or item.get("shortcode") or item.get("url") or index
-            )
-            self.item_started.emit(item_id)
-
-            try:
-                saved_path = self._process_single_item(item, index, total_items)
-                if self._is_cancelled:
-                    self.item_finished.emit(item_id, False)
-                    break
-
-                if saved_path and (
-                    os.path.exists(saved_path) or os.path.isdir(self.save_folder)
-                ):
-                    success_count += 1
-                    self.item_finished.emit(item_id, True)
-                else:
-                    self.item_finished.emit(item_id, False)
-            except Exception as exc:
-                if self._is_cancelled:
-                    self.item_finished.emit(item_id, False)
-                    break
-                logger.error(f"Error downloading item {item_id}: {exc}", exc_info=True)
-                self.item_finished.emit(item_id, False)
-
-            # Update overall progress step
-            curr_prog = int(((index + 1) / total_items) * 100)
-            self.progress.emit(curr_prog)
-
-        self.progress.emit(100)
-        self.finished.emit(success_count)
-
-    def _process_single_item(
-        self, item: Dict[str, Any], index: int, total_items: int
+    def _build_filepath(
+        self,
+        username: str,
+        shortcode: str,
+        slide_index: Optional[int] = None,
+        ext: str = "jpg",
     ) -> str:
-        """Determines best download strategy (Carousel child downloader, Direct CDN streaming, or yt-dlp)."""
-        if self._is_cancelled:
-            return ""
+        """Constructs: {username}_{shortcode}[_{slide_index}].{ext} (No captions)."""
+        clean_user = self._sanitize_name(username, fallback="instagram_user")
+        clean_code = self._sanitize_name(shortcode, fallback="media")
+        clean_ext = ext.lstrip(".").lower() or "jpg"
 
-        title = item.get("title") or item.get("id") or f"instagram_{int(time.time())}"
-        clean_title = sanitize_filename(title)[:80]
-        item_id = str(item.get("id") or item.get("shortcode") or index)
+        if slide_index is not None:
+            filename = f"{clean_user}_{clean_code}_{slide_index}.{clean_ext}"
+        else:
+            filename = f"{clean_user}_{clean_code}.{clean_ext}"
 
-        # Strategy 1: Multi-Item Carousel Post -> Download all slide images/videos
-        slides = item.get("slides")
-        if slides and isinstance(slides, list) and len(slides) > 0:
-            saved_any = False
-            last_path = ""
-            for s_idx, slide in enumerate(slides, start=1):
-                if self._is_cancelled:
-                    break
-                slide_url = (
-                    slide.get("download_url")
-                    or slide.get("video_url")
-                    or slide.get("thumbnail_url")
-                )
-                is_vid = bool(slide.get("is_video"))
-                ext = ".mp4" if is_vid else ".jpg"
-                slide_path = os.path.join(
-                    self.save_folder, f"{clean_title}_{item_id}_{s_idx}{ext}"
-                )
-                if slide_url and (
-                    slide_url.startswith("http://") or slide_url.startswith("https://")
-                ):
-                    try:
-                        self._download_direct_stream(
-                            slide_url, slide_path, index, total_items
-                        )
-                        if os.path.exists(slide_path):
-                            saved_any = True
-                            last_path = slide_path
-                    except Exception as s_err:
-                        if self._is_cancelled:
-                            break
-                        logger.debug(f"Slide {s_idx} stream failed: {s_err}")
+        return os.path.join(self.save_folder, filename)
 
-            if self._is_cancelled:
-                return ""
-            if saved_any:
-                return last_path
-            # Fallback to yt-dlp if direct slide streaming failed
-            return self._download_via_ytdlp(item, clean_title, index, total_items)
-
-        # Strategy 2: Single Post / Reel / Image
-        direct_url = (
-            item.get("download_url") or item.get("media_url") or item.get("video_url")
-        )
-        media_type = (item.get("type") or item.get("media_type") or "video").lower()
-
-        ext = (
-            ".mp4"
-            if "image" not in media_type and "photo" not in media_type
-            else ".jpg"
-        )
-        target_path = os.path.join(self.save_folder, f"{clean_title}_{item_id}{ext}")
-
-        # Verify that direct_url is an actual CDN media link and not an Instagram HTML page
-        is_direct_cdn = bool(
-            direct_url
-            and direct_url.startswith("http")
-            and not any(
-                x in direct_url
-                for x in ("/p/", "/reel/", "/reels/", "/tv/", "/stories/")
-            )
-        )
-
-        if is_direct_cdn:
-            try:
-                return self._download_direct_stream(
-                    direct_url, target_path, index, total_items
-                )
-            except Exception as stream_err:
-                if self._is_cancelled:
-                    return ""
-                logger.warning(
-                    f"Direct stream failed for {item_id}, falling back to yt-dlp: {stream_err}"
-                )
-
-        # Strategy 3: yt-dlp Fallback
-        return self._download_via_ytdlp(item, clean_title, index, total_items)
-
-    def _get_download_headers(self, url: str) -> dict[str, str]:
+    def _get_download_headers(self, url: str) -> Dict[str, str]:
         """Returns minimal headers for CDN assets, omitting session cookies to protect account."""
         headers = {
             "User-Agent": DEFAULT_USER_AGENT,
@@ -244,7 +138,6 @@ class DownloadWorker(QThread):
             "Accept-Encoding": "identity",
             "Connection": "keep-alive",
         }
-        # Only attach session cookies when requesting instagram.com API endpoints, never CDNs
         is_cdn = any(domain in url for domain in ("cdninstagram.com", "fbcdn.net"))
         if not is_cdn and self.cookie_str:
             headers["Cookie"] = self.cookie_str
@@ -253,8 +146,8 @@ class DownloadWorker(QThread):
     def _download_direct_stream(
         self, url: str, target_path: str, index: int, total_items: int
     ) -> str:
-        """Streams media directly via 256 KB chunk buffering with smooth overall progress updates."""
-        CHUNK_SIZE = 256 * 1024  # 256 KB buffer
+        """Streams media directly via 256 KB chunk buffering with smooth progress reporting."""
+        CHUNK_SIZE = 256 * 1024
         temp_path = f"{target_path}.part"
         req_headers = self._get_download_headers(url)
 
@@ -282,7 +175,6 @@ class DownloadWorker(QThread):
                         f.write(chunk)
                         downloaded_bytes += len(chunk)
 
-                        # Throttle progress calculation to max 20Hz (every 50ms)
                         current_time = time.time()
                         if (
                             current_time - last_signal_time >= 0.05
@@ -316,14 +208,39 @@ class DownloadWorker(QThread):
         return target_path
 
     def _download_via_ytdlp(
-        self, item: Dict[str, Any], clean_title: str, index: int, total_items: int
+        self,
+        item: Dict[str, Any],
+        username: str,
+        shortcode: str,
+        index: int,
+        total_items: int,
     ) -> str:
-        """Executes yt-dlp extractor fallback with progress hook."""
-        if self._is_cancelled:
+        """Executes yt-dlp fallback with strict username_shortcode outtmpl (no captions)."""
+        if yt_dlp is None or self._is_cancelled:
             return ""
 
-        url = item.get("url") or item.get("webpage_url") or item.get("download_url")
-        outtmpl = os.path.join(self.save_folder, f"{clean_title}_%(id)s.%(ext)s")
+        url = str(
+            item.get("url")
+            or item.get("webpage_url")
+            or item.get("download_url")
+            or f"https://www.instagram.com/p/{shortcode}/"
+        )
+        clean_user = self._sanitize_name(username, fallback="instagram_user")
+        clean_code = self._sanitize_name(shortcode, fallback="media")
+        is_carousel = "carousel" in str(item.get("media_type", "")).lower() or bool(
+            item.get("carousel_count")
+        )
+
+        if is_carousel:
+            out_template = os.path.join(
+                self.save_folder,
+                f"{clean_user}_{clean_code}_%(playlist_index)s.%(ext)s",
+            )
+        else:
+            out_template = os.path.join(
+                self.save_folder, f"{clean_user}_{clean_code}.%(ext)s"
+            )
+
         last_progress_time = 0.0
 
         def ytdlp_hook(d):
@@ -342,7 +259,7 @@ class DownloadWorker(QThread):
                     self.progress.emit(min(overall_percent, 99))
 
         ydl_opts = {
-            "outtmpl": outtmpl,
+            "outtmpl": out_template,
             "quiet": True,
             "no_warnings": True,
             "progress_hooks": [ytdlp_hook],
@@ -364,3 +281,141 @@ class DownloadWorker(QThread):
             if "entries" in info and info["entries"]:
                 return ydl.prepare_filename(info["entries"][0])
             return ydl.prepare_filename(info)
+
+    def _process_single_item(
+        self, item: Dict[str, Any], index: int, total_items: int
+    ) -> str:
+        """Downloads single media or carousels using strict username_shortcode formatting."""
+        if self._is_cancelled:
+            return ""
+
+        username = str(item.get("username") or item.get("uploader") or "instagram_user")
+        shortcode = str(item.get("shortcode") or item.get("id") or f"media_{index}")
+
+        # Strategy 1: Multi-Item Carousel -> Direct Stream Each Slide
+        slides = item.get("slides")
+        if slides and isinstance(slides, list) and len(slides) > 0:
+            saved_any = False
+            last_path = ""
+            for s_idx, slide in enumerate(slides, start=1):
+                if self._is_cancelled:
+                    break
+                slide_url = (
+                    slide.get("download_url")
+                    or slide.get("video_url")
+                    or slide.get("thumbnail_url")
+                )
+                is_vid = bool(slide.get("is_video"))
+                ext = "mp4" if is_vid else "jpg"
+                slide_path = self._build_filepath(
+                    username, shortcode, slide_index=s_idx, ext=ext
+                )
+
+                if slide_url and (
+                    slide_url.startswith("http://") or slide_url.startswith("https://")
+                ):
+                    try:
+                        self._download_direct_stream(
+                            slide_url, slide_path, index, total_items
+                        )
+                        if os.path.exists(slide_path):
+                            saved_any = True
+                            last_path = slide_path
+                    except Exception as s_err:
+                        if self._is_cancelled:
+                            break
+                        logger.debug("Slide %d direct stream failed: %s", s_idx, s_err)
+
+            if self._is_cancelled:
+                return ""
+            if saved_any:
+                return last_path
+            # Fallback to yt-dlp for carousel
+            return self._download_via_ytdlp(
+                item, username, shortcode, index, total_items
+            )
+
+        # Strategy 2: Single Post / Reel / Image -> Direct Stream
+        direct_url = (
+            item.get("download_url") or item.get("media_url") or item.get("video_url")
+        )
+        media_type = str(item.get("type") or item.get("media_type") or "video").lower()
+        is_video = "image" not in media_type and "photo" not in media_type
+        ext = "mp4" if is_video else "jpg"
+        target_path = self._build_filepath(username, shortcode, ext=ext)
+
+        is_direct_cdn = bool(
+            direct_url
+            and direct_url.startswith("http")
+            and not any(
+                x in direct_url
+                for x in ("/p/", "/reel/", "/reels/", "/tv/", "/stories/")
+            )
+        )
+
+        if is_direct_cdn:
+            try:
+                return self._download_direct_stream(
+                    direct_url, target_path, index, total_items
+                )
+            except Exception as stream_err:
+                if self._is_cancelled:
+                    return ""
+                logger.warning(
+                    "Direct stream failed for %s_%s, falling back to yt-dlp: %s",
+                    username,
+                    shortcode,
+                    stream_err,
+                )
+
+        # Strategy 3: yt-dlp Fallback
+        return self._download_via_ytdlp(item, username, shortcode, index, total_items)
+
+    def run(self) -> None:
+        """Sequential queue execution loop."""
+        total_items = len(self.items)
+        if total_items == 0:
+            self.progress.emit(100)
+            self.finished.emit(0)
+            return
+
+        success_count = 0
+        logger.info("Starting sequential download queue (%d items)", total_items)
+
+        for index, item in enumerate(self.items):
+            if self._is_cancelled:
+                logger.warning("Download queue cancelled by user.")
+                break
+
+            item_id = str(
+                item.get("id") or item.get("shortcode") or item.get("url") or index
+            )
+            self.item_started.emit(item_id)
+
+            try:
+                saved_path = self._process_single_item(item, index, total_items)
+                if self._is_cancelled:
+                    self.item_finished.emit(item_id, False)
+                    break
+
+                if saved_path and (
+                    os.path.exists(saved_path) or os.path.isdir(self.save_folder)
+                ):
+                    success_count += 1
+                    self.item_finished.emit(item_id, True)
+                else:
+                    self.item_finished.emit(item_id, False)
+            except Exception as exc:
+                if self._is_cancelled:
+                    self.item_finished.emit(item_id, False)
+                    break
+                logger.error(
+                    "Error downloading item %s: %s", item_id, exc, exc_info=True
+                )
+                self.item_finished.emit(item_id, False)
+
+            curr_prog = int(((index + 1) / total_items) * 100)
+            self.progress.emit(curr_prog)
+
+        self.progress.emit(100)
+        self.finished.emit(success_count)

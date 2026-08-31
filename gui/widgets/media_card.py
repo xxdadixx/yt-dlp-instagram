@@ -459,29 +459,30 @@ class MediaCard(QFrame):
         self.lbl_thumb.clicked.connect(self.open_image_gallery)
         layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        # 2. Middle Layer: Etched Metadata Surface
+        # 2. Middle Layer: Etched Metadata Surface (Title + Details Row)
         details_layout = QVBoxLayout()
         details_layout.setContentsMargins(0, 2, 0, 2)
-        details_layout.setSpacing(6)
+        details_layout.setSpacing(5)
 
-        # Title
-        raw_title = str(
-            self.item_data.get("title")
-            or self.item_data.get("caption")
-            or "Instagram Media"
-        ).strip()
-        display_title = raw_title.splitlines()[0] if raw_title else "Instagram Media"
-        if len(display_title) > 92:
-            display_title = display_title[:89] + "..."
+        # Title Label with Elision & Full Hover Tooltip
+        raw_title = str(self.item_data.get("title") or "")
+        full_caption = str(self.item_data.get("caption") or raw_title)
 
-        self.lbl_title = QLabel(display_title, self)
-        self.lbl_title.setObjectName("CardTitle")
-        self.lbl_title.setFont(
-            self._get_app_font(size=10, weight=QFont.Weight.DemiBold)
-        )
+        self.lbl_title = QLabel(self)
+        self.lbl_title.setFont(self._get_app_font(size=9, weight=QFont.Weight.Medium))
         self.lbl_title.setStyleSheet(
-            "color: #F8FAFC; background: transparent; border: none;"
+            "color: #FFFFFF; background: transparent; border: none;"
         )
+
+        if len(raw_title) > 65:
+            display_title = raw_title[:62].rstrip() + "..."
+        else:
+            display_title = raw_title
+
+        self.lbl_title.setText(display_title)
+        if full_caption:
+            self.lbl_title.setToolTip(full_caption)
+
         details_layout.addWidget(self.lbl_title)
 
         # Metadata Badges Row
