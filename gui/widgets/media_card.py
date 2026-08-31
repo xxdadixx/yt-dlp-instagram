@@ -5,6 +5,7 @@ gui/widgets/media_card.py - Instagram-styled Media Card with interactive hover z
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import QByteArray, QPoint, QPointF, QRectF, Qt, pyqtSignal
@@ -100,7 +101,32 @@ STATUS_STYLES = {
     },
 }
 
-logger = logging.getLogger(__name__)
+
+class ThumbnailCache:
+    """Thread-safe in-memory cache for raw thumbnail byte buffers."""
+
+    _lock = threading.RLock()
+    _cache: Dict[str, bytes] = {}
+
+    @classmethod
+    def get(cls, url: str) -> Optional[bytes]:
+        with cls._lock:
+            return cls._cache.get(url)
+
+    @classmethod
+    def set(cls, url: str, data: bytes) -> None:
+        with cls._lock:
+            cls._cache[url] = data
+
+    @classmethod
+    def clear(cls) -> None:
+        with cls._lock:
+            cls._cache.clear()
+
+    @classmethod
+    def contains(cls, url: str) -> bool:
+        with cls._lock:
+            return url in cls._cache
 
 
 class ThumbnailHoverPopup(QWidget):
@@ -400,6 +426,7 @@ class MediaCard(QFrame):
         )
         self.status: str = str(self.item_data.get("status", "ready"))
         self.thumb_loader: Optional[ThumbnailLoader] = None
+        self._is_cleaned_up: bool = False
 
         # Interaction & Specular Physics Tracking
         self._cursor_pos: QPointF = QPointF(-100, -100)
@@ -781,14 +808,21 @@ class MediaCard(QFrame):
         return self.item_data
 
     def cleanup(self) -> None:
+        """Explicitly cancels background loaders and cleans up child graphics."""
+        self._is_cleaned_up = True
         if hasattr(self, "lbl_thumb") and getattr(
             self.lbl_thumb, "_preview_popup", None
         ):
             self.lbl_thumb._preview_popup.hide()
             self.lbl_thumb._preview_popup.deleteLater()
             self.lbl_thumb._preview_popup = None
-        if self.thumb_loader and self.thumb_loader.isRunning():
-            self.thumb_loader.wait(200)
+
+        if self.thumb_loader is not None:
+            if self.thumb_loader.isRunning():
+                self.thumb_loader.cancel()
+                self.thumb_loader.quit()
+                self.thumb_loader.wait(200)
+            self.thumb_loader = None
 
     def open_image_gallery(self) -> None:
         slides = self.item_data.get("slides")

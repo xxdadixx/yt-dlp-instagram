@@ -251,7 +251,11 @@ class ImageDownloadWorker(QThread):
             req = urllib.request.Request(
                 self.url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/128.0.0.0 Safari/537.36"
+                    ),
                     "Referer": "https://www.instagram.com/",
                 },
             )
@@ -263,27 +267,6 @@ class ImageDownloadWorker(QThread):
                     self.image_loaded.emit(self.index, data)
         except Exception:
             pass
-
-    # ในคลาส ImageViewerDialog เพิ่มเมธอด lifecycle cleanup:
-    def closeEvent(self, event) -> None:
-        """Stops and cleans up background download workers upon closing."""
-        for worker in self.active_workers:
-            if worker.isRunning():
-                worker.cancel()
-                worker.quit()
-                worker.wait(150)
-        self.active_workers.clear()
-        super().closeEvent(event)
-
-    def reject(self) -> None:
-        """Handles Escape key and system dismiss safely."""
-        for worker in self.active_workers:
-            if worker.isRunning():
-                worker.cancel()
-                worker.quit()
-                worker.wait(150)
-        self.active_workers.clear()
-        super().reject()
 
 
 class ImageViewerDialog(QDialog):
@@ -482,6 +465,26 @@ class ImageViewerDialog(QDialog):
         super().resizeEvent(event)
         if self.current_index in self.pixmap_cache:
             self.viewport.set_image_direct(self.pixmap_cache[self.current_index])
+
+    def closeEvent(self, event) -> None:
+        """Stops and cleans up background download workers upon closing."""
+        for worker in self.active_workers:
+            if worker.isRunning():
+                worker.cancel()
+                worker.quit()
+                worker.wait(150)
+        self.active_workers.clear()
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        """Handles Escape key and system dismiss safely."""
+        for worker in self.active_workers:
+            if worker.isRunning():
+                worker.cancel()
+                worker.quit()
+                worker.wait(150)
+        self.active_workers.clear()
+        super().reject()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Left:

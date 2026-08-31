@@ -279,6 +279,7 @@ class MainWindow(QMainWindow):
         self.lbl_queue_count = QLabel(self)
         self.lbl_queue_count.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.lbl_queue_count.setStyleSheet("color: #FFFFFF;")
+        self.lbl_selected_count = self.lbl_queue_count  # Compatibility Alias
         queue_bar.addWidget(self.lbl_queue_count)
 
         queue_bar.addStretch()
@@ -372,6 +373,10 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Delete"), self, self.delete_selected_cards)
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, self.start_download)
         QShortcut(QKeySequence(Qt.Key.Key_Enter), self, self.start_download)
+
+    def clear_media_grid(self) -> None:
+        """Compatibility alias for clearing all media cards in queue."""
+        self.clear_all_cards()
 
     def _setup_logging(self) -> None:
         """Configures QtLogHandler to intercept application logs and forward them to the UI."""

@@ -180,6 +180,13 @@ class DownloadWorker(QThread):
             headers["Cookie"] = self.cookie_str
         return headers
 
+    def sanitize_filename(value: str, fallback: str = "media") -> str:
+        """Sanitizes filename strings for safe OS filesystem writes."""
+        from utils.file_utils import sanitize_filesystem_name
+
+        cleaned = sanitize_filesystem_name(str(value), max_length=64)
+        return cleaned if cleaned else fallback
+
     def _download_direct_stream(
         self, url: str, target_path: str, index: int, total_items: int
     ) -> str:

@@ -52,6 +52,7 @@ class ResilientSession:
         cookies: dict[str, str] | None = None,
         proxy_url: str | None = None,
         circuit_config: CircuitBreakerConfig | None = None,
+        verify_ssl: bool = True,
     ) -> None:
         self.circuit_config = circuit_config or CircuitBreakerConfig()
         self.circuit_state = CircuitState.CLOSED
@@ -59,7 +60,12 @@ class ResilientSession:
         self.last_state_change = time.time()
         self.proxy_url = proxy_url
         self.cookies: dict[str, str] = cookies or {}
-        self._ssl_ctx = ssl._create_unverified_context()
+
+        # Enforce secure TLS certificate verification by default
+        if verify_ssl:
+            self._ssl_ctx = ssl.create_default_context()
+        else:
+            self._ssl_ctx = ssl._create_unverified_context()
 
         if cffi_requests is not None:
             self._session = cffi_requests.Session(impersonate="chrome120")
