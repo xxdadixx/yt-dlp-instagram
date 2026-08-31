@@ -4,8 +4,6 @@ gui/widgets/media_card.py - Instagram-styled Media Card with interactive hover z
 
 from __future__ import annotations
 
-from __future__ import annotations
-
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -13,12 +11,12 @@ from PyQt6.QtCore import QByteArray, QPoint, QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QFont,
+    QLinearGradient,
     QMouseEvent,
     QPainter,
     QPainterPath,
     QPixmap,
     QRadialGradient,
-    QLinearGradient,
 )
 from PyQt6.QtWidgets import (
     QApplication,

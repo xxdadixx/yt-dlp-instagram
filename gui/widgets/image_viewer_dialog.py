@@ -239,8 +239,14 @@ class ImageDownloadWorker(QThread):
         super().__init__(parent)
         self.index = index
         self.url = url
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
 
     def run(self) -> None:
+        if self._is_cancelled:
+            return
         try:
             req = urllib.request.Request(
                 self.url,
@@ -249,12 +255,35 @@ class ImageDownloadWorker(QThread):
                     "Referer": "https://www.instagram.com/",
                 },
             )
-            with urllib.request.urlopen(req, timeout=15) as response:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                if self._is_cancelled:
+                    return
                 data = response.read()
-                if data:
+                if data and not self._is_cancelled:
                     self.image_loaded.emit(self.index, data)
         except Exception:
             pass
+
+    # ในคลาส ImageViewerDialog เพิ่มเมธอด lifecycle cleanup:
+    def closeEvent(self, event) -> None:
+        """Stops and cleans up background download workers upon closing."""
+        for worker in self.active_workers:
+            if worker.isRunning():
+                worker.cancel()
+                worker.quit()
+                worker.wait(150)
+        self.active_workers.clear()
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        """Handles Escape key and system dismiss safely."""
+        for worker in self.active_workers:
+            if worker.isRunning():
+                worker.cancel()
+                worker.quit()
+                worker.wait(150)
+        self.active_workers.clear()
+        super().reject()
 
 
 class ImageViewerDialog(QDialog):

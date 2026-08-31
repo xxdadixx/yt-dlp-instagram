@@ -209,6 +209,9 @@ class UnifiedInstagramParser:
         )
 
 
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
 def sanitize_instagram_url(url: str) -> str:
     """Strip tracking and pagination query parameters from the Instagram URL."""
     if not url:
@@ -274,64 +277,131 @@ def normalize_url(url: str) -> str:
     return cleaned
 
 
-def parse_instagram_url(url: str) -> Dict[str, Optional[str]]:
+def id_to_shortcode(media_id: int | str) -> str:
+    """Converts a numeric Instagram media ID to its Base64 shortcode representation."""
+    try:
+        num = int(media_id)
+    except (ValueError, TypeError):
+        return ""
+
+    if num == 0:
+        return ALPHABET[0]
+
+    shortcode_chars: list[str] = []
+    while num > 0:
+        num, remainder = divmod(num, 64)
+        shortcode_chars.append(ALPHABET[remainder])
+    return "".join(reversed(shortcode_chars))
+
+
+def parse_instagram_url(url: str) -> Dict[str, Any]:
     """
     Parses and normalizes Instagram URLs into routing targets matching InspectWorker's schema.
+    Supports raw URLs, handle strings (@username), and query stripping.
     """
     cleaned_url = (url or "").strip()
+    if not cleaned_url:
+        return {
+            "valid": False,
+            "type": "unknown",
+            "username": None,
+            "shortcode": None,
+            "identifier": None,
+        }
+
+    # Handle raw usernames prefixed with @
+    if cleaned_url.startswith("@"):
+        clean_user = cleaned_url.lstrip("@").strip()
+        return {
+            "valid": bool(clean_user),
+            "type": "profile",
+            "username": clean_user,
+            "shortcode": None,
+            "identifier": f"{clean_user}_all_posts",
+        }
+
+    # Handle domainless / shorthand input paths
+    if not cleaned_url.startswith(("http://", "https://")):
+        cleaned_url = "https://www.instagram.com/" + cleaned_url.lstrip("/")
+
     parsed = urlparse(cleaned_url)
     path = parsed.path.strip("/")
     segments = [seg for seg in path.split("/") if seg]
 
     if not segments:
-        return {"type": "unknown", "username": None, "shortcode": None}
+        return {
+            "valid": False,
+            "type": "unknown",
+            "username": None,
+            "shortcode": None,
+            "identifier": None,
+        }
 
     first = segments[0].lower()
 
-    # Single media: /p/{shortcode}, /reel/{shortcode}, /reels/{shortcode}, /tv/{shortcode}
-    if first in {"p", "reel", "reels", "tv"} and len(segments) >= 2:
+    # Direct posts / reels / TV: /p/{code}, /reel/{code}, /reels/{code}, /tv/{code}
+    if first in {"p", "post", "reel", "reels", "tv"} and len(segments) >= 2:
+        code = segments[1]
+        media_type = "reel" if first in {"reel", "reels"} else "post"
+        if "img_index=" in parsed.query:
+            media_type = "carousel"
         return {
-            "type": "reel" if first in {"reel", "reels"} else "post",
+            "valid": True,
+            "type": media_type,
             "username": None,
-            "shortcode": segments[1],
+            "shortcode": code,
+            "identifier": code,
         }
 
     # Stories: /stories/{username}/{story_id?}
     if first == "stories" and len(segments) >= 2:
+        user = segments[1]
+        story_id = segments[2] if len(segments) >= 3 else None
         return {
-            "type": "story",
-            "username": segments[1],
-            "shortcode": segments[2] if len(segments) >= 3 else None,
+            "valid": True,
+            "type": "story" if story_id else "story_user",
+            "username": user,
+            "shortcode": story_id,
+            "identifier": story_id or f"{user}_all_stories",
         }
 
-    # User profile / Reels tab: /{username}/reels/ or /{username}/
+    # User Profile or Reels Tab: /{username}/ or /{username}/reels/
     if first not in RESERVED_ROOT_PATHS:
-        username = segments[0]
+        username = segments[0].lstrip("@")
         if len(segments) >= 2 and segments[1].lower() in {"reels", "reel"}:
             return {
+                "valid": True,
                 "type": "profile_reels",
                 "username": username,
                 "shortcode": None,
+                "identifier": f"{username}_all_reels",
             }
         return {
+            "valid": True,
             "type": "profile",
             "username": username,
             "shortcode": None,
+            "identifier": f"{username}_all_posts",
         }
 
-    return {"type": "unknown", "username": None, "shortcode": None}
+    return {
+        "valid": False,
+        "type": "unknown",
+        "username": None,
+        "shortcode": None,
+        "identifier": None,
+    }
 
 
 def shortcode_to_id(shortcode: str) -> Optional[int]:
     """Converts an Instagram Base64 shortcode to a numeric media ID."""
-    if not shortcode:
+    if not shortcode or not isinstance(shortcode, str):
         return None
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     media_id = 0
     for char in shortcode:
-        if char not in alphabet:
+        if char not in ALPHABET:
             return None
-        media_id = (media_id * 64) + alphabet.index(char)
+        media_id = (media_id * 64) + ALPHABET.index(char)
     return media_id
 
 

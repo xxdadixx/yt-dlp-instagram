@@ -623,26 +623,6 @@ class MainWindow(QMainWindow):
         self._last_selected_card = card
         self.update_selection_counter()
 
-    def _update_selection_ui(self):
-        """Update header selection counter and download button availability."""
-        cards = self.get_all_media_cards()
-        total_count = len(cards)
-        selected_count = sum(1 for c in cards if c.is_selected)
-
-        # Update queue header label
-        self.queue_header_label.setText(
-            f"Media Queue ({selected_count}/{total_count} Selected)"
-        )
-
-        # Enable/Disable download action button based on active selection
-        self.download_button.setEnabled(selected_count > 0)
-
-        # Sync Select All button text state
-        if total_count > 0 and selected_count == total_count:
-            self.select_all_btn.setText(self.tr("Deselect All"))
-        else:
-            self.select_all_btn.setText(self.tr("Select All"))
-
     def toggle_select_all(self) -> None:
         """
         Toggles all cards between Selected and Deselected.
@@ -659,50 +639,6 @@ class MainWindow(QMainWindow):
             card.set_selected(new_state)
 
         self.update_selection_counter()
-
-    def _update_queue_action_buttons(self) -> None:
-        """
-        Updates the queue header label, tab text, select-all button text, and download button state.
-        """
-        if not hasattr(self, "media_cards"):
-            return
-
-        total_count = len(self.media_cards)
-        selected_count = sum(1 for c in self.media_cards if c.is_selected)
-
-        # Update Header label
-        if hasattr(self, "lbl_queue_header") and self.lbl_queue_header:
-            self.lbl_queue_header.setText(
-                f"Media Queue ({selected_count}/{total_count} Selected)"
-            )
-        elif hasattr(self, "lbl_queue_title") and self.lbl_queue_title:
-            self.lbl_queue_title.setText(
-                f"Media Queue ({selected_count}/{total_count} Selected)"
-            )
-
-        # Update Tab Title
-        if hasattr(self, "tab_widget") and self.tab_widget:
-            self.tab_widget.setTabText(
-                0, f"Media Queue ({selected_count}/{total_count})"
-            )
-
-        # Update Select All / Deselect All Button Label
-        if hasattr(self, "btn_select_all") and self.btn_select_all:
-            if total_count > 0 and selected_count == total_count:
-                self.btn_select_all.setText("Deselect All")
-            else:
-                self.btn_select_all.setText("Select All")
-
-        # Update Download Button State
-        if hasattr(self, "btn_download") and self.btn_download:
-            self.btn_download.setEnabled(selected_count > 0)
-
-    def _create_media_card(self, item_data: dict) -> MediaCard:
-        card = MediaCard(item_data, parent=self)
-        card.card_clicked.connect(self._on_card_clicked)
-        card.selection_changed.connect(self._update_queue_action_buttons)
-        card.deleted.connect(lambda c=card: self._on_card_deleted(c))
-        return card
 
     def smooth_scroll_queue_to_bottom(self) -> None:
         v_bar = self.scroll_area.verticalScrollBar()

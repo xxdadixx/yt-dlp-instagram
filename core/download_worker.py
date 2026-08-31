@@ -435,9 +435,14 @@ class DownloadWorker(QThread):
                     self.item_finished.emit(item_id, False)
                     break
 
-                if saved_path and (
-                    os.path.exists(saved_path) or os.path.isdir(self.save_folder)
-                ):
+                # Ensure target file actually exists on filesystem and is non-empty
+                is_valid_download = bool(
+                    saved_path
+                    and os.path.isfile(saved_path)
+                    and os.path.getsize(saved_path) > 0
+                )
+
+                if is_valid_download:
                     success_count += 1
                     self.item_finished.emit(item_id, True)
                 else:
