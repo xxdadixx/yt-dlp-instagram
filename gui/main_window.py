@@ -96,7 +96,8 @@ class MainWindow(QMainWindow):
         self.update_cookie_status()
 
     def _setup_crawl_limit_selector(self) -> None:
-        """Initializes preset limit selector supporting extended batch sizes with userData."""
+        """Initializes preset limit selector supporting extended batch sizes."""
+        self.combo_batch_limit.blockSignals(True)
         self.combo_batch_limit.clear()
 
         presets = [
@@ -106,14 +107,19 @@ class MainWindow(QMainWindow):
             ("240 items (Macro-Paced)", 240),
             ("480 items (Deep Crawl)", 480),
             ("960 items (High Capacity)", 960),
-            ("All Available (Full Profile)", 0),
+            ("All Available (No Limit)", 0),
         ]
 
         for label, limit_val in presets:
             self.combo_batch_limit.addItem(label, userData=limit_val)
 
-        # Default to 72 items (Index 1)
-        self.combo_batch_limit.setCurrentIndex(1)
+        self.combo_batch_limit.setSizeAdjustPolicy(
+            NoScrollComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.combo_batch_limit.view().setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.combo_batch_limit.setMinimumWidth(165)
+        self.combo_batch_limit.setCurrentIndex(1)  # Default: 72 items
+        self.combo_batch_limit.blockSignals(False)
 
     def get_all_media_cards(self) -> list[MediaCard]:
         """Return all active MediaCard widgets currently present in the queue."""
@@ -191,13 +197,15 @@ class MainWindow(QMainWindow):
         self.url_container.urls_changed.connect(self._on_urls_list_updated)
         main_layout.addWidget(self.url_container.input_widget)
 
-        # 3. Action Strip: Auto-Paste + Profile Mode Filter + Inspect Action
+        # 3. Action Strip: Auto-Paste + Profile Mode Filter + Crawl Limit + Inspect Action
         action_strip = QHBoxLayout()
         action_strip.setContentsMargins(2, 0, 2, 0)
-        action_strip.setSpacing(8)
+        action_strip.setSpacing(10)
 
+        # Checkbox with explicit minimum width to prevent text truncation
         self.chk_clipboard = QCheckBox(self)
         self.chk_clipboard.setChecked(self.auto_clipboard)
+        self.chk_clipboard.setMinimumWidth(175)
         self.chk_clipboard.stateChanged.connect(self._on_clipboard_toggle)
         action_strip.addWidget(self.chk_clipboard)
 
@@ -211,6 +219,11 @@ class MainWindow(QMainWindow):
 
         self.combo_profile_mode = NoScrollComboBox(self)
         self.combo_profile_mode.setFixedHeight(32)
+        self.combo_profile_mode.setMinimumWidth(140)
+        self.combo_profile_mode.setSizeAdjustPolicy(
+            NoScrollComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.combo_profile_mode.view().setTextElideMode(Qt.TextElideMode.ElideNone)
         mode_idx = (
             0
             if self.profile_mode == "all"
@@ -223,9 +236,7 @@ class MainWindow(QMainWindow):
         )
         action_strip.addWidget(self.combo_profile_mode)
 
-        # -----------------------------------------------------------------
-        # >>> ADD CRAWL LIMIT SELECTOR HERE <<<
-        # -----------------------------------------------------------------
+        # Crawl Limit Dropdown
         self.lbl_batch_limit = QLabel("Crawl Limit:", self)
         self.lbl_batch_limit.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
         self.lbl_batch_limit.setStyleSheet("color: #A0A0B2;")
@@ -235,21 +246,11 @@ class MainWindow(QMainWindow):
         self.combo_batch_limit.setFixedHeight(32)
         self._setup_crawl_limit_selector()
         action_strip.addWidget(self.combo_batch_limit)
-        self.combo_batch_limit.addItems(
-            [
-                "36 items (Fast)",
-                "72 items (Safe)",
-                "120 items (Deep)",
-                "240 items (Macro-Paced)",
-            ]
-        )
-        self.combo_batch_limit.setCurrentIndex(1)  # Default: 72 items
-        action_strip.addWidget(self.combo_batch_limit)
-        # -----------------------------------------------------------------
 
         self.btn_inspect = QPushButton(self)
         self.btn_inspect.setObjectName("PrimaryActionButton")
         self.btn_inspect.setFixedHeight(34)
+        self.btn_inspect.setMinimumWidth(125)
         self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 13)
         self.btn_inspect.clicked.connect(self.start_inspection)
         action_strip.addWidget(self.btn_inspect)
@@ -512,12 +513,12 @@ class MainWindow(QMainWindow):
         self.tab_widget.setCurrentIndex(0)
 
         # Retrieve integer limit value stored in the item's userData
-        limit_data = (
+        raw_limit_data = (
             self.combo_batch_limit.currentData()
             if hasattr(self, "combo_batch_limit")
-            else 72
+            else None
         )
-        selected_limit = int(limit_data) if limit_data is not None else 72
+        selected_limit = int(raw_limit_data) if raw_limit_data is not None else 72
 
         self.inspect_worker = InspectWorker(
             targets=targets,
