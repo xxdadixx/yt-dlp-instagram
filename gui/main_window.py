@@ -100,15 +100,12 @@ class MainWindow(QMainWindow):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.cards: List[MediaCard] = []
+        self._card_id_set: Set[str] = set()
+        self._card_sort_keys: List[int] = []
         self._last_selected_index: int = -1
         self._last_selected_card: Optional[MediaCard] = None
         self.inspect_worker: Optional[InspectWorker] = None
         self.download_worker: Optional[DownloadWorker] = None
-
-        # Cookie Manager
-        self.cookie_manager = CookieManager()
-        self.cookie_str: str = self.cookie_manager.get_cookie_string()
-        self.cookie_file: str = self.cookie_manager.get_cookie_file_path() or ""
 
         # Defaults
         self.save_folder: str = os.path.abspath("downloads")
@@ -118,16 +115,21 @@ class MainWindow(QMainWindow):
         self.quality_preset: str = "best_video"
         self._last_clipboard_text: str = ""
         self._queue_scroll_anim: Optional[QPropertyAnimation] = None
-
-        # Window Position & Geometry State
         self._saved_geometry_hex: str = ""
         self._is_maximized: bool = False
 
         self.load_settings()
         os.makedirs(self.save_folder, exist_ok=True)
 
+        # Logging and UI initialization
         self._setup_logging()
         self.init_ui()
+
+        # Cookie Manager
+        self.cookie_manager = CookieManager()
+        self.cookie_str: str = self.cookie_manager.get_cookie_string()
+        self.cookie_file: str = self.cookie_manager.get_cookie_file_path() or ""
+
         self.apply_translations()
         self.setup_clipboard_monitor()
         self.update_cookie_status()
@@ -597,37 +599,47 @@ class MainWindow(QMainWindow):
         self._update_action_button_states()
 
     def add_card(self, item_data: Dict[str, Any]) -> None:
-        """Inserts media item into UI maintaining chronological ordering."""
+        """
+        Inserts media item into UI in O(log N) time using binary search insertion
+        and O(1) deduplication to prevent UI layout freezing.
+        """
+        import bisect
+
         new_id = str(
             item_data.get("id")
             or item_data.get("shortcode")
             or item_data.get("url")
             or ""
         )
-        new_c_idx = item_data.get("carousel_index")
+        c_idx = str(item_data.get("carousel_index", ""))
+        dedup_key = f"{new_id}::{c_idx}" if new_id else ""
 
-        for existing in self.cards:
-            ed = getattr(existing, "item_data", {})
-            eid = str(ed.get("id") or ed.get("shortcode") or ed.get("url") or "")
-            if new_id and eid == new_id and ed.get("carousel_index") == new_c_idx:
-                return
+        if dedup_key and dedup_key in self._card_id_set:
+            return
 
         card = MediaCard(item_data, parent=self)
         card.deleted.connect(lambda: self.remove_card(card))
         card.card_clicked.connect(self._on_card_clicked)
         card.selection_changed.connect(self.update_selection_counter)
 
-        new_key = extract_chronological_key(item_data)
+        # Monotonic sorting key: reverse order requires bisecting negated keys
+        sort_key = extract_chronological_key(item_data)
+        neg_key = -sort_key
 
-        target_idx = len(self.cards)
-        for idx, existing_card in enumerate(self.cards):
-            existing_key = extract_chronological_key(existing_card.get_item_data())
-            if new_key > existing_key:
-                target_idx = idx
-                break
+        # Binary search insertion index: O(log N)
+        target_idx = bisect.bisect_right(self._card_sort_keys, neg_key)
 
+        self._card_sort_keys.insert(target_idx, neg_key)
         self.cards.insert(target_idx, card)
-        self.media_grid_layout.insertWidget(target_idx, card)
+        if dedup_key:
+            self._card_id_set.add(dedup_key)
+
+        # Suspend widget repaint during layout re-indexing
+        self.scroll_widget.setUpdatesEnabled(False)
+        try:
+            self.media_grid_layout.insertWidget(target_idx, card)
+        finally:
+            self.scroll_widget.setUpdatesEnabled(True)
 
         self.update_selection_counter()
         self._update_action_button_states()
@@ -686,7 +698,17 @@ class MainWindow(QMainWindow):
 
     def remove_card(self, card: MediaCard) -> None:
         if card in self.cards:
-            self.cards.remove(card)
+            idx = self.cards.index(card)
+            self.cards.pop(idx)
+            if idx < len(self._card_sort_keys):
+                self._card_sort_keys.pop(idx)
+
+            ed = card.get_item_data()
+            cid = str(ed.get("id") or ed.get("shortcode") or ed.get("url") or "")
+            c_idx = str(ed.get("carousel_index", ""))
+            dedup_key = f"{cid}::{c_idx}" if cid else ""
+            self._card_id_set.discard(dedup_key)
+
         self.media_grid_layout.removeWidget(card)
         card.cleanup()
         card.setParent(None)
@@ -808,7 +830,6 @@ class MainWindow(QMainWindow):
         self._update_action_button_states()
 
     def clear_all_cards(self) -> None:
-        """Batches deletion of all media cards to prevent UI layout freezing."""
         if not self.cards:
             return
 
@@ -820,6 +841,8 @@ class MainWindow(QMainWindow):
                 card.setParent(None)
                 card.deleteLater()
             self.cards.clear()
+            self._card_id_set.clear()
+            self._card_sort_keys.clear()
         finally:
             self.scroll_widget.setUpdatesEnabled(True)
 

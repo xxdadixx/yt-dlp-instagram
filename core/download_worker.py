@@ -135,12 +135,9 @@ class DownloadWorker(QThread):
         self.session.headers.update(headers)
 
     def cancel(self) -> None:
-        """Signals the worker to abort active downloads immediately."""
+        """Signals the worker to abort active downloads cooperatively."""
         self._is_cancelled = True
-        try:
-            self.session.close()
-        except Exception:
-            pass
+        self.requestInterruption()
 
     def _build_filename(
         self,
@@ -202,14 +199,18 @@ class DownloadWorker(QThread):
     def _download_direct_stream(
         self, url: str, target_path: str, index: int, total_items: int
     ) -> str:
-        chunk_size = 256 * 1024
+        chunk_size = 256 * 1024  # 256 KB streaming chunks
         temp_path = f"{target_path}.part"
         req_headers = self._get_download_headers(url)
         completed_successfully = False
 
         try:
             with self.session.get(
-                url, headers=req_headers, stream=True, timeout=(6.0, 30.0)
+                url,
+                headers=req_headers,
+                stream=True,
+                timeout=(6.0, 30.0),
+                verify=True,
             ) as response:
                 response.raise_for_status()
                 try:
@@ -222,7 +223,7 @@ class DownloadWorker(QThread):
 
                 with open(temp_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=chunk_size):
-                        if self._is_cancelled:
+                        if self._is_cancelled or self.isInterruptionRequested():
                             raise InterruptedError("Download cancelled by user.")
 
                         if chunk:
@@ -245,12 +246,17 @@ class DownloadWorker(QThread):
                                 )
                                 self.progress.emit(min(overall_percent, 99))
 
-            if self._is_cancelled:
+            if self._is_cancelled or self.isInterruptionRequested():
                 raise InterruptedError("Download cancelled by user.")
 
             os.replace(temp_path, target_path)
             completed_successfully = True
             return target_path
+
+        except (requests.exceptions.RequestException, OSError, InterruptedError) as exc:
+            if not self._is_cancelled:
+                logger.warning("Stream failed for target %s: %s", target_path, exc)
+            return ""
 
         finally:
             if not completed_successfully and os.path.exists(temp_path):
@@ -267,7 +273,7 @@ class DownloadWorker(QThread):
         index: int,
         total_items: int,
     ) -> str:
-        if yt_dlp is None or self._is_cancelled:
+        if yt_dlp is None or self._is_cancelled or self.isInterruptionRequested():
             return ""
 
         url = str(
@@ -296,7 +302,7 @@ class DownloadWorker(QThread):
 
         def ytdlp_hook(d: Dict[str, Any]) -> None:
             nonlocal last_progress_time
-            if self._is_cancelled:
+            if self._is_cancelled or self.isInterruptionRequested():
                 raise yt_dlp.utils.DownloadCancelled("Download cancelled by user.")
 
             if d.get("status") == "downloading":
@@ -314,7 +320,7 @@ class DownloadWorker(QThread):
             "quiet": True,
             "no_warnings": True,
             "progress_hooks": [ytdlp_hook],
-            "nocheckcertificate": True,
+            "nocheckcertificate": False,  # Strict TLS Certificate Chain Verification
             "buffersize": 256 * 1024,
             "http_chunk_size": 10485760,
             "concurrent_fragment_downloads": 4,
@@ -334,9 +340,8 @@ class DownloadWorker(QThread):
                     return ydl.prepare_filename(info["entries"][0])
                 return ydl.prepare_filename(info)
         except Exception as exc:
-            if self._is_cancelled:
-                return ""
-            logger.warning("yt-dlp download failed for %s: %s", url, exc)
+            if not self._is_cancelled:
+                logger.warning("yt-dlp download failed for %s: %s", url, exc)
             return ""
 
     def _process_single_item(

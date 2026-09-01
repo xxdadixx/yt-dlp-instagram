@@ -3,6 +3,6 @@
 # This is a template cookie file for Instagram Pro Downloader.
 # Export cookies from your authenticated browser session to populate this file.
 
-# .instagram.com	TRUE	/	TRUE	2147483647	csrftoken	YOUR_CSRF_TOKEN_HERE
-# .instagram.com	TRUE	/	TRUE	2147483647	ds_user_id	YOUR_USER_ID_HERE
-# .instagram.com	TRUE	/	TRUE	2147483647	sessionid	YOUR_SESSION_ID_HERE
+# .instagram.com	TRUE	/	TRUE	2147483647	csrftoken	txSy1ulFN8sEj2G81ClqbBCbfcZjUTOf
+# .instagram.com	TRUE	/	TRUE	2147483647	ds_user_id	2320467545
+# .instagram.com	TRUE	/	TRUE	2147483647	sessionid	2320467545%3A5Uiq8qyWrKSTA1%3A15%3AAYgPYy8J70kXxZ2YUxXZcqfWNkS83lES4uYszAUTjLUZ

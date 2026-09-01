@@ -27,15 +27,41 @@ class CookieManager:
         self.cookies: Dict[str, str] = {}
         self._cookie_string: str = ""
 
+        # Scan candidate paths in order of priority
+        candidate_paths: List[str] = []
         if cookie_file:
-            self.cookie_file_path = os.path.abspath(cookie_file)
-        else:
-            self.cookie_file_path = os.path.join(
-                get_user_data_dir(), "instagram_cookies.txt"
-            )
+            candidate_paths.append(os.path.abspath(cookie_file))
 
-        if os.path.exists(self.cookie_file_path):
-            self.load_from_file(self.cookie_file_path)
+        # 1. User Application Data (%APPDATA%/InstagramProDownloader)
+        candidate_paths.append(
+            os.path.join(get_user_data_dir(), "instagram_cookies.txt")
+        )
+        # 2. Project Root Directory
+        candidate_paths.append(os.path.abspath("instagram_cookies.txt"))
+        # 3. Project Config Directory
+        candidate_paths.append(
+            os.path.abspath(os.path.join("config", "instagram_cookies.txt"))
+        )
+
+        self.cookie_file_path = os.path.join(
+            get_user_data_dir(), "instagram_cookies.txt"
+        )
+
+        # Auto-load from the first existing candidate containing actual session tokens
+        for path in candidate_paths:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                try:
+                    content = self._read_file_content(path)
+                    if any(
+                        token in content
+                        for token in ("sessionid", "csrftoken", "ds_user_id")
+                    ):
+                        if self.import_cookie_file(path):
+                            self.cookie_file_path = os.path.abspath(path)
+                            logger.info("Auto-loaded active cookies from: %s", path)
+                            break
+                except Exception as exc:
+                    logger.debug("Could not read cookie candidate %s: %s", path, exc)
 
     def load_from_file(self, file_path: str) -> bool:
         """Loads and parses cookies from a target file path."""

@@ -1183,28 +1183,79 @@ class InspectWorker(QThread):
         }
         return [card]
 
+    def get_cookie_opener(
+        cookie_path: Optional[str] = None,
+    ) -> urllib.request.OpenerDirector:
+        """
+        Constructs an isolated OpenerDirector configured with certificate verification
+        and Netscape cookie jar session handling at module scope.
+        """
+        handlers: List[urllib.request.BaseHandler] = []
+        try:
+            import certifi
+
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            ctx = ssl.create_default_context()
+
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+
+        if cookie_path and os.path.exists(cookie_path):
+            import http.cookiejar
+
+            cj = http.cookiejar.MozillaCookieJar(cookie_path)
+            try:
+                cj.load(ignore_discard=True, ignore_expires=True)
+                handlers.append(urllib.request.HTTPCookieProcessor(cj))
+            except Exception as exc:
+                logger.debug(
+                    "Failed to load MozillaCookieJar from %s: %s", cookie_path, exc
+                )
+
+        return urllib.request.build_opener(*handlers)
+
     def _inspect_single_post(
         self, shortcode: str, raw_target: str = "", media_type: str = "POST"
     ) -> List[Dict[str, Any]]:
-        """Tier 1 -> Tier 2 -> Tier 3 inspection for single post URLs."""
-        target_url = raw_target or f"https://www.instagram.com/p/{shortcode}/"
+        """Multi-tier post resolution: Public Embed -> Mobile API -> Authenticated Web JSON -> yt-dlp."""
+        target_url = raw_target or f"{IG_BASE_URL}/p/{shortcode}/"
 
-        # Tier 1: Instagram Mobile Media Info API (Unauthenticated First)
+        # Tier 0.5: Instagram Embed Iframe (Resolves public posts without login wall)
+        embed_url = f"{IG_BASE_URL}/p/{shortcode}/embed/captioned/"
+        opener = get_cookie_opener(self.cookie_file)
+        try:
+            req = urllib.request.Request(
+                embed_url, headers=self._build_headers(require_auth=False)
+            )
+            with opener.open(req, timeout=10) as resp:
+                html_text = resp.read().decode("utf-8", errors="replace")
+                card = self._extract_from_embed_html(
+                    html_text, shortcode, raw_target=target_url
+                )
+                if card:
+                    with self._lock:
+                        cid = str(card["id"])
+                        if cid not in self.seen_ids:
+                            self.seen_ids.add(cid)
+                            self.item_found.emit(card)
+                            self.media_found.emit(card)
+                    return [card]
+        except Exception as exc:
+            logger.debug("Embed fallback failed for %s: %s", shortcode, exc)
+
+        # Tier 1: Instagram Mobile Media Info API (Requires mobile client headers)
         media_id = shortcode_to_id(shortcode)
         if media_id:
             info_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
+            headers_mobile = self._build_headers(
+                is_mobile=True, require_auth=bool(self.cookie_str)
+            )
             res_mobile = self._make_request(
                 info_url,
+                headers=headers_mobile,
                 caller_tag="MobileMediaInfo",
-                require_auth=False,
+                require_auth=bool(self.cookie_str),
             )
-            if not res_mobile and self.cookie_str:
-                res_mobile = self._make_request(
-                    info_url,
-                    caller_tag="MobileMediaInfoAuth",
-                    require_auth=True,
-                )
-
             if res_mobile and isinstance(res_mobile, dict) and res_mobile.get("items"):
                 extracted = self._extract_media_cards(
                     res_mobile["items"][0], raw_target=target_url
@@ -1219,36 +1270,18 @@ class InspectWorker(QThread):
                                 self.media_found.emit(card)
                     return extracted
 
-        # Tier 2: Instagram Web JSON Endpoint
-        api_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+        # Tier 2: Authenticated Web JSON Endpoint
+        api_url = f"{IG_BASE_URL}/p/{shortcode}/?__a=1&__d=dis"
         res_web = self._make_request(
             api_url,
             caller_tag="WebJSONPost",
-            require_auth=False,
+            require_auth=bool(self.cookie_str),
         )
         if isinstance(res_web, dict):
-            graphql_data = res_web.get("graphql")
-            data_dict = res_web.get("data")
-            raw_items = res_web.get("items")
-
             media_data = (
-                (
-                    graphql_data.get("shortcode_media")
-                    if isinstance(graphql_data, dict)
-                    else None
-                )
-                or (
-                    data_dict.get("xdt_shortcode_media")
-                    if isinstance(data_dict, dict)
-                    else None
-                )
-                or (
-                    raw_items[0]
-                    if isinstance(raw_items, list)
-                    and raw_items
-                    and isinstance(raw_items[0], dict)
-                    else None
-                )
+                res_web.get("graphql", {}).get("shortcode_media")
+                or res_web.get("data", {}).get("xdt_shortcode_media")
+                or (res_web.get("items", [{}])[0] if res_web.get("items") else None)
             )
             if isinstance(media_data, dict):
                 extracted = self._extract_media_cards(media_data, raw_target=target_url)
@@ -1262,7 +1295,7 @@ class InspectWorker(QThread):
                                 self.media_found.emit(card)
                     return extracted
 
-        # Tier 3: Direct yt-dlp fallback
+        # Tier 3: yt-dlp Engine Fallback
         self._inspect_via_ytdlp(target_url)
         return []
 

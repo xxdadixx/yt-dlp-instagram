@@ -69,15 +69,22 @@ class UnifiedInstagramParser:
         if not isinstance(node, dict):
             return None
 
-        media_id = str(node.get("id") or node.get("pk") or "")
-        shortcode = str(node.get("code") or node.get("shortcode") or "")
+        # Resolve primary identifiers with fallbacks
+        media_id = str(node.get("id") or node.get("pk") or "").strip()
+        shortcode = str(node.get("code") or node.get("shortcode") or "").strip()
+
+        if not media_id and shortcode:
+            decoded_id = shortcode_to_id(shortcode)
+            if decoded_id is not None:
+                media_id = str(decoded_id)
+
         if not media_id and not shortcode:
             return None
 
         owner_data = node.get("owner") or node.get("user")
         owner_dict = owner_data if isinstance(owner_data, dict) else {}
-        owner_username = str(owner_dict.get("username") or "")
-        owner_id = str(owner_dict.get("id") or owner_dict.get("pk") or "")
+        owner_username = str(owner_dict.get("username") or "").strip()
+        owner_id = str(owner_dict.get("id") or owner_dict.get("pk") or "").strip()
 
         caption = ""
         caption_data = node.get("edge_media_to_caption")
@@ -96,11 +103,19 @@ class UnifiedInstagramParser:
             elif isinstance(caption_field, str):
                 caption = caption_field
 
-        taken_at = int(node.get("taken_at_timestamp") or node.get("taken_at") or 0)
+        try:
+            taken_at = int(node.get("taken_at_timestamp") or node.get("taken_at") or 0)
+        except (ValueError, TypeError):
+            taken_at = 0
+
         display_url = str(node.get("display_url") or node.get("display_src") or "")
 
         typename = str(node.get("__typename") or "")
-        is_video_flag = bool(node.get("is_video") or node.get("media_type") == 2)
+        is_video_flag = bool(
+            node.get("is_video")
+            or node.get("media_type") == 2
+            or node.get("product_type") == "clips"
+        )
 
         assets: list[MediaAsset] = []
         carousel_children: list[NormalizedMedia] = []
@@ -138,11 +153,16 @@ class UnifiedInstagramParser:
             if isinstance(video_versions, list) and len(video_versions) > 0:
                 for v in video_versions:
                     if isinstance(v, dict) and v.get("url"):
+                        try:
+                            w = int(v.get("width") or 0)
+                            h = int(v.get("height") or 0)
+                        except (ValueError, TypeError):
+                            w, h = 0, 0
                         assets.append(
                             MediaAsset(
                                 url=str(v["url"]),
-                                width=int(v.get("width") or 0),
-                                height=int(v.get("height") or 0),
+                                width=w,
+                                height=h,
                                 is_video=True,
                                 mime_type="video/mp4",
                             )
@@ -150,11 +170,16 @@ class UnifiedInstagramParser:
             elif video_url:
                 dim = node.get("dimensions")
                 dim_dict = dim if isinstance(dim, dict) else {}
+                try:
+                    w = int(dim_dict.get("width") or 0)
+                    h = int(dim_dict.get("height") or 0)
+                except (ValueError, TypeError):
+                    w, h = 0, 0
                 assets.append(
                     MediaAsset(
                         url=video_url,
-                        width=int(dim_dict.get("width") or 0),
-                        height=int(dim_dict.get("height") or 0),
+                        width=w,
+                        height=h,
                         is_video=True,
                         mime_type="video/mp4",
                     )
@@ -170,11 +195,16 @@ class UnifiedInstagramParser:
             if isinstance(display_resources, list) and len(display_resources) > 0:
                 for res in display_resources:
                     if isinstance(res, dict) and res.get("src"):
+                        try:
+                            w = int(res.get("config_width") or 0)
+                            h = int(res.get("config_height") or 0)
+                        except (ValueError, TypeError):
+                            w, h = 0, 0
                         assets.append(
                             MediaAsset(
                                 url=str(res["src"]),
-                                width=int(res.get("config_width") or 0),
-                                height=int(res.get("config_height") or 0),
+                                width=w,
+                                height=h,
                                 is_video=False,
                                 mime_type="image/jpeg",
                             )
@@ -182,11 +212,16 @@ class UnifiedInstagramParser:
             elif display_url:
                 dim = node.get("dimensions")
                 dim_dict = dim if isinstance(dim, dict) else {}
+                try:
+                    w = int(dim_dict.get("width") or 0)
+                    h = int(dim_dict.get("height") or 0)
+                except (ValueError, TypeError):
+                    w, h = 0, 0
                 assets.append(
                     MediaAsset(
                         url=display_url,
-                        width=int(dim_dict.get("width") or 0),
-                        height=int(dim_dict.get("height") or 0),
+                        width=w,
+                        height=h,
                         is_video=False,
                         mime_type="image/jpeg",
                     )
@@ -278,15 +313,20 @@ def id_to_shortcode(media_id: int | str) -> str:
 
 
 def shortcode_to_id(shortcode: str) -> Optional[int]:
-    """Converts an Instagram Base64 shortcode to a numeric media ID."""
+    """Converts an Instagram Base64 shortcode to a numeric 64-bit media ID."""
     if not shortcode or not isinstance(shortcode, str):
         return None
+    # Strip URL artifacts, trailing slashes, or query fragments
+    clean_code = shortcode.strip().split("?")[0].rstrip("/")
     media_id = 0
-    for char in shortcode:
-        if char not in ALPHABET:
-            return None
-        media_id = (media_id * 64) + ALPHABET.index(char)
-    return media_id
+    try:
+        for char in clean_code:
+            if char not in ALPHABET:
+                return None
+            media_id = (media_id * 64) + ALPHABET.index(char)
+        return media_id if media_id > 0 else None
+    except Exception:
+        return None
 
 
 def parse_instagram_url(url: str) -> Dict[str, Any]:

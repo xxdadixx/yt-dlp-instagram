@@ -1,6 +1,7 @@
 """
 gui/widgets/thumbnail_loader.py - High-performance asynchronous thumbnail loader
-with thread-safe LRU memory eviction and bounded QThreadPool task dispatching.
+with thread-safe LRU memory eviction, bounded QThreadPool dispatching,
+and backward-compatible test cache APIs.
 """
 
 from __future__ import annotations
@@ -19,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 class BoundedThumbnailCache:
-    """Thread-safe LRU in-memory cache for raw thumbnail byte buffers with capacity enforcement."""
+    """Thread-safe LRU in-memory cache for raw thumbnail byte buffers."""
 
-    def __init__(self, max_items: int = 256) -> None:
+    def __init__(self, max_items: int = 300) -> None:
         self._lock = threading.RLock()
         self._cache: OrderedDict[str, bytes] = OrderedDict()
         self._max_items = max_items
@@ -54,7 +55,36 @@ class BoundedThumbnailCache:
             return len(self._cache)
 
 
+# Global singleton instance
 GLOBAL_THUMB_CACHE = BoundedThumbnailCache(max_items=300)
+
+
+class _ThumbnailCacheProxy:
+    """Class-level proxy preserving backward compatibility with legacy test suites."""
+
+    @staticmethod
+    def get(url: str) -> Optional[bytes]:
+        return GLOBAL_THUMB_CACHE.get(url)
+
+    @staticmethod
+    def set(url: str, data: bytes) -> None:
+        GLOBAL_THUMB_CACHE.set(url, data)
+
+    @staticmethod
+    def clear() -> None:
+        GLOBAL_THUMB_CACHE.clear()
+
+    @staticmethod
+    def contains(url: str) -> bool:
+        return GLOBAL_THUMB_CACHE.contains(url)
+
+    @staticmethod
+    def size() -> int:
+        return GLOBAL_THUMB_CACHE.size()
+
+
+# Export alias required by tests/test_audit_suite.py
+ThumbnailCache = _ThumbnailCacheProxy
 
 
 class ThumbnailTaskSignals(QObject):
@@ -65,7 +95,7 @@ class ThumbnailTaskSignals(QObject):
 
 
 class ThumbnailTask(QRunnable):
-    """Worker task executing within a bounded QThreadPool to avoid thread exhaustion."""
+    """Worker task executing within a bounded QThreadPool to prevent thread exhaustion."""
 
     def __init__(self, url: str, signals: ThumbnailTaskSignals) -> None:
         super().__init__()
@@ -100,7 +130,7 @@ class ThumbnailTask(QRunnable):
                     "Referer": "https://www.instagram.com/",
                 },
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 if self._is_cancelled:
                     return
                 data = resp.read()
@@ -122,8 +152,11 @@ class ThumbnailLoader(QObject):
         super().__init__(parent)
         self.url = url
         self._signals = ThumbnailTaskSignals()
-        self._signals.loaded.connect(self.loaded.emit)
+        self._signals.loaded.connect(self._on_loaded)
         self._task: Optional[ThumbnailTask] = None
+
+    def _on_loaded(self, data: bytes) -> None:
+        self.loaded.emit(data)
 
     def start(self) -> None:
         if not self.url:

@@ -9,17 +9,47 @@ import os
 import re
 import shutil
 import sys
+import unicodedata
 from pathlib import Path
+
+# Reserved device names on Windows DOS-derived filesystems
+WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
 
 
 def sanitize_filesystem_name(name: str, max_length: int = 120) -> str:
-    """Sanitizes strings to prevent path traversal and illegal OS characters."""
-    if not name:
+    """
+    Robustly sanitizes strings against path traversal, control codes,
+    Windows reserved device identifiers, and illegal filesystem characters.
+    """
+    if not name or not isinstance(name, str):
         return "unnamed_media"
 
-    cleaned = str(name).replace("../", "").replace("..\\", "")
-    cleaned = re.sub(r'[\\/*?:"<>|]', "_", cleaned)
-    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", cleaned).strip(" .")
+    # Normalize Unicode characters (NFKD canonical decomposition)
+    normalized = unicodedata.normalize("NFKD", name)
+
+    # Extract only the base leaf filename to strip directory traversal sequences
+    leaf = Path(normalized).name
+
+    # Replace forbidden characters across NTFS, FAT32, ext4, and APFS
+    cleaned = re.sub(r'[\\/*?:"<>|\x00-\x1f\x7f-\x9f]', "_", leaf)
+
+    # Remove redundant traversal sequences, trailing dots, and whitespaces
+    cleaned = re.sub(r"\.{2,}", "_", cleaned)
+    cleaned = cleaned.strip(" .")
+
+    # Guard against Windows reserved device names (e.g., CON.mp4, NUL.jpg)
+    base_stem = cleaned.split(".")[0].upper()
+    if base_stem in WINDOWS_RESERVED_NAMES:
+        cleaned = f"media_{cleaned}"
 
     if not cleaned:
         cleaned = "unnamed_media"
