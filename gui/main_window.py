@@ -905,11 +905,16 @@ class MainWindow(QMainWindow):
         self.apply_translations()
         self.save_settings()
 
+    def _resolve_settings_file(self) -> str:
+        from utils.file_utils import get_app_dir
+        return os.path.join(get_app_dir(), "config", "settings.json")
+
     def load_settings(self) -> None:
         """Loads persistent user preferences and last window geometry from settings.json."""
-        if os.path.exists(self.SETTINGS_FILE):
+        settings_path = self._resolve_settings_file()
+        if os.path.exists(settings_path):
             try:
-                with open(self.SETTINGS_FILE, "r", encoding="utf-8") as f:
+                with open(settings_path, "r", encoding="utf-8") as f:
                     d = json.load(f)
                 if isinstance(d, dict):
                     self.save_folder = d.get("save_folder", self.save_folder)
@@ -922,12 +927,13 @@ class MainWindow(QMainWindow):
                     self._saved_geometry_hex = d.get("window_geometry", "")
                     self._is_maximized = bool(d.get("window_maximized", False))
             except Exception as e:
-                logger.debug(f"Failed to load settings: {e}")
+                logger.debug("Failed to load settings: %s", e)
 
     def save_settings(self) -> None:
-        """Persists current link preferences, profile mode, save path, and window geometry to settings.json."""
+        """Persists current link preferences, profile mode, save path, and window geometry."""
+        settings_path = self._resolve_settings_file()
         try:
-            os.makedirs(os.path.dirname(self.SETTINGS_FILE), exist_ok=True)
+            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
             geometry_hex = self.saveGeometry().toHex().data().decode("utf-8")
             payload = {
                 "save_folder": self.save_folder,
@@ -938,10 +944,10 @@ class MainWindow(QMainWindow):
                 "window_geometry": geometry_hex,
                 "window_maximized": self.isMaximized(),
             }
-            with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
+            with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
         except Exception as e:
-            logger.debug(f"Failed to save settings: {e}")
+            logger.debug("Failed to save settings: %s", e)
 
     def closeEvent(self, event) -> None:
         """Saves all settings and window state upon exit."""

@@ -1,4 +1,8 @@
-# gui/widgets/url_chip_input.py
+"""
+gui/widgets/url_chip_input.py - URL Chip Deck with strict URL syntax validation,
+paste extraction, and interactive item removal.
+"""
+
 from __future__ import annotations
 
 import re
@@ -24,11 +28,6 @@ from gui.icons import get_icon
 
 
 class URLItemCard(QFrame):
-    """
-    Glassmorphic card for individual URL targets, matching the exact visual
-    hierarchy and Dark Apple aesthetic of MediaCard in the Media Queue tab.
-    """
-
     deleted = pyqtSignal(str)
 
     def __init__(
@@ -43,12 +42,16 @@ class URLItemCard(QFrame):
         self._init_ui()
 
     def _get_badge_palette(self) -> tuple[str, str, str]:
-        """Returns (background_rgba, border_rgba, text_color) based on target media type."""
         palette = {
             "PROFILE": (
                 "rgba(56, 189, 248, 0.15)",
                 "rgba(56, 189, 248, 0.35)",
                 "#38BDF8",
+            ),
+            "PROFILE_REELS": (
+                "rgba(244, 63, 94, 0.15)",
+                "rgba(244, 63, 94, 0.35)",
+                "#FB7185",
             ),
             "REEL": ("rgba(244, 63, 94, 0.15)", "rgba(244, 63, 94, 0.35)", "#FB7185"),
             "STORY": (
@@ -57,17 +60,16 @@ class URLItemCard(QFrame):
                 "#FBBF24",
             ),
             "POST": ("rgba(16, 185, 129, 0.15)", "rgba(16, 185, 129, 0.35)", "#34D399"),
-            "IMAGE": (
-                "rgba(16, 185, 129, 0.15)",
-                "rgba(16, 185, 129, 0.35)",
-                "#34D399",
-            ),
             "CAROUSEL": (
                 "rgba(139, 92, 246, 0.15)",
                 "rgba(139, 92, 246, 0.35)",
                 "#A78BFA",
             ),
-            "TV": ("rgba(168, 85, 247, 0.15)", "rgba(168, 85, 247, 0.35)", "#C084FC"),
+            "HIGHLIGHT": (
+                "rgba(236, 72, 153, 0.15)",
+                "rgba(236, 72, 153, 0.35)",
+                "#F472B6",
+            ),
         }
         return palette.get(
             self.target_type,
@@ -95,11 +97,10 @@ class URLItemCard(QFrame):
         layout.setContentsMargins(12, 6, 10, 6)
         layout.setSpacing(12)
 
-        # 1. Type Pill Badge (Matches MediaCard format)
         self.lbl_type = QLabel(self.target_type, self)
         self.lbl_type.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self.lbl_type.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_type.setFixedWidth(78)
+        self.lbl_type.setFixedWidth(88)
         self.lbl_type.setFixedHeight(26)
         self.lbl_type.setStyleSheet(
             f"""
@@ -115,7 +116,6 @@ class URLItemCard(QFrame):
         )
         layout.addWidget(self.lbl_type)
 
-        # 2. Clean URL Target Text
         display_url = (
             self.url.replace("https://www.", "")
             .replace("http://www.", "")
@@ -131,7 +131,6 @@ class URLItemCard(QFrame):
         self.lbl_url.setToolTip(self.url)
         layout.addWidget(self.lbl_url, stretch=1)
 
-        # 3. Glassmorphic Delete Button (Matches MediaCard top-right action buttons)
         self.btn_delete = QPushButton(self)
         self.btn_delete.setObjectName("CardDeleteButton")
         self.btn_delete.setFixedSize(30, 30)
@@ -139,7 +138,7 @@ class URLItemCard(QFrame):
         self.btn_delete.setToolTip("Remove target")
 
         del_icon = get_icon("trash", color="#94A3B8", size=13) or get_icon(
-            "close", color="#94A3B8", size=12
+            "cancel", color="#94A3B8", size=12
         )
         if del_icon:
             self.btn_delete.setIcon(del_icon)
@@ -171,10 +170,6 @@ class URLItemCard(QFrame):
 
 
 class URLChipInput(QWidget):
-    """
-    Manages URL input text entry and provides the embeddable chip list view for the tab container.
-    """
-
     urls_changed = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -187,7 +182,6 @@ class URLChipInput(QWidget):
         self._init_list_view()
 
     def _init_input_bar(self) -> None:
-        """Constructs the top input bar widget."""
         self.input_widget = QWidget(self)
         layout = QHBoxLayout(self.input_widget)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -262,13 +256,11 @@ class URLChipInput(QWidget):
         layout.addWidget(self.btn_add)
 
     def _init_list_view(self) -> None:
-        """Constructs the tab-embeddable chip list view widget."""
         self.list_widget = QWidget(self)
         main_layout = QVBoxLayout(self.list_widget)
         main_layout.setContentsMargins(10, 8, 10, 8)
         main_layout.setSpacing(6)
 
-        # Tab Header Bar
         header_bar = QHBoxLayout()
         self.lbl_list_count = QLabel("URL Links (0)", self.list_widget)
         self.lbl_list_count.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
@@ -284,7 +276,6 @@ class URLChipInput(QWidget):
         header_bar.addWidget(self.btn_clear_all)
         main_layout.addLayout(header_bar)
 
-        # Scroll Area for URL Chips
         self.scroll_area = QScrollArea(self.list_widget)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
@@ -328,8 +319,7 @@ class URLChipInput(QWidget):
             token = token.strip()
             if not token:
                 continue
-            clean_url = re.sub(r"([?&])img_index=\d+(&?)", r"\1\2", token).rstrip("?&#")
-            if self.add_url_chip(clean_url):
+            if self.add_url_chip(token):
                 found_any = True
 
         if found_any:
@@ -339,14 +329,15 @@ class URLChipInput(QWidget):
         return False
 
     def add_url_chip(self, url: str) -> bool:
-        """Adds a URL item card with normalized badge type. Returns True if newly added."""
         clean_url = url.strip()
         if not clean_url or clean_url in self._urls:
             return False
 
         parsed = parse_instagram_url(clean_url)
-        target_type = str(parsed.get("type") or "MEDIA").upper()
+        if not parsed.get("valid"):
+            return False
 
+        target_type = str(parsed.get("type") or "MEDIA").upper()
         card = URLItemCard(
             clean_url, target_type=target_type, parent=self.list_container
         )
@@ -365,7 +356,6 @@ class URLChipInput(QWidget):
         return True
 
     def remove_url(self, url: str) -> None:
-        """Removes a URL item card and synchronizes state."""
         if url in self._urls:
             self._urls.remove(url)
         if url in self._chip_widgets:
@@ -376,7 +366,6 @@ class URLChipInput(QWidget):
         self._sync_state()
 
     def remove_url_chip(self, url: str) -> None:
-        """Alias for remove_url."""
         self.remove_url(url)
 
     def _sync_state(self) -> None:
@@ -386,7 +375,6 @@ class URLChipInput(QWidget):
         self.urls_changed.emit()
 
     def smooth_scroll_to_bottom(self) -> None:
-        """Animates smooth scrolling to the newest link entry."""
         v_bar = self.scroll_area.verticalScrollBar()
         if not v_bar:
             return
@@ -415,9 +403,3 @@ class URLChipInput(QWidget):
             self.remove_url(url)
         self.input_edit.clear()
         self._sync_state()
-
-
-# Backward Compatibility Aliases
-UrlChipItem = URLItemCard
-UrlChipInput = URLChipInput
-URLChip = URLItemCard

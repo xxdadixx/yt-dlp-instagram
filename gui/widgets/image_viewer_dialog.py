@@ -1,6 +1,11 @@
+"""
+gui/widgets/image_viewer_dialog.py - High-Resolution Photo Gallery Lightbox Dialog
+with bounded QThreadPool preloading and gesture-driven animations.
+"""
+
 from __future__ import annotations
 
-import io
+import logging
 import urllib.request
 from typing import Dict, List, Optional
 
@@ -12,9 +17,11 @@ from PyQt6.QtCore import (
     QPoint,
     QPointF,
     QPropertyAnimation,
-    QThread,
+    QRunnable,
+    QThreadPool,
     Qt,
     pyqtSignal,
+    pyqtSlot,
 )
 from PyQt6.QtGui import QFont, QKeyEvent, QPixmap
 from PyQt6.QtWidgets import (
@@ -28,13 +35,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class SwipeableAnimatedViewport(QFrame):
-    """
-    High-Performance Animated Viewport.
-    Supports touch-like mouse swipe/drag gestures and smooth OutCubic sliding transitions.
-    """
-
     swipe_left = pyqtSignal()
     swipe_right = pyqtSignal()
 
@@ -76,7 +80,6 @@ class SwipeableAnimatedViewport(QFrame):
     def set_image_direct(
         self, pixmap: Optional[QPixmap], placeholder: str = ""
     ) -> None:
-        """ตั้งค่าภาพโดยตรงและปรับสเกลให้พอดีกับ Viewport"""
         if (
             self._anim_group
             and self._anim_group.state() == QParallelAnimationGroup.State.Running
@@ -105,7 +108,6 @@ class SwipeableAnimatedViewport(QFrame):
         self.label_next.hide()
 
     def update_current_pixmap(self, pixmap: QPixmap) -> None:
-        """อัปเดตภาพทันทีเมื่อดาวน์โหลดเสร็จสมบูรณ์ในระหว่างที่ผู้ใช้เปิดดูสไลด์นี้อยู่"""
         self._current_pixmap = pixmap
         if pixmap and not pixmap.isNull():
             scaled = self._scale_pixmap(pixmap)
@@ -128,7 +130,6 @@ class SwipeableAnimatedViewport(QFrame):
         direction: str = "next",
         placeholder: str = "",
     ) -> None:
-        """เล่น Animation เลื่อนสไลด์ภาพอย่างนุ่มนวล"""
         if (
             self._anim_group
             and self._anim_group.state() == QParallelAnimationGroup.State.Running
@@ -232,21 +233,20 @@ class SwipeableAnimatedViewport(QFrame):
         super().mouseReleaseEvent(event)
 
 
-class ImageDownloadWorker(QThread):
+class TaskSignals(QObject):
     image_loaded = pyqtSignal(int, bytes)
 
-    def __init__(self, index: int, url: str, parent: Optional[QObject] = None):
-        super().__init__(parent)
+
+class ImageDownloadTask(QRunnable):
+    def __init__(self, index: int, url: str):
+        super().__init__()
         self.index = index
         self.url = url
-        self._is_cancelled = False
+        self.signals = TaskSignals()
+        self.setAutoDelete(True)
 
-    def cancel(self) -> None:
-        self._is_cancelled = True
-
+    @pyqtSlot()
     def run(self) -> None:
-        if self._is_cancelled:
-            return
         try:
             req = urllib.request.Request(
                 self.url,
@@ -260,20 +260,14 @@ class ImageDownloadWorker(QThread):
                 },
             )
             with urllib.request.urlopen(req, timeout=10) as response:
-                if self._is_cancelled:
-                    return
                 data = response.read()
-                if data and not self._is_cancelled:
-                    self.image_loaded.emit(self.index, data)
-        except Exception:
-            pass
+                if data:
+                    self.signals.image_loaded.emit(self.index, data)
+        except Exception as exc:
+            logger.debug("Failed to preload slide %d: %s", self.index, exc)
 
 
 class ImageViewerDialog(QDialog):
-    """
-    High-Resolution Photo Gallery Lightbox Dialog with Automatic Preloading.
-    """
-
     def __init__(
         self,
         image_urls: List[str],
@@ -285,7 +279,8 @@ class ImageViewerDialog(QDialog):
         self.post_title = title
         self.current_index = 0
         self.pixmap_cache: Dict[int, QPixmap] = {}
-        self.active_workers: List[ImageDownloadWorker] = []
+        self.thread_pool = QThreadPool(self)
+        self.thread_pool.setMaxThreadCount(4)
 
         self.init_ui()
         self._preload_all_images()
@@ -342,7 +337,6 @@ class ImageViewerDialog(QDialog):
         main_layout.setContentsMargins(16, 14, 16, 16)
         main_layout.setSpacing(12)
 
-        # 1. Top Bar: Badge Counter + Title + Close Button
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(0, 0, 0, 0)
         top_bar.setSpacing(10)
@@ -368,7 +362,6 @@ class ImageViewerDialog(QDialog):
 
         main_layout.addLayout(top_bar)
 
-        # 2. Main Large Image View Area
         view_area = QHBoxLayout()
         view_area.setContentsMargins(0, 0, 0, 0)
         view_area.setSpacing(10)
@@ -405,13 +398,11 @@ class ImageViewerDialog(QDialog):
         self.btn_next.setEnabled(self.current_index < total - 1)
 
     def _preload_all_images(self) -> None:
-        """ดาวน์โหลดรูปภาพทั้งหมดในโพสต์ล่วงหน้าแบบ Asynchronous"""
         for idx, url in enumerate(self.image_urls):
             if idx not in self.pixmap_cache and url.startswith("http"):
-                worker = ImageDownloadWorker(idx, url, self)
-                worker.image_loaded.connect(self._on_image_downloaded)
-                self.active_workers.append(worker)
-                worker.start()
+                task = ImageDownloadTask(idx, url)
+                task.signals.image_loaded.connect(self._on_image_downloaded)
+                self.thread_pool.start(task)
 
     def _on_image_downloaded(self, index: int, data: bytes) -> None:
         pixmap = QPixmap()
@@ -467,23 +458,13 @@ class ImageViewerDialog(QDialog):
             self.viewport.set_image_direct(self.pixmap_cache[self.current_index])
 
     def closeEvent(self, event) -> None:
-        """Stops and cleans up background download workers upon closing."""
-        for worker in self.active_workers:
-            if worker.isRunning():
-                worker.cancel()
-                worker.quit()
-                worker.wait(150)
-        self.active_workers.clear()
+        self.thread_pool.clear()
+        self.thread_pool.waitForDone(100)
         super().closeEvent(event)
 
     def reject(self) -> None:
-        """Handles Escape key and system dismiss safely."""
-        for worker in self.active_workers:
-            if worker.isRunning():
-                worker.cancel()
-                worker.quit()
-                worker.wait(150)
-        self.active_workers.clear()
+        self.thread_pool.clear()
+        self.thread_pool.waitForDone(100)
         super().reject()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:

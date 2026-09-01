@@ -1,4 +1,8 @@
-# core/download_worker.py
+"""
+core/download_worker.py - High-throughput sequential media download worker
+with persistent connection pooling, 256 KB streaming buffers, and static filename sanitization.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -6,41 +10,24 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Union
+
 import requests
+from PyQt6.QtCore import QThread, pyqtSignal
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
-from PyQt6.QtCore import QThread, pyqtSignal
 
 try:
     import yt_dlp
 except ImportError:
     yt_dlp = None
 
-try:
-    from config.constants import DEFAULT_USER_AGENT
-except (ImportError, AttributeError):
-    DEFAULT_USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    )
-
-try:
-    from config.constants import INSTAGRAM_APP_ID
-except (ImportError, AttributeError):
-    try:
-        from config.constants import IG_APP_ID as INSTAGRAM_APP_ID
-    except (ImportError, AttributeError):
-        INSTAGRAM_APP_ID = "936619743392459"
+from config.constants import DEFAULT_USER_AGENT, IG_APP_ID
+from utils.file_utils import sanitize_filesystem_name
 
 logger = logging.getLogger("DownloadWorker")
 
 
 class DownloadWorker(QThread):
-    """Sequential media download worker with persistent socket connection pools,
-
-    256 KB streaming buffers, and strict username_shortcode filename formatting.
-    """
-
     progress = pyqtSignal(int)
     item_started = pyqtSignal(str)
     item_finished = pyqtSignal(str, bool)
@@ -68,7 +55,6 @@ class DownloadWorker(QThread):
         self._is_cancelled: bool = False
         os.makedirs(self.save_folder, exist_ok=True)
 
-        # Connection-pooled HTTP session for high-throughput streaming
         self.session = requests.Session()
         retries = Retry(
             total=3,
@@ -87,7 +73,7 @@ class DownloadWorker(QThread):
 
         headers = {
             "User-Agent": DEFAULT_USER_AGENT,
-            "X-IG-App-ID": INSTAGRAM_APP_ID,
+            "X-IG-App-ID": IG_APP_ID,
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
@@ -106,10 +92,10 @@ class DownloadWorker(QThread):
             pass
 
     @staticmethod
-    def _sanitize_name(value: str, fallback: str = "media") -> str:
-        """Strips invalid filesystem characters, emojis, and whitespace."""
-        cleaned = re.sub(r'[\\/*?:"<>|\r\n\t]', "", str(value)).strip()
-        return cleaned or fallback
+    def sanitize_filename(value: str, fallback: str = "media") -> str:
+        """Sanitizes filename strings for safe filesystem operations."""
+        cleaned = sanitize_filesystem_name(str(value), max_length=64)
+        return cleaned if cleaned else fallback
 
     def _build_filename(
         self,
@@ -118,14 +104,6 @@ class DownloadWorker(QThread):
         ext: str = "mp4",
         slide_index: Optional[int] = None,
     ) -> str:
-        """
-        Constructs a sanitized filename adhering strictly to:
-        {username}_{shortcode}[_{slide_index}].{ext}
-
-        Accepts either an item dictionary or positional strings.
-        """
-        from utils.file_utils import sanitize_filesystem_name
-
         if isinstance(item_or_username, dict):
             raw_user = item_or_username.get("username") or "instagram"
             raw_code = (
@@ -156,9 +134,6 @@ class DownloadWorker(QThread):
         ext: str = "mp4",
         slide_index: Optional[int] = None,
     ) -> str:
-        """
-        Resolves the absolute destination file path within self.save_folder.
-        """
         filename = self._build_filename(
             item_or_username=item_or_username,
             shortcode=shortcode,
@@ -168,7 +143,6 @@ class DownloadWorker(QThread):
         return os.path.join(self.save_folder, filename)
 
     def _get_download_headers(self, url: str) -> Dict[str, str]:
-        """Returns minimal headers for CDN assets, omitting session cookies to protect account."""
         headers = {
             "User-Agent": DEFAULT_USER_AGENT,
             "Accept": "*/*",
@@ -180,18 +154,10 @@ class DownloadWorker(QThread):
             headers["Cookie"] = self.cookie_str
         return headers
 
-    def sanitize_filename(value: str, fallback: str = "media") -> str:
-        """Sanitizes filename strings for safe OS filesystem writes."""
-        from utils.file_utils import sanitize_filesystem_name
-
-        cleaned = sanitize_filesystem_name(str(value), max_length=64)
-        return cleaned if cleaned else fallback
-
     def _download_direct_stream(
         self, url: str, target_path: str, index: int, total_items: int
     ) -> str:
-        """Streams media directly via 256 KB chunk buffering with smooth progress reporting."""
-        CHUNK_SIZE = 256 * 1024
+        chunk_size = 256 * 1024
         temp_path = f"{target_path}.part"
         req_headers = self._get_download_headers(url)
 
@@ -199,19 +165,22 @@ class DownloadWorker(QThread):
             url, headers=req_headers, stream=True, timeout=(6.0, 30.0)
         ) as response:
             response.raise_for_status()
-            total_size = int(response.headers.get("content-length", 0))
+            try:
+                total_size = int(response.headers.get("content-length", 0) or 0)
+            except (ValueError, TypeError):
+                total_size = 0
 
             downloaded_bytes = 0
             last_signal_time = 0.0
 
             with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                for chunk in response.iter_content(chunk_size=chunk_size):
                     if self._is_cancelled:
                         f.close()
                         if os.path.exists(temp_path):
                             try:
                                 os.remove(temp_path)
-                            except Exception:
+                            except OSError:
                                 pass
                         raise InterruptedError("Download cancelled.")
 
@@ -239,14 +208,14 @@ class DownloadWorker(QThread):
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
-                except Exception:
+                except OSError:
                     pass
             raise InterruptedError("Download cancelled.")
 
         if os.path.exists(target_path):
             try:
                 os.remove(target_path)
-            except Exception:
+            except OSError:
                 pass
         os.rename(temp_path, target_path)
         return target_path
@@ -259,7 +228,6 @@ class DownloadWorker(QThread):
         index: int,
         total_items: int,
     ) -> str:
-        """Executes yt-dlp fallback with strict username_shortcode outtmpl (no captions)."""
         if yt_dlp is None or self._is_cancelled:
             return ""
 
@@ -269,8 +237,8 @@ class DownloadWorker(QThread):
             or item.get("download_url")
             or f"https://www.instagram.com/p/{shortcode}/"
         )
-        clean_user = self._sanitize_name(username, fallback="instagram_user")
-        clean_code = self._sanitize_name(shortcode, fallback="media")
+        clean_user = self.sanitize_filename(username, fallback="instagram_user")
+        clean_code = self.sanitize_filename(shortcode, fallback="media")
         is_carousel = "carousel" in str(item.get("media_type", "")).lower() or bool(
             item.get("carousel_count")
         )
@@ -329,14 +297,13 @@ class DownloadWorker(QThread):
     def _process_single_item(
         self, item: Dict[str, Any], index: int, total_items: int
     ) -> str:
-        """Downloads single media or carousels using strict username_shortcode formatting."""
         if self._is_cancelled:
             return ""
 
         username = str(item.get("username") or item.get("uploader") or "instagram_user")
         shortcode = str(item.get("shortcode") or item.get("id") or f"media_{index}")
 
-        # Strategy 1: Multi-Item Carousel -> Direct Stream Each Slide
+        # 1. Multi-Item Carousel -> Direct Stream Each Slide
         slides = item.get("slides")
         if slides and isinstance(slides, list) and len(slides) > 0:
             saved_any = False
@@ -374,12 +341,11 @@ class DownloadWorker(QThread):
                 return ""
             if saved_any:
                 return last_path
-            # Fallback to yt-dlp for carousel
             return self._download_via_ytdlp(
                 item, username, shortcode, index, total_items
             )
 
-        # Strategy 2: Single Post / Reel / Image -> Direct Stream
+        # 2. Single Post / Reel / Image -> Direct Stream
         direct_url = (
             item.get("download_url") or item.get("media_url") or item.get("video_url")
         )
@@ -412,11 +378,10 @@ class DownloadWorker(QThread):
                     stream_err,
                 )
 
-        # Strategy 3: yt-dlp Fallback
+        # 3. yt-dlp Scrape Fallback
         return self._download_via_ytdlp(item, username, shortcode, index, total_items)
 
     def run(self) -> None:
-        """Sequential queue execution loop."""
         total_items = len(self.items)
         if total_items == 0:
             self.progress.emit(100)
@@ -442,14 +407,13 @@ class DownloadWorker(QThread):
                     self.item_finished.emit(item_id, False)
                     break
 
-                # Ensure target file actually exists on filesystem and is non-empty
-                is_valid_download = bool(
+                is_valid = bool(
                     saved_path
                     and os.path.isfile(saved_path)
                     and os.path.getsize(saved_path) > 0
                 )
 
-                if is_valid_download:
+                if is_valid:
                     success_count += 1
                     self.item_finished.emit(item_id, True)
                 else:
