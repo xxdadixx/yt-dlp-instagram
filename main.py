@@ -1,5 +1,5 @@
 """
-main.py - Application Bootstrap and Lifecycle Management.
+main.py - Application Bootstrap, Per-Monitor DPI Scaling, and Lifecycle Management.
 """
 
 import ctypes
@@ -14,10 +14,21 @@ from utils.file_utils import get_icon_path
 
 
 def main() -> None:
-    # กำหนด Windows Application User Model ID เพื่อให้แสดง Icon บน Taskbar ถูกต้อง
+    # Enable Windows Per-Monitor High-DPI Awareness and App User Model ID
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+            ctypes.windll.shcore.SetProcessDpiAwareness(
+                2
+            )  # PROCESS_PER_MONITOR_DPI_AWARE
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                APP_USER_MODEL_ID
+            )
         except Exception:
             pass
 

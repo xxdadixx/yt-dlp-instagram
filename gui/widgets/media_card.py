@@ -1,11 +1,10 @@
 """
-gui/widgets/media_card.py - Instagram-styled Media Card with interactive hover zoom previews.
+gui/widgets/media_card.py - Instagram-styled Media Card with scaled high-DPI thumbnails and hover previews.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import QByteArray, QPoint, QPointF, QRectF, Qt, pyqtSignal
@@ -102,33 +101,6 @@ STATUS_STYLES = {
 }
 
 
-class ThumbnailCache:
-    """Thread-safe in-memory cache for raw thumbnail byte buffers."""
-
-    _lock = threading.RLock()
-    _cache: Dict[str, bytes] = {}
-
-    @classmethod
-    def get(cls, url: str) -> Optional[bytes]:
-        with cls._lock:
-            return cls._cache.get(url)
-
-    @classmethod
-    def set(cls, url: str, data: bytes) -> None:
-        with cls._lock:
-            cls._cache[url] = data
-
-    @classmethod
-    def clear(cls) -> None:
-        with cls._lock:
-            cls._cache.clear()
-
-    @classmethod
-    def contains(cls, url: str) -> bool:
-        with cls._lock:
-            return url in cls._cache
-
-
 class ThumbnailHoverPopup(QWidget):
     """Floating enlarged thumbnail preview popup with Liquid Glass rim and deep drop shadow."""
 
@@ -156,7 +128,7 @@ class ThumbnailHoverPopup(QWidget):
         frame_layout.setContentsMargins(8, 8, 8, 8)
 
         self.lbl_image = QLabel(self.frame)
-        self.lbl_image.setFixedSize(224, 298)
+        self.lbl_image.setFixedSize(260, 340)
         self.lbl_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_image.setStyleSheet("border-radius: 10px; background-color: #0B0A11;")
         frame_layout.addWidget(self.lbl_image)
@@ -171,7 +143,7 @@ class ThumbnailHoverPopup(QWidget):
 
     def set_preview_pixmap(self, pixmap: QPixmap) -> None:
         if pixmap and not pixmap.isNull():
-            target_w, target_h = 224, 298
+            target_w, target_h = 260, 340
             scaled = pixmap.scaled(
                 target_w,
                 target_h,
@@ -197,10 +169,7 @@ class ThumbnailHoverPopup(QWidget):
 
 
 class Elevated3DThumbnail(QLabel):
-    """
-    Top Layer (Z=24px): 3D Elevated Thumbnail casting ambient occlusion shadows
-    onto the liquid glass card base plate.
-    """
+    """Top Layer (Z=24px): 3D Elevated Thumbnail casting ambient occlusion shadows."""
 
     clicked = pyqtSignal()
 
@@ -209,7 +178,7 @@ class Elevated3DThumbnail(QLabel):
         self._raw_pixmap: Optional[QPixmap] = None
         self._preview_popup: Optional[ThumbnailHoverPopup] = None
 
-        self.setFixedSize(68, 68)
+        self.setFixedSize(82, 82)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setText("...")
@@ -218,15 +187,16 @@ class Elevated3DThumbnail(QLabel):
             QLabel {
                 background-color: #171522;
                 border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 10px;
+                border-radius: 12px;
                 color: #64748B;
+                font-size: 11px;
+                font-weight: bold;
             }
         """
         )
 
-        # 3D Elevation Ambient Occlusion Drop Shadow
         self._elev_shadow = QGraphicsDropShadowEffect(self)
-        self._elev_shadow.setBlurRadius(14)
+        self._elev_shadow.setBlurRadius(16)
         self._elev_shadow.setOffset(0, 4)
         self._elev_shadow.setColor(QColor(0, 0, 0, 160))
         self.setGraphicsEffect(self._elev_shadow)
@@ -238,23 +208,23 @@ class Elevated3DThumbnail(QLabel):
             return
 
         scaled = pixmap.scaled(
-            68,
-            68,
+            82,
+            82,
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation,
         )
-        crop_x = max(0, (scaled.width() - 68) // 2)
-        crop_y = max(0, (scaled.height() - 68) // 2)
-        cropped = scaled.copy(crop_x, crop_y, 68, 68)
+        crop_x = max(0, (scaled.width() - 82) // 2)
+        crop_y = max(0, (scaled.height() - 82) // 2)
+        cropped = scaled.copy(crop_x, crop_y, 82, 82)
 
-        rounded = QPixmap(68, 68)
+        rounded = QPixmap(82, 82)
         rounded.fill(Qt.GlobalColor.transparent)
         painter = QPainter(rounded)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, 68, 68), 10.0, 10.0)
+        path.addRoundedRect(QRectF(0, 0, 82, 82), 12.0, 12.0)
         painter.setClipPath(path)
         painter.drawPixmap(0, 0, cropped)
         painter.end()
@@ -263,23 +233,23 @@ class Elevated3DThumbnail(QLabel):
         self.setPixmap(rounded)
 
     def enterEvent(self, event) -> None:
-        self._elev_shadow.setBlurRadius(20)
+        self._elev_shadow.setBlurRadius(22)
         self._elev_shadow.setOffset(0, 6)
-        self._elev_shadow.setColor(QColor(225, 48, 108, 110))
+        self._elev_shadow.setColor(QColor(225, 48, 108, 120))
 
         if self._raw_pixmap and not self._raw_pixmap.isNull():
             if not self._preview_popup:
                 self._preview_popup = ThumbnailHoverPopup()
 
             self._preview_popup.set_preview_pixmap(self._raw_pixmap)
-            global_pos = self.mapToGlobal(QPoint(self.width() + 16, -115))
+            global_pos = self.mapToGlobal(QPoint(self.width() + 16, -125))
             screen = QApplication.primaryScreen()
             if screen:
                 screen_geom = screen.availableGeometry()
-                if global_pos.x() + 250 > screen_geom.right():
-                    global_pos.setX(self.mapToGlobal(QPoint(0, 0)).x() - 260)
-                if global_pos.y() + 330 > screen_geom.bottom():
-                    global_pos.setY(screen_geom.bottom() - 335)
+                if global_pos.x() + 290 > screen_geom.right():
+                    global_pos.setX(self.mapToGlobal(QPoint(0, 0)).x() - 300)
+                if global_pos.y() + 370 > screen_geom.bottom():
+                    global_pos.setY(screen_geom.bottom() - 375)
                 if global_pos.y() < screen_geom.top():
                     global_pos.setY(screen_geom.top() + 10)
 
@@ -288,107 +258,9 @@ class Elevated3DThumbnail(QLabel):
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
-        self._elev_shadow.setBlurRadius(14)
+        self._elev_shadow.setBlurRadius(16)
         self._elev_shadow.setOffset(0, 4)
         self._elev_shadow.setColor(QColor(0, 0, 0, 160))
-        if self._preview_popup:
-            self._preview_popup.hide()
-        super().leaveEvent(event)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            if self._preview_popup:
-                self._preview_popup.hide()
-            self.clicked.emit()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-
-class HoverThumbnailLabel(QLabel):
-    """Interactive thumbnail widget that shows an enlarged floating preview on hover."""
-
-    clicked = pyqtSignal()
-
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._raw_pixmap: Optional[QPixmap] = None
-        self._preview_popup: Optional[ThumbnailHoverPopup] = None
-
-        self.setFixedSize(66, 66)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setText("...")
-        self.setStyleSheet(
-            """
-            QLabel {
-                background-color: #1a1a24;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
-                color: #64748B;
-            }
-            QLabel:hover {
-                border: 1px solid rgba(225, 48, 108, 0.6);
-            }
-        """
-        )
-
-    def set_thumbnail_pixmap(self, pixmap: QPixmap) -> None:
-        self._raw_pixmap = pixmap
-        if not pixmap or pixmap.isNull():
-            self.setText("NO IMG")
-            return
-
-        scaled = pixmap.scaled(
-            66,
-            66,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        crop_x = max(0, (scaled.width() - 66) // 2)
-        crop_y = max(0, (scaled.height() - 66) // 2)
-        cropped = scaled.copy(crop_x, crop_y, 66, 66)
-
-        rounded = QPixmap(66, 66)
-        rounded.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(rounded)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, 66, 66), 8.0, 8.0)
-        painter.setClipPath(path)
-        painter.drawPixmap(0, 0, cropped)
-        painter.end()
-
-        self.setText("")
-        self.setPixmap(rounded)
-
-    def enterEvent(self, event) -> None:
-        if self._raw_pixmap and not self._raw_pixmap.isNull():
-            if not self._preview_popup:
-                self._preview_popup = ThumbnailHoverPopup()
-
-            self._preview_popup.set_preview_pixmap(self._raw_pixmap)
-
-            # Position popup to the right with screen boundary bounds checking
-            global_pos = self.mapToGlobal(QPoint(self.width() + 14, -110))
-            screen = QApplication.primaryScreen()
-            if screen:
-                screen_geom = screen.availableGeometry()
-                if global_pos.x() + 250 > screen_geom.right():
-                    global_pos.setX(self.mapToGlobal(QPoint(0, 0)).x() - 255)
-                if global_pos.y() + 320 > screen_geom.bottom():
-                    global_pos.setY(screen_geom.bottom() - 325)
-                if global_pos.y() < screen_geom.top():
-                    global_pos.setY(screen_geom.top() + 10)
-
-            self._preview_popup.move(global_pos)
-            self._preview_popup.show()
-
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
         if self._preview_popup:
             self._preview_popup.hide()
         super().leaveEvent(event)
@@ -404,10 +276,7 @@ class HoverThumbnailLabel(QLabel):
 
 
 class MediaCard(QFrame):
-    """
-    2.5D Liquid Glass Media Card Container with dynamic cursor-tracking caustics
-    and specular light reflections.
-    """
+    """2.5D Liquid Glass Media Card Container with scaled high-DPI dimensions."""
 
     card_clicked = pyqtSignal(object, Qt.KeyboardModifier)
     clicked = card_clicked
@@ -428,15 +297,13 @@ class MediaCard(QFrame):
         self.thumb_loader: Optional[ThumbnailLoader] = None
         self._is_cleaned_up: bool = False
 
-        # Interaction & Specular Physics Tracking
         self._cursor_pos: QPointF = QPointF(-100, -100)
         self._is_hovered: bool = False
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setObjectName("LiquidMediaCard")
-        self.setFixedHeight(88)
+        self.setFixedHeight(104)
 
-        # Ambient Base Tray Glow
         self._tray_glow = QGraphicsDropShadowEffect(self)
         self._tray_glow.setOffset(0, 4)
         self.setGraphicsEffect(self._tray_glow)
@@ -455,9 +322,9 @@ class MediaCard(QFrame):
         return self.status.lower() == "finished"
 
     def _get_app_font(
-        self, size: int = 9, bold: bool = False, weight: Optional[QFont.Weight] = None
+        self, size: int = 10, bold: bool = False, weight: Optional[QFont.Weight] = None
     ) -> QFont:
-        font = QFont("Segoe UI Variable Display", max(8, int(size)))
+        font = QFont("Segoe UI Variable Display", max(9, int(size)))
         font.setFamilies(
             [
                 "-apple-system",
@@ -475,32 +342,30 @@ class MediaCard(QFrame):
 
     def _init_ui(self) -> None:
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 14, 10)
-        layout.setSpacing(14)
+        layout.setContentsMargins(14, 10, 16, 10)
+        layout.setSpacing(16)
 
-        # 1. Top Layer: Elevated 3D Thumbnail (Z=24)
+        # 1. 3D Elevated Thumbnail (Scaled to 82x82)
         self.lbl_thumb = Elevated3DThumbnail(self)
-        self.lbl_thumb.setFont(self._get_app_font(size=8, bold=True))
         self.lbl_thumb.clicked.connect(self.open_image_gallery)
         layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        # 2. Middle Layer: Etched Metadata Surface (Title + Details Row)
+        # 2. Middle Layer: Title + Details Row
         details_layout = QVBoxLayout()
         details_layout.setContentsMargins(0, 2, 0, 2)
-        details_layout.setSpacing(5)
+        details_layout.setSpacing(6)
 
-        # Title Label with Elision & Full Hover Tooltip
         raw_title = str(self.item_data.get("title") or "")
         full_caption = str(self.item_data.get("caption") or raw_title)
 
         self.lbl_title = QLabel(self)
-        self.lbl_title.setFont(self._get_app_font(size=9, weight=QFont.Weight.Medium))
+        self.lbl_title.setFont(self._get_app_font(size=10, weight=QFont.Weight.Medium))
         self.lbl_title.setStyleSheet(
-            "color: #FFFFFF; background: transparent; border: none;"
+            "color: #FFFFFF; background: transparent; border: none; font-size: 13.5px;"
         )
 
-        if len(raw_title) > 65:
-            display_title = raw_title[:62].rstrip() + "..."
+        if len(raw_title) > 75:
+            display_title = raw_title[:72].rstrip() + "..."
         else:
             display_title = raw_title
 
@@ -510,25 +375,21 @@ class MediaCard(QFrame):
 
         details_layout.addWidget(self.lbl_title)
 
-        # Metadata Badges Row
         meta_row = QHBoxLayout()
         meta_row.setContentsMargins(0, 0, 0, 0)
-        meta_row.setSpacing(8)
+        meta_row.setSpacing(10)
 
-        # Username Tag
         raw_username = str(self.item_data.get("username") or "instagram").strip()
         display_username = (
             f"@{raw_username}" if not raw_username.startswith("@") else raw_username
         )
         self.lbl_username = QLabel(display_username, self)
-        self.lbl_username.setObjectName("CardUsername")
-        self.lbl_username.setFont(self._get_app_font(size=9, bold=True))
+        self.lbl_username.setFont(self._get_app_font(size=10, bold=True))
         self.lbl_username.setStyleSheet(
-            "color: #38BDF8; background: transparent; border: none;"
+            "color: #38BDF8; background: transparent; border: none; font-size: 13px;"
         )
         meta_row.addWidget(self.lbl_username)
 
-        # Etched Pill Badge
         badge_type = str(self.item_data.get("media_type") or "MEDIA").upper()
         slides_count = len(self.item_data.get("slides") or [])
         badge_label_text = (
@@ -546,22 +407,21 @@ class MediaCard(QFrame):
             },
         )
         self.lbl_badge = QLabel(badge_label_text, self)
-        self.lbl_badge.setObjectName("CardBadge")
-        self.lbl_badge.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_badge.setFont(self._get_app_font(size=9, bold=True))
         self.lbl_badge.setStyleSheet(
             f"""
             QLabel {{
                 background-color: {style_info['bg']};
                 color: {style_info['color']};
                 border: 1px solid {style_info['border']};
-                border-radius: 5px;
-                padding: 1px 7px;
+                border-radius: 6px;
+                padding: 2px 9px;
+                font-size: 11.5px;
             }}
         """
         )
         meta_row.addWidget(self.lbl_badge)
 
-        # Engagement Stats
         likes = self.item_data.get("like_count") or 0
         views = self.item_data.get("view_count") or 0
         meta_parts = []
@@ -572,10 +432,9 @@ class MediaCard(QFrame):
         meta_str = " • ".join(meta_parts) if meta_parts else f"ID: {self.item_id[:12]}"
 
         self.lbl_meta = QLabel(meta_str, self)
-        self.lbl_meta.setObjectName("CardMeta")
-        self.lbl_meta.setFont(self._get_app_font(size=9))
+        self.lbl_meta.setFont(self._get_app_font(size=10))
         self.lbl_meta.setStyleSheet(
-            "color: #94A3B8; background: transparent; border: none;"
+            "color: #94A3B8; background: transparent; border: none; font-size: 12.5px;"
         )
         meta_row.addWidget(self.lbl_meta)
         meta_row.addStretch()
@@ -583,34 +442,34 @@ class MediaCard(QFrame):
         details_layout.addLayout(meta_row)
         layout.addLayout(details_layout, stretch=1)
 
-        # 3. Liquid Status Capsule & Crimson Bevel Delete
+        # 3. Status Capsule & Delete Button
         action_col = QHBoxLayout()
         action_col.setContentsMargins(0, 0, 0, 0)
-        action_col.setSpacing(10)
+        action_col.setSpacing(12)
         action_col.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
 
         self.lbl_status = QLabel(self)
-        self.lbl_status.setObjectName("CardStatusPill")
-        self.lbl_status.setFont(self._get_app_font(size=8, bold=True))
+        self.lbl_status.setFont(self._get_app_font(size=9, bold=True))
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.set_status(self.status)
         action_col.addWidget(self.lbl_status)
 
         self.btn_delete = QPushButton("✕", self)
         self.btn_delete.setObjectName("CardDeleteButton")
-        self.btn_delete.setFixedSize(26, 26)
+        self.btn_delete.setFixedSize(30, 30)
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_delete.setFont(self._get_app_font(size=9, bold=True))
+        self.btn_delete.setFont(self._get_app_font(size=10, bold=True))
         self.btn_delete.setStyleSheet(
             """
             QPushButton#CardDeleteButton {
-                background-color: rgba(255, 255, 255, 0.03);
+                background-color: rgba(255, 255, 255, 0.04);
                 color: #71717A;
                 border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 13px;
+                border-radius: 15px;
                 padding: 0px;
+                font-size: 12px;
             }
             QPushButton#CardDeleteButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #EF4444, stop:1 #DC2626);
@@ -620,7 +479,6 @@ class MediaCard(QFrame):
             QPushButton#CardDeleteButton:pressed {
                 background: #991B1B;
                 color: #FECACA;
-                padding-top: 1px;
             }
             QPushButton#CardDeleteButton:disabled {
                 background-color: transparent !important;
@@ -635,7 +493,6 @@ class MediaCard(QFrame):
         layout.addLayout(action_col)
 
     def _set_children_transparent(self) -> None:
-        """Permit mouse movement tracking through child labels for caustics calculation."""
         for label in (
             self.lbl_title,
             self.lbl_username,
@@ -646,7 +503,6 @@ class MediaCard(QFrame):
             label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """Track cursor position across the card surface for specular highlights."""
         self._cursor_pos = event.position()
         self.update()
         super().mouseMoveEvent(event)
@@ -671,21 +527,14 @@ class MediaCard(QFrame):
             super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:
-        """
-        Custom Liquid Glass Painter:
-        1. Frosted acrylic base plate.
-        2. Mouse-tracked dynamic specular caustics shine.
-        3. Light-source top-bevel gradient border.
-        """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         w, h = float(self.width()), float(self.height())
         rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
         card_path = QPainterPath()
-        card_path.addRoundedRect(rect, 12.0, 12.0)
+        card_path.addRoundedRect(rect, 14.0, 14.0)
 
-        # 1. Base Glass Tray Fill
         base_grad = QLinearGradient(0, 0, w, h)
         if self._is_selected:
             base_grad.setColorAt(0.0, QColor(32, 24, 46, 210))
@@ -696,13 +545,12 @@ class MediaCard(QFrame):
 
         painter.fillPath(card_path, base_grad)
 
-        # 2. Specular Caustics Follow Light (Hover Radial Flare)
         if self._is_hovered and self._cursor_pos.x() >= 0:
-            specular = QRadialGradient(self._cursor_pos, 160.0)
+            specular = QRadialGradient(self._cursor_pos, 180.0)
             specular_color = (
-                QColor(255, 255, 255, 28)
+                QColor(255, 255, 255, 30)
                 if not self._is_selected
-                else QColor(255, 117, 151, 40)
+                else QColor(255, 117, 151, 45)
             )
             specular.setColorAt(0.0, specular_color)
             specular.setColorAt(1.0, QColor(255, 255, 255, 0))
@@ -712,7 +560,6 @@ class MediaCard(QFrame):
             painter.fillPath(card_path, specular)
             painter.restore()
 
-        # 3. Polished Glass Gradient Border (Light on Top-Left -> Dark Bottom-Right)
         border_grad = QLinearGradient(0, 0, w, h)
         if self._is_selected:
             border_grad.setColorAt(0.0, QColor(255, 60, 120, 240))
@@ -752,14 +599,13 @@ class MediaCard(QFrame):
         self.set_selected(not self._is_selected)
 
     def update_style(self) -> None:
-        """Update neon ambient shadow glow based on selection and hover elevation."""
         if self._is_selected:
-            self._tray_glow.setBlurRadius(20 if self._is_hovered else 14)
+            self._tray_glow.setBlurRadius(22 if self._is_hovered else 16)
             self._tray_glow.setColor(
-                QColor(225, 48, 108, 90 if self._is_hovered else 65)
+                QColor(225, 48, 108, 95 if self._is_hovered else 70)
             )
         else:
-            self._tray_glow.setBlurRadius(12 if self._is_hovered else 8)
+            self._tray_glow.setBlurRadius(14 if self._is_hovered else 10)
             self._tray_glow.setColor(QColor(0, 0, 0, 140 if self._is_hovered else 100))
         self.update()
 
@@ -770,12 +616,14 @@ class MediaCard(QFrame):
         self.lbl_status.setText(cfg["text"])
         self.lbl_status.setStyleSheet(
             f"""
-            QLabel#CardStatusPill {{
+            QLabel {{
                 background-color: {cfg['bg']};
                 color: {cfg['color']};
                 border: 1px solid {cfg['border']};
-                border-radius: 5px;
-                padding: 3px 10px;
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-size: 11px;
+                font-weight: 700;
             }}
         """
         )
@@ -808,7 +656,6 @@ class MediaCard(QFrame):
         return self.item_data
 
     def cleanup(self) -> None:
-        """Explicitly cancels background loaders and cleans up child graphics."""
         self._is_cleaned_up = True
         if hasattr(self, "lbl_thumb") and getattr(
             self.lbl_thumb, "_preview_popup", None

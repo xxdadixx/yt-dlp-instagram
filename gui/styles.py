@@ -1,6 +1,6 @@
 """
 gui/styles.py - Liquid Glass Design System for Instagram Pro Studio.
-Features frosted acrylic layers, specular edge gradients, and Apple-inspired dark mode surfaces.
+Features frosted acrylic layers, specular edge gradients, and comfortable high-DPI scaling metrics.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ QMainWindow, QWidget#centralWidget {
     background-color: #0D0C13;
     color: #F8FAFC;
     font-family: -apple-system, 'SF Pro Display', 'Segoe UI Variable Display', 'Segoe UI', sans-serif;
+    font-size: 13px;
 }
 
 /* =========================================================================
@@ -28,12 +29,12 @@ QTabWidget::pane {
 QTabBar::tab {
     background: rgba(255, 255, 255, 0.03);
     color: #94A3B8;
-    padding: 8px 18px;
-    margin-right: 4px;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
+    padding: 10px 22px;
+    margin-right: 6px;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
     border: 1px solid transparent;
-    font-size: 11px;
+    font-size: 12.5px;
     font-weight: 600;
 }
 
@@ -54,11 +55,11 @@ QTabBar::tab:hover:!selected {
    ========================================================================= */
 QLineEdit {
     background-color: rgba(24, 22, 35, 0.65);
-    border: 1px solid rgba(255, 255, 255, 0.10);
+    border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 10px;
-    padding: 7px 14px;
+    padding: 8px 16px;
     color: #FFFFFF;
-    font-size: 12px;
+    font-size: 13.5px;
     selection-background-color: #E1306C;
 }
 
@@ -69,11 +70,11 @@ QLineEdit:focus {
 
 QComboBox {
     background-color: rgba(24, 22, 35, 0.65);
-    border: 1px solid rgba(255, 255, 255, 0.10);
-    border-radius: 8px;
-    padding: 4px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 9px;
+    padding: 6px 14px;
     color: #E2E8F0;
-    font-size: 11px;
+    font-size: 12.5px;
     font-weight: 600;
 }
 
@@ -84,16 +85,17 @@ QComboBox:hover {
 
 QComboBox::drop-down {
     border: none;
-    width: 20px;
+    width: 24px;
 }
 
 QComboBox QAbstractItemView {
     background-color: #171522;
     border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 8px;
+    border-radius: 10px;
     selection-background-color: #E1306C;
     selection-color: #FFFFFF;
-    padding: 4px;
+    padding: 6px;
+    font-size: 12.5px;
     outline: none;
 }
 
@@ -101,9 +103,9 @@ QComboBox QAbstractItemView {
    4. Liquid Action Buttons Suite
    ========================================================================= */
 QPushButton {
-    border-radius: 8px;
-    padding: 6px 14px;
-    font-size: 11.5px;
+    border-radius: 9px;
+    padding: 7px 16px;
+    font-size: 13px;
     font-weight: 600;
     outline: none;
 }
@@ -120,7 +122,7 @@ QPushButton#DownloadAllButton {
     color: #FFFFFF;
     border: 1px solid rgba(255, 255, 255, 0.35);
     border-radius: 10px;
-    padding: 8px 20px;
+    padding: 0px;
     font-weight: 700;
 }
 
@@ -143,8 +145,6 @@ QPushButton#DownloadAllButton:pressed {
         stop: 0.5 #C71228,
         stop: 1 #D4892A
     );
-    padding-top: 9px;
-    padding-bottom: 7px;
 }
 
 QPushButton#PrimaryActionButton:disabled,
@@ -156,23 +156,21 @@ QPushButton#DownloadAllButton:disabled {
 
 /* Frosted Glass Action Buttons */
 QPushButton#GlassActionButton {
-    background-color: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.09);
-    border-radius: 8px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 9px;
     color: #CBD5E1;
 }
 
 QPushButton#GlassActionButton:hover {
-    background-color: rgba(255, 255, 255, 0.09);
+    background-color: rgba(255, 255, 255, 0.10);
     border: 1px solid rgba(225, 48, 108, 0.6);
     color: #FFFFFF;
 }
 
 QPushButton#GlassActionButton:pressed {
-    background-color: rgba(255, 255, 255, 0.02);
+    background-color: rgba(255, 255, 255, 0.03);
     border: 1px solid rgba(225, 48, 108, 0.3);
-    padding-top: 7px;
-    padding-bottom: 5px;
 }
 
 QPushButton#GlassActionButton:disabled {
@@ -183,10 +181,10 @@ QPushButton#GlassActionButton:disabled {
 
 /* Destructive Crimson Bevel */
 QPushButton#DestructiveButton {
-    background-color: rgba(239, 68, 68, 0.12);
+    background-color: rgba(239, 68, 68, 0.14);
     color: #F87171;
-    border: 1px solid rgba(239, 68, 68, 0.30);
-    border-radius: 8px;
+    border: 1px solid rgba(239, 68, 68, 0.32);
+    border-radius: 9px;
     font-weight: 600;
 }
 
@@ -198,8 +196,6 @@ QPushButton#DestructiveButton:hover {
 
 QPushButton#DestructiveButton:pressed {
     background: #991B1B;
-    padding-top: 7px;
-    padding-bottom: 5px;
 }
 
 QPushButton#DestructiveButton:disabled {
@@ -213,20 +209,20 @@ QPushButton#DestructiveButton:disabled {
    ========================================================================= */
 QScrollBar:vertical {
     border: none;
-    background: rgba(0, 0, 0, 0.2);
-    width: 6px;
-    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.25);
+    width: 9px;
+    border-radius: 4.5px;
     margin: 4px 2px 4px 0px;
 }
 
 QScrollBar::handle:vertical {
-    background: rgba(255, 255, 255, 0.15);
-    min-height: 24px;
-    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.18);
+    min-height: 32px;
+    border-radius: 4.5px;
 }
 
 QScrollBar::handle:vertical:hover {
-    background: rgba(225, 48, 108, 0.6);
+    background: rgba(225, 48, 108, 0.7);
 }
 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,

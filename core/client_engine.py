@@ -1,19 +1,22 @@
-# core/client_engine.py
-# (Context: Replace lines 1-60 and execute_persisted_query in ResilientSession)
+"""
+core/client_engine.py - HTTP/2 & TLS-spoofed communication client with adaptive circuit-breaking,
+dynamic Gaussian-jitter request pacing, and thread-safe fallback execution.
+"""
 
 from __future__ import annotations
 
 import gzip
+import importlib
 import json
 import logging
 import random
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-import importlib
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -39,9 +42,9 @@ class CircuitBreakerConfig:
 
 
 class ResilientSession:
-    """HTTP/2 & TLS-spoofed communication client with adaptive circuit-breaking,
+    """HTTP/2 & TLS-spoofed communication client with adaptive circuit-breaking
 
-    dynamic Gaussian-jitter request pacing, and standard library fallback.
+    and thread-safe standard library fallback.
     """
 
     WEB_APP_ID = "936619743392459"
@@ -54,14 +57,14 @@ class ResilientSession:
         circuit_config: CircuitBreakerConfig | None = None,
         verify_ssl: bool = True,
     ) -> None:
+        self._lock = threading.RLock()
         self.circuit_config = circuit_config or CircuitBreakerConfig()
         self.circuit_state = CircuitState.CLOSED
         self.failure_counter = 0
         self.last_state_change = time.time()
         self.proxy_url = proxy_url
-        self.cookies: dict[str, str] = cookies or {}
+        self.cookies: dict[str, str] = dict(cookies or {})
 
-        # Enforce secure TLS certificate verification by default
         if verify_ssl:
             self._ssl_ctx = ssl.create_default_context()
         else:
@@ -104,37 +107,42 @@ class ResilientSession:
                     self._session.headers["X-CSRFToken"] = self.cookies["csrftoken"]
 
     def _check_circuit(self) -> None:
-        now = time.time()
-        if self.circuit_state == CircuitState.OPEN:
-            if now - self.last_state_change > self.circuit_config.cooldown_seconds:
-                logger.info("Circuit breaker transitioning OPEN -> HALF_OPEN")
-                self.circuit_state = CircuitState.HALF_OPEN
-                self.last_state_change = now
-            else:
-                raise RuntimeError(
-                    "Circuit breaker is OPEN: Rate limit lockdown active."
-                )
+        with self._lock:
+            now = time.time()
+            if self.circuit_state == CircuitState.OPEN:
+                if now - self.last_state_change > self.circuit_config.cooldown_seconds:
+                    logger.info("Circuit breaker transitioning OPEN -> HALF_OPEN")
+                    self.circuit_state = CircuitState.HALF_OPEN
+                    self.last_state_change = now
+                else:
+                    raise RuntimeError(
+                        "Circuit breaker is OPEN: Rate limit lockdown active."
+                    )
 
     def _record_success(self) -> None:
-        if self.circuit_state == CircuitState.HALF_OPEN:
-            logger.info(
-                "Probe succeeded. Circuit breaker transitioning HALF_OPEN -> CLOSED"
-            )
-            self.circuit_state = CircuitState.CLOSED
-            self.failure_counter = 0
-            self.last_state_change = time.time()
+        with self._lock:
+            if self.circuit_state == CircuitState.HALF_OPEN:
+                logger.info(
+                    "Probe succeeded. Circuit breaker transitioning HALF_OPEN -> CLOSED"
+                )
+                self.circuit_state = CircuitState.CLOSED
+                self.failure_counter = 0
+                self.last_state_change = time.time()
 
     def _record_failure(self, status_code: int) -> None:
-        self.failure_counter += 1
-        logger.warning(
-            "Request failed with status %d (Failures: %d)",
-            status_code,
-            self.failure_counter,
-        )
-        if self.failure_counter >= self.circuit_config.failure_threshold:
-            logger.error("Failure threshold reached. Tripping circuit breaker to OPEN.")
-            self.circuit_state = CircuitState.OPEN
-            self.last_state_change = time.time()
+        with self._lock:
+            self.failure_counter += 1
+            logger.warning(
+                "Request failed with status %d (Failures: %d)",
+                status_code,
+                self.failure_counter,
+            )
+            if self.failure_counter >= self.circuit_config.failure_threshold:
+                logger.error(
+                    "Failure threshold reached. Tripping circuit breaker to OPEN."
+                )
+                self.circuit_state = CircuitState.OPEN
+                self.last_state_change = time.time()
 
     def pace_request(
         self,
@@ -148,9 +156,10 @@ class ResilientSession:
         time.sleep(delay)
 
     def _build_cookie_header(self) -> str:
-        if not self.cookies:
-            return ""
-        return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+        with self._lock:
+            if not self.cookies:
+                return ""
+            return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
 
     def execute_persisted_query(
         self,
@@ -166,7 +175,7 @@ class ResilientSession:
             "variables": json.dumps(variables, separators=(",", ":")),
         }
 
-        # --- Primary Branch: curl_cffi (JA4 + HTTP/2 Impersonation) ---
+        # --- Primary Branch: curl_cffi (HTTP/2 Impersonation) ---
         if self._session is not None:
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -206,7 +215,11 @@ class ResilientSession:
         # --- Fallback Branch: Standard Library urllib.request ---
         post_data = urllib.parse.urlencode(payload).encode("utf-8")
         req_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            ),
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate",

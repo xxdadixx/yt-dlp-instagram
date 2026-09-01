@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -240,16 +241,30 @@ class CookieManager:
         return header_str, netscape_content
 
     def _write_secure_file(self, file_path: str, content: str) -> None:
-        """Writes content to a file with owner-only (0600) permissions on POSIX systems."""
-        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+        """Atomically writes content to disk with owner-only (0600) POSIX permissions."""
+        target_dir = os.path.dirname(os.path.abspath(file_path))
+        os.makedirs(target_dir, exist_ok=True)
+
+        # Atomic temp file write in the target directory
+        with tempfile.NamedTemporaryFile(
+            "w", dir=target_dir, delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write(content)
+            temp_name = tf.name
+
         if sys.platform != "win32":
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-            fd = os.open(file_path, flags, 0o600)
-            with open(fd, "w", encoding="utf-8") as f:
-                f.write(content)
-        else:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            try:
+                os.chmod(temp_name, 0o600)
+            except OSError:
+                pass
+
+        os.replace(temp_name, file_path)
+
+        if sys.platform != "win32":
+            try:
+                os.chmod(file_path, 0o600)
+            except OSError:
+                pass
 
     def import_cookie_file(self, file_path: str) -> bool:
         if not file_path or not os.path.exists(file_path):

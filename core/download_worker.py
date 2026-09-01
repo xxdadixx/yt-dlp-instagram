@@ -1,6 +1,7 @@
 """
 core/download_worker.py - High-throughput sequential media download worker
-with persistent connection pooling, 256 KB streaming buffers, and static filename sanitization.
+with monotonic chronological ordering (Most Recent -> Oldest), connection pooling,
+256 KB streaming buffers, and atomic file replacement.
 """
 
 from __future__ import annotations
@@ -22,9 +23,52 @@ except ImportError:
     yt_dlp = None
 
 from config.constants import DEFAULT_USER_AGENT, IG_APP_ID
+from core.parser import shortcode_to_id
 from utils.file_utils import sanitize_filesystem_name
 
 logger = logging.getLogger("DownloadWorker")
+
+
+def sanitize_filename(value: str, fallback: str = "media") -> str:
+    """Sanitizes filename strings for safe filesystem operations."""
+    cleaned = sanitize_filesystem_name(str(value), max_length=64)
+    return cleaned if cleaned else fallback
+
+
+def extract_chronological_key(item_data: Dict[str, Any]) -> int:
+    """Extracts monotonic integer timestamp or snowflake ID from media payload (higher = newer)."""
+    if not isinstance(item_data, dict):
+        return 0
+
+    ts = (
+        item_data.get("taken_at_timestamp")
+        or item_data.get("taken_at")
+        or item_data.get("timestamp")
+        or item_data.get("date")
+    )
+    if ts:
+        try:
+            return int(ts)
+        except (ValueError, TypeError):
+            pass
+
+    raw_id = item_data.get("id") or item_data.get("pk") or item_data.get("media_id")
+    if raw_id:
+        try:
+            clean_id = str(raw_id).split("_")[0]
+            val = int(clean_id)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+
+    shortcode = item_data.get("shortcode") or item_data.get("code")
+    if shortcode and isinstance(shortcode, str):
+        decoded = shortcode_to_id(shortcode)
+        if decoded is not None and decoded > 0:
+            return decoded
+
+    return 0
 
 
 class DownloadWorker(QThread):
@@ -32,6 +76,8 @@ class DownloadWorker(QThread):
     item_started = pyqtSignal(str)
     item_finished = pyqtSignal(str, bool)
     finished = pyqtSignal(int)
+
+    sanitize_filename = staticmethod(sanitize_filename)
 
     def __init__(
         self,
@@ -44,7 +90,12 @@ class DownloadWorker(QThread):
         parent=None,
     ):
         super().__init__(parent)
-        self.items: List[Dict[str, Any]] = items or queue_items or []
+        raw_items: List[Dict[str, Any]] = list(items or queue_items or [])
+
+        # Strict Chronological Sort: Most Recent (highest timestamp/ID) -> Oldest (lowest)
+        raw_items.sort(key=extract_chronological_key, reverse=True)
+        self.items: List[Dict[str, Any]] = raw_items
+
         self.save_folder: str = os.path.abspath(
             save_folder or output_directory or "downloads"
         )
@@ -91,12 +142,6 @@ class DownloadWorker(QThread):
         except Exception:
             pass
 
-    @staticmethod
-    def sanitize_filename(value: str, fallback: str = "media") -> str:
-        """Sanitizes filename strings for safe filesystem operations."""
-        cleaned = sanitize_filesystem_name(str(value), max_length=64)
-        return cleaned if cleaned else fallback
-
     def _build_filename(
         self,
         item_or_username: Union[Dict[str, Any], str],
@@ -119,8 +164,8 @@ class DownloadWorker(QThread):
             raw_code = shortcode or "media"
             slide_idx = slide_index
 
-        clean_user = sanitize_filesystem_name(str(raw_user), max_length=64)
-        clean_code = sanitize_filesystem_name(str(raw_code), max_length=64)
+        clean_user = sanitize_filename(str(raw_user), fallback="instagram")
+        clean_code = sanitize_filename(str(raw_code), fallback="media")
         clean_ext = re.sub(r"[^a-zA-Z0-9]", "", ext).lower() or "mp4"
 
         if slide_idx is not None:
@@ -160,65 +205,59 @@ class DownloadWorker(QThread):
         chunk_size = 256 * 1024
         temp_path = f"{target_path}.part"
         req_headers = self._get_download_headers(url)
+        completed_successfully = False
 
-        with self.session.get(
-            url, headers=req_headers, stream=True, timeout=(6.0, 30.0)
-        ) as response:
-            response.raise_for_status()
-            try:
-                total_size = int(response.headers.get("content-length", 0) or 0)
-            except (ValueError, TypeError):
-                total_size = 0
+        try:
+            with self.session.get(
+                url, headers=req_headers, stream=True, timeout=(6.0, 30.0)
+            ) as response:
+                response.raise_for_status()
+                try:
+                    total_size = int(response.headers.get("content-length", 0) or 0)
+                except (ValueError, TypeError):
+                    total_size = 0
 
-            downloaded_bytes = 0
-            last_signal_time = 0.0
+                downloaded_bytes = 0
+                last_signal_time = 0.0
 
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if self._is_cancelled:
-                        f.close()
-                        if os.path.exists(temp_path):
-                            try:
-                                os.remove(temp_path)
-                            except OSError:
-                                pass
-                        raise InterruptedError("Download cancelled.")
+                with open(temp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if self._is_cancelled:
+                            raise InterruptedError("Download cancelled by user.")
 
-                    if chunk:
-                        f.write(chunk)
-                        downloaded_bytes += len(chunk)
+                        if chunk:
+                            f.write(chunk)
+                            downloaded_bytes += len(chunk)
 
-                        current_time = time.time()
-                        if (
-                            current_time - last_signal_time >= 0.05
-                            or downloaded_bytes == total_size
-                        ):
-                            last_signal_time = current_time
-                            item_percent = (
-                                (downloaded_bytes / total_size)
-                                if total_size > 0
-                                else 0.0
-                            )
-                            overall_percent = int(
-                                ((index + item_percent) / total_items) * 100
-                            )
-                            self.progress.emit(min(overall_percent, 99))
+                            current_time = time.time()
+                            if (
+                                current_time - last_signal_time >= 0.05
+                                or downloaded_bytes == total_size
+                            ):
+                                last_signal_time = current_time
+                                item_percent = (
+                                    (downloaded_bytes / total_size)
+                                    if total_size > 0
+                                    else 0.0
+                                )
+                                overall_percent = int(
+                                    ((index + item_percent) / total_items) * 100
+                                )
+                                self.progress.emit(min(overall_percent, 99))
 
-        if self._is_cancelled:
-            if os.path.exists(temp_path):
+            if self._is_cancelled:
+                raise InterruptedError("Download cancelled by user.")
+
+            os.replace(temp_path, target_path)
+            completed_successfully = True
+            return target_path
+
+        finally:
+            if not completed_successfully and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
                 except OSError:
                     pass
-            raise InterruptedError("Download cancelled.")
-
-        if os.path.exists(target_path):
-            try:
-                os.remove(target_path)
-            except OSError:
-                pass
-        os.rename(temp_path, target_path)
-        return target_path
 
     def _download_via_ytdlp(
         self,
@@ -237,8 +276,8 @@ class DownloadWorker(QThread):
             or item.get("download_url")
             or f"https://www.instagram.com/p/{shortcode}/"
         )
-        clean_user = self.sanitize_filename(username, fallback="instagram_user")
-        clean_code = self.sanitize_filename(shortcode, fallback="media")
+        clean_user = sanitize_filename(username, fallback="instagram_user")
+        clean_code = sanitize_filename(shortcode, fallback="media")
         is_carousel = "carousel" in str(item.get("media_type", "")).lower() or bool(
             item.get("carousel_count")
         )
@@ -255,7 +294,7 @@ class DownloadWorker(QThread):
 
         last_progress_time = 0.0
 
-        def ytdlp_hook(d):
+        def ytdlp_hook(d: Dict[str, Any]) -> None:
             nonlocal last_progress_time
             if self._is_cancelled:
                 raise yt_dlp.utils.DownloadCancelled("Download cancelled by user.")
@@ -286,13 +325,19 @@ class DownloadWorker(QThread):
         if self.cookie_file and os.path.exists(self.cookie_file):
             ydl_opts["cookiefile"] = self.cookie_file
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info:
+                    return ""
+                if "entries" in info and info["entries"]:
+                    return ydl.prepare_filename(info["entries"][0])
+                return ydl.prepare_filename(info)
+        except Exception as exc:
+            if self._is_cancelled:
                 return ""
-            if "entries" in info and info["entries"]:
-                return ydl.prepare_filename(info["entries"][0])
-            return ydl.prepare_filename(info)
+            logger.warning("yt-dlp download failed for %s: %s", url, exc)
+            return ""
 
     def _process_single_item(
         self, item: Dict[str, Any], index: int, total_items: int
@@ -319,7 +364,10 @@ class DownloadWorker(QThread):
                 is_vid = bool(slide.get("is_video"))
                 ext = "mp4" if is_vid else "jpg"
                 slide_path = self._build_filepath(
-                    username, shortcode, slide_index=s_idx, ext=ext
+                    item_or_username=username,
+                    shortcode=shortcode,
+                    slide_index=s_idx,
+                    ext=ext,
                 )
 
                 if slide_url and (
@@ -352,7 +400,11 @@ class DownloadWorker(QThread):
         media_type = str(item.get("type") or item.get("media_type") or "video").lower()
         is_video = "image" not in media_type and "photo" not in media_type
         ext = "mp4" if is_video else "jpg"
-        target_path = self._build_filepath(username, shortcode, ext=ext)
+        target_path = self._build_filepath(
+            item_or_username=username,
+            shortcode=shortcode,
+            ext=ext,
+        )
 
         is_direct_cdn = bool(
             direct_url
@@ -389,7 +441,10 @@ class DownloadWorker(QThread):
             return
 
         success_count = 0
-        logger.info("Starting sequential download queue (%d items)", total_items)
+        logger.info(
+            "Starting sequential download queue in chronological order (%d items)",
+            total_items,
+        )
 
         for index, item in enumerate(self.items):
             if self._is_cancelled:

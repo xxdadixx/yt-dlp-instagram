@@ -1,6 +1,5 @@
 """
-gui/widgets/url_chip_input.py - URL Chip Deck with strict URL syntax validation,
-paste extraction, and interactive item removal.
+gui/widgets/url_chip_input.py - URL Chip Deck with scaled high-DPI input controls and URL cards.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ class URLItemCard(QFrame):
         self.url = url.strip()
         self.target_type = target_type.upper()
         self.setObjectName("URLItemCard")
-        self.setFixedHeight(50)
+        self.setFixedHeight(56)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._init_ui()
 
@@ -94,22 +93,23 @@ class URLItemCard(QFrame):
         )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 6, 10, 6)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 8, 12, 8)
+        layout.setSpacing(14)
 
         self.lbl_type = QLabel(self.target_type, self)
-        self.lbl_type.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.lbl_type.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.lbl_type.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_type.setFixedWidth(88)
-        self.lbl_type.setFixedHeight(26)
+        self.lbl_type.setFixedWidth(98)
+        self.lbl_type.setFixedHeight(30)
         self.lbl_type.setStyleSheet(
             f"""
             QLabel {{
                 background-color: {bg_col};
                 color: {text_col};
                 border: 1px solid {border_col};
-                border-radius: 6px;
+                border-radius: 7px;
                 font-weight: 700;
+                font-size: 11.5px;
                 letter-spacing: 0.5px;
             }}
             """
@@ -123,8 +123,10 @@ class URLItemCard(QFrame):
             .replace("http://", "")
         )
         self.lbl_url = QLabel(display_url, self)
-        self.lbl_url.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
-        self.lbl_url.setStyleSheet("color: #E2E8F0; background: transparent;")
+        self.lbl_url.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
+        self.lbl_url.setStyleSheet(
+            "color: #E2E8F0; background: transparent; font-size: 13px;"
+        )
         self.lbl_url.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
@@ -133,16 +135,16 @@ class URLItemCard(QFrame):
 
         self.btn_delete = QPushButton(self)
         self.btn_delete.setObjectName("CardDeleteButton")
-        self.btn_delete.setFixedSize(30, 30)
+        self.btn_delete.setFixedSize(34, 34)
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_delete.setToolTip("Remove target")
 
-        del_icon = get_icon("trash", color="#94A3B8", size=13) or get_icon(
-            "cancel", color="#94A3B8", size=12
+        del_icon = get_icon("trash", color="#94A3B8", size=15) or get_icon(
+            "cancel", color="#94A3B8", size=14
         )
         if del_icon:
             self.btn_delete.setIcon(del_icon)
-            self.btn_delete.setIconSize(QSize(13, 13))
+            self.btn_delete.setIconSize(QSize(15, 15))
         else:
             self.btn_delete.setText("✕")
 
@@ -152,7 +154,7 @@ class URLItemCard(QFrame):
                 background-color: rgba(255, 255, 255, 0.04);
                 color: #A0A0B2;
                 border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 7px;
+                border-radius: 8px;
             }
             QPushButton#CardDeleteButton:hover {
                 background-color: rgba(239, 68, 68, 0.22);
@@ -161,7 +163,6 @@ class URLItemCard(QFrame):
             }
             QPushButton#CardDeleteButton:pressed {
                 background-color: rgba(185, 28, 28, 0.40);
-                padding-top: 1px;
             }
             """
         )
@@ -185,25 +186,25 @@ class URLChipInput(QWidget):
         self.input_widget = QWidget(self)
         layout = QHBoxLayout(self.input_widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
         self.input_edit = QLineEdit(self.input_widget)
         self.input_edit.setPlaceholderText(
             "Paste Instagram links (Ctrl+V or Enter multiple links)..."
         )
-        self.input_edit.setFixedHeight(36)
+        self.input_edit.setFixedHeight(42)
         self.input_edit.setStyleSheet(
             """
             QLineEdit {
                 background-color: #16161F;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 8px;
-                padding: 6px 12px;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 10px;
+                padding: 8px 14px;
                 color: #FFFFFF;
-                font-size: 9pt;
+                font-size: 10.5pt;
             }
             QLineEdit:focus {
-                border: 1px solid #E1306C;
+                border: 1.5px solid #E1306C;
                 background-color: #1C1C28;
             }
             """
@@ -212,10 +213,16 @@ class URLChipInput(QWidget):
         self.input_edit.installEventFilter(self)
         layout.addWidget(self.input_edit, 1)
 
-        self.btn_add = QPushButton("+ Add", self.input_widget)
+        self.btn_add = QPushButton(self.input_widget)
         self.btn_add.setObjectName("AddUrlButton")
-        self.btn_add.setFixedHeight(36)
+        self.btn_add.setFixedSize(42, 42)
         self.btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_add.setToolTip("Add Instagram URL")
+        add_icon = get_icon("plus", color="#FFFFFF", size=18)
+        if add_icon:
+            self.btn_add.setIcon(add_icon)
+            self.btn_add.setIconSize(QSize(18, 18))
+
         self.btn_add.clicked.connect(self._handle_manual_entry)
         self.btn_add.setStyleSheet(
             """
@@ -228,10 +235,8 @@ class URLChipInput(QWidget):
                 );
                 color: #FFFFFF;
                 border: 1px solid rgba(255, 255, 255, 0.2);
-                border-radius: 8px;
-                padding: 0 18px;
-                font-weight: 700;
-                font-size: 8.5pt;
+                border-radius: 10px;
+                padding: 0px;
             }
             QPushButton#AddUrlButton:hover {
                 background: qlineargradient(
@@ -244,11 +249,9 @@ class URLChipInput(QWidget):
             }
             QPushButton#AddUrlButton:pressed {
                 background: #B82556;
-                padding-top: 2px;
             }
             QPushButton#AddUrlButton:disabled {
                 background: #1A1822 !important;
-                color: #4B4B5A !important;
                 border: 1px solid rgba(255, 255, 255, 0.04) !important;
             }
             """
@@ -258,20 +261,26 @@ class URLChipInput(QWidget):
     def _init_list_view(self) -> None:
         self.list_widget = QWidget(self)
         main_layout = QVBoxLayout(self.list_widget)
-        main_layout.setContentsMargins(10, 8, 10, 8)
-        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(8)
 
         header_bar = QHBoxLayout()
         self.lbl_list_count = QLabel("URL Links (0)", self.list_widget)
-        self.lbl_list_count.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.lbl_list_count.setStyleSheet("color: #FFFFFF;")
+        self.lbl_list_count.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.lbl_list_count.setStyleSheet("color: #FFFFFF; font-size: 13.5px;")
         header_bar.addWidget(self.lbl_list_count)
         header_bar.addStretch()
 
-        self.btn_clear_all = QPushButton("Clear All", self.list_widget)
+        self.btn_clear_all = QPushButton(self.list_widget)
         self.btn_clear_all.setObjectName("DestructiveButton")
-        self.btn_clear_all.setFixedHeight(28)
+        self.btn_clear_all.setFixedSize(36, 32)
         self.btn_clear_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_all.setToolTip("Clear All URLs")
+        clear_all_icon = get_icon("trash", color="#F87171", size=15)
+        if clear_all_icon:
+            self.btn_clear_all.setIcon(clear_all_icon)
+            self.btn_clear_all.setIconSize(QSize(15, 15))
+
         self.btn_clear_all.clicked.connect(self.clear)
         header_bar.addWidget(self.btn_clear_all)
         main_layout.addLayout(header_bar)
@@ -287,7 +296,7 @@ class URLChipInput(QWidget):
         self.list_container.setStyleSheet("background: transparent;")
         self.list_layout = QVBoxLayout(self.list_container)
         self.list_layout.setContentsMargins(2, 2, 2, 2)
-        self.list_layout.setSpacing(6)
+        self.list_layout.setSpacing(8)
         self.list_layout.addStretch(1)
 
         self.scroll_area.setWidget(self.list_container)

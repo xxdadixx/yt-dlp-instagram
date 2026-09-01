@@ -1,5 +1,6 @@
 """
-gui/main_window.py - Instagram Pro Studio Main Window with Profile Mode Selector and Download Cancellation.
+gui/main_window.py - Instagram Pro Studio Main Window with Scaled High-DPI Workspace,
+Icon-Only Controls, Chronological Sorting, and Tab Navigation Counters.
 """
 
 from __future__ import annotations
@@ -45,26 +46,62 @@ from config.translations import TRANSLATIONS
 from core.cookie_manager import CookieManager
 from core.download_worker import DownloadWorker
 from core.inspect_worker import InspectWorker
-from core.parser import extract_instagram_urls
+from core.parser import extract_instagram_urls, shortcode_to_id
 from gui.icons import get_icon
 from gui.styles import DARK_STYLESHEET
+from gui.widgets.log_viewer_widget import LogViewerWidget
 from gui.widgets.media_card import MediaCard
 from gui.widgets.modern_progress_bar import ModernProgressBar
 from gui.widgets.no_scroll_combo import NoScrollComboBox
 from gui.widgets.url_chip_input import URLChipInput
-from gui.widgets.log_viewer_widget import LogViewerWidget
+from utils.file_utils import get_app_dir
 from utils.logger import QtLogHandler
 
 logger = logging.getLogger(__name__)
 
 
-class MainWindow(QMainWindow):
-    SETTINGS_FILE = os.path.join("config", "settings.json")
+def extract_chronological_key(item_data: Dict[str, Any]) -> int:
+    """Extracts a monotonic integer timestamp or snowflake ID from media payload (higher = newer)."""
+    if not isinstance(item_data, dict):
+        return 0
 
+    ts = (
+        item_data.get("taken_at_timestamp")
+        or item_data.get("taken_at")
+        or item_data.get("timestamp")
+        or item_data.get("date")
+    )
+    if ts:
+        try:
+            return int(ts)
+        except (ValueError, TypeError):
+            pass
+
+    raw_id = item_data.get("id") or item_data.get("pk") or item_data.get("media_id")
+    if raw_id:
+        try:
+            clean_id = str(raw_id).split("_")[0]
+            val = int(clean_id)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+
+    shortcode = item_data.get("shortcode") or item_data.get("code")
+    if shortcode and isinstance(shortcode, str):
+        decoded = shortcode_to_id(shortcode)
+        if decoded is not None and decoded > 0:
+            return decoded
+
+    return 0
+
+
+class MainWindow(QMainWindow):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.cards: List[MediaCard] = []
         self._last_selected_index: int = -1
+        self._last_selected_card: Optional[MediaCard] = None
         self.inspect_worker: Optional[InspectWorker] = None
         self.download_worker: Optional[DownloadWorker] = None
 
@@ -77,7 +114,7 @@ class MainWindow(QMainWindow):
         self.save_folder: str = os.path.abspath("downloads")
         self.current_lang: str = "en"
         self.auto_clipboard: bool = True
-        self.profile_mode: str = "all"  # "all", "reels", "photos"
+        self.profile_mode: str = "all"
         self.quality_preset: str = "best_video"
         self._last_clipboard_text: str = ""
         self._queue_scroll_anim: Optional[QPropertyAnimation] = None
@@ -96,7 +133,6 @@ class MainWindow(QMainWindow):
         self.update_cookie_status()
 
     def _setup_crawl_limit_selector(self) -> None:
-        """Initializes preset limit selector with clean items, integer userData, and no eliding."""
         self.combo_batch_limit.blockSignals(True)
         self.combo_batch_limit.clear()
 
@@ -117,18 +153,12 @@ class MainWindow(QMainWindow):
             NoScrollComboBox.SizeAdjustPolicy.AdjustToContents
         )
         self.combo_batch_limit.view().setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.combo_batch_limit.setMinimumWidth(165)
-        self.combo_batch_limit.setCurrentIndex(1)  # Default: 72 items
+        self.combo_batch_limit.setMinimumWidth(185)
+        self.combo_batch_limit.setCurrentIndex(1)
         self.combo_batch_limit.blockSignals(False)
 
     def get_all_media_cards(self) -> list[MediaCard]:
-        """Return all active MediaCard widgets currently present in the queue."""
-        if hasattr(self, "cards") and isinstance(self.cards, list):
-            return self.cards
-        if hasattr(self, "media_cards") and isinstance(self.media_cards, list):
-            return self.media_cards
-        # Dynamic fallback: retrieve all child MediaCard instances
-        return self.findChildren(MediaCard)
+        return self.cards
 
     def tr_text(self, key: str, **kwargs) -> str:
         lang_dict = TRANSLATIONS.get(self.current_lang, TRANSLATIONS["en"])
@@ -137,7 +167,7 @@ class MainWindow(QMainWindow):
 
     def init_ui(self) -> None:
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(780, 540)
+        self.setMinimumSize(920, 640)
         self.setStyleSheet(DARK_STYLESHEET)
 
         if self._saved_geometry_hex:
@@ -146,10 +176,10 @@ class MainWindow(QMainWindow):
                     QByteArray.fromHex(self._saved_geometry_hex.encode("utf-8"))
                 )
             except Exception as e:
-                logger.debug(f"Failed to restore window geometry: {e}")
-                self.resize(880, 680)
+                logger.debug("Failed to restore window geometry: %s", e)
+                self.resize(1120, 800)
         else:
-            self.resize(880, 680)
+            self.resize(1120, 800)
 
         if self._is_maximized:
             self.showMaximized()
@@ -157,35 +187,37 @@ class MainWindow(QMainWindow):
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(14, 12, 14, 12)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(14)
 
         # 1. Top Bar: App Brand + Cookie Status + Language
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(2, 0, 2, 0)
+        top_bar.setSpacing(12)
 
         self.lbl_app_brand = QLabel("✨ Instagram Pro Studio", self)
-        self.lbl_app_brand.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.lbl_app_brand.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         self.lbl_app_brand.setStyleSheet("color: #FFFFFF; letter-spacing: 0.3px;")
         top_bar.addWidget(self.lbl_app_brand)
 
         top_bar.addStretch()
 
         self.lbl_cookie_status = QLabel(self)
-        self.lbl_cookie_status.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        self.lbl_cookie_status.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
         top_bar.addWidget(self.lbl_cookie_status)
 
+        # Import Cookie Button (Icon Only - Scaled)
         self.btn_import_cookie = QPushButton(self)
         self.btn_import_cookie.setObjectName("GlassActionButton")
-        self._set_button_icon(self.btn_import_cookie, "key", "#FCAF45", 12)
-        self.btn_import_cookie.setFixedHeight(28)
+        self._set_button_icon(self.btn_import_cookie, "key", "#FCAF45", 16)
+        self.btn_import_cookie.setFixedSize(38, 34)
         self.btn_import_cookie.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_import_cookie.clicked.connect(self.import_cookie)
         top_bar.addWidget(self.btn_import_cookie)
 
         self.combo_lang = NoScrollComboBox(self)
         self.combo_lang.addItems(["English (EN)", "ภาษาไทย (TH)"])
-        self.combo_lang.setFixedHeight(28)
+        self.combo_lang.setFixedHeight(34)
         self.combo_lang.setCurrentIndex(1 if self.current_lang == "th" else 0)
         self.combo_lang.currentIndexChanged.connect(self._on_lang_changed)
         top_bar.addWidget(self.combo_lang)
@@ -197,29 +229,28 @@ class MainWindow(QMainWindow):
         self.url_container.urls_changed.connect(self._on_urls_list_updated)
         main_layout.addWidget(self.url_container.input_widget)
 
-        # 3. Action Strip: Auto-Paste + Profile Mode Filter + Crawl Limit + Inspect Action
+        # 3. Action Strip: Auto-Paste + Profile Mode + Crawl Limit + Inspect
         action_strip = QHBoxLayout()
         action_strip.setContentsMargins(2, 0, 2, 0)
-        action_strip.setSpacing(10)
+        action_strip.setSpacing(12)
 
-        # Checkbox with explicit minimum width to prevent text truncation
         self.chk_clipboard = QCheckBox(self)
         self.chk_clipboard.setChecked(self.auto_clipboard)
-        self.chk_clipboard.setMinimumWidth(175)
+        self.chk_clipboard.setFont(QFont("Segoe UI", 10))
+        self.chk_clipboard.setMinimumWidth(200)
         self.chk_clipboard.stateChanged.connect(self._on_clipboard_toggle)
         action_strip.addWidget(self.chk_clipboard)
 
         action_strip.addStretch()
 
-        # Profile Crawl Filter Dropdown
         self.lbl_profile_filter = QLabel(self)
-        self.lbl_profile_filter.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        self.lbl_profile_filter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
         self.lbl_profile_filter.setStyleSheet("color: #A0A0B2;")
         action_strip.addWidget(self.lbl_profile_filter)
 
         self.combo_profile_mode = NoScrollComboBox(self)
-        self.combo_profile_mode.setFixedHeight(32)
-        self.combo_profile_mode.setMinimumWidth(140)
+        self.combo_profile_mode.setFixedHeight(38)
+        self.combo_profile_mode.setMinimumWidth(160)
         self.combo_profile_mode.setSizeAdjustPolicy(
             NoScrollComboBox.SizeAdjustPolicy.AdjustToContents
         )
@@ -236,25 +267,22 @@ class MainWindow(QMainWindow):
         )
         action_strip.addWidget(self.combo_profile_mode)
 
-        # -----------------------------------------------------------------
-        # >>> CRAWL LIMIT SELECTOR <<<
-        # -----------------------------------------------------------------
         self.lbl_batch_limit = QLabel("Crawl Limit:", self)
-        self.lbl_batch_limit.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        self.lbl_batch_limit.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
         self.lbl_batch_limit.setStyleSheet("color: #A0A0B2;")
         action_strip.addWidget(self.lbl_batch_limit)
 
         self.combo_batch_limit = NoScrollComboBox(self)
-        self.combo_batch_limit.setFixedHeight(32)
+        self.combo_batch_limit.setFixedHeight(38)
         self._setup_crawl_limit_selector()
         action_strip.addWidget(self.combo_batch_limit)
-        # -----------------------------------------------------------------
 
+        # Inspect Button (Icon Only - Scaled)
         self.btn_inspect = QPushButton(self)
         self.btn_inspect.setObjectName("PrimaryActionButton")
-        self.btn_inspect.setFixedHeight(34)
-        self.btn_inspect.setMinimumWidth(125)
-        self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 13)
+        self.btn_inspect.setFixedSize(44, 38)
+        self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 18)
+        self.btn_inspect.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_inspect.clicked.connect(self.start_inspection)
         action_strip.addWidget(self.btn_inspect)
 
@@ -262,43 +290,52 @@ class MainWindow(QMainWindow):
 
         # 4. Progress Bar
         self.progress_bar = ModernProgressBar(self)
-        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setFixedHeight(6)
         self.progress_bar.setValue(0)
         main_layout.addWidget(self.progress_bar)
 
-        # 5. Switchable Tab Widget: Media Queue vs. URL Links
+        # 5. Switchable Tab Widget
         self.tab_widget = QTabWidget(self)
 
         # Tab 0: Media Queue Panel
         queue_tab = QWidget()
         queue_layout = QVBoxLayout(queue_tab)
-        queue_layout.setContentsMargins(10, 8, 10, 8)
-        queue_layout.setSpacing(6)
+        queue_layout.setContentsMargins(12, 10, 12, 10)
+        queue_layout.setSpacing(8)
 
         queue_bar = QHBoxLayout()
         self.lbl_queue_count = QLabel(self)
-        self.lbl_queue_count.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.lbl_queue_count.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.lbl_queue_count.setStyleSheet("color: #FFFFFF;")
-        self.lbl_selected_count = self.lbl_queue_count  # Compatibility Alias
+        self.lbl_selected_count = self.lbl_queue_count
         queue_bar.addWidget(self.lbl_queue_count)
 
         queue_bar.addStretch()
 
+        # Select All (Icon Only - Scaled)
         self.btn_select_all = QPushButton(self)
         self.btn_select_all.setObjectName("GlassActionButton")
-        self._set_button_icon(self.btn_select_all, "select_all", "#10B981", 12)
+        self.btn_select_all.setFixedSize(36, 32)
+        self.btn_select_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_button_icon(self.btn_select_all, "select_all", "#10B981", 16)
         self.btn_select_all.clicked.connect(self.toggle_select_all)
         queue_bar.addWidget(self.btn_select_all)
 
+        # Delete Selected (Icon Only - Scaled)
         self.btn_delete_selected = QPushButton(self)
         self.btn_delete_selected.setObjectName("DestructiveButton")
-        self._set_button_icon(self.btn_delete_selected, "trash", "#FF6B6B", 12)
+        self.btn_delete_selected.setFixedSize(36, 32)
+        self.btn_delete_selected.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_button_icon(self.btn_delete_selected, "trash", "#FF6B6B", 15)
         self.btn_delete_selected.clicked.connect(self.delete_selected_cards)
         queue_bar.addWidget(self.btn_delete_selected)
 
+        # Clear Completed (Icon Only - Scaled)
         self.btn_clear_completed = QPushButton(self)
         self.btn_clear_completed.setObjectName("GlassActionButton")
-        self._set_button_icon(self.btn_clear_completed, "check_double", "#70C5FF", 12)
+        self.btn_clear_completed.setFixedSize(36, 32)
+        self.btn_clear_completed.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_button_icon(self.btn_clear_completed, "check_double", "#70C5FF", 16)
         self.btn_clear_completed.clicked.connect(self.clear_completed_cards)
         queue_bar.addWidget(self.btn_clear_completed)
 
@@ -309,8 +346,8 @@ class MainWindow(QMainWindow):
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll_widget = QWidget()
         self.media_grid_layout = QVBoxLayout(self.scroll_widget)
-        self.media_grid_layout.setContentsMargins(2, 2, 2, 2)
-        self.media_grid_layout.setSpacing(6)
+        self.media_grid_layout.setContentsMargins(4, 4, 4, 4)
+        self.media_grid_layout.setSpacing(8)
         self.media_grid_layout.addStretch()
         self.scroll_area.setWidget(self.scroll_widget)
         queue_layout.addWidget(self.scroll_area, stretch=1)
@@ -320,7 +357,7 @@ class MainWindow(QMainWindow):
         # Tab 1: URL Links List
         self.tab_widget.addTab(self.url_container.list_widget, "URL Links (0)")
 
-        # Tab 2: Activity Logs (Right after URL Links)
+        # Tab 2: Activity Logs
         self.log_viewer = LogViewerWidget(self)
         self.tab_widget.addTab(self.log_viewer, "Activity Logs")
         if hasattr(self, "log_handler") and self.log_handler:
@@ -333,33 +370,41 @@ class MainWindow(QMainWindow):
         # 6. Bottom Bento Bar: Folder Controls + Status + Download Action
         bot_bar = QHBoxLayout()
         bot_bar.setContentsMargins(2, 0, 2, 0)
-        bot_bar.setSpacing(8)
+        bot_bar.setSpacing(10)
 
+        # Change Folder Button (Icon Only - Scaled)
         self.btn_change_folder = QPushButton(self)
         self.btn_change_folder.setObjectName("GlassActionButton")
-        self._set_button_icon(self.btn_change_folder, "folder", "#FCAF45", 13)
+        self.btn_change_folder.setFixedSize(38, 34)
+        self.btn_change_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_button_icon(self.btn_change_folder, "folder", "#FCAF45", 16)
         self.btn_change_folder.clicked.connect(self.browse_save_folder)
         bot_bar.addWidget(self.btn_change_folder)
 
+        # Open Folder Button (Icon Only - Scaled)
         self.btn_open_folder = QPushButton(self)
         self.btn_open_folder.setObjectName("GlassActionButton")
-        self._set_button_icon(self.btn_open_folder, "folder_open", "#F56040", 13)
+        self.btn_open_folder.setFixedSize(38, 34)
+        self.btn_open_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_button_icon(self.btn_open_folder, "folder_open", "#F56040", 16)
         self.btn_open_folder.clicked.connect(self.open_save_folder)
         bot_bar.addWidget(self.btn_open_folder)
 
         self.lbl_status = QLabel(self)
-        self.lbl_status.setFont(QFont("Segoe UI", 8))
+        self.lbl_status.setFont(QFont("Segoe UI", 9))
         self.lbl_status.setStyleSheet("color: #A0A0B2;")
         bot_bar.addWidget(self.lbl_status, 1)
 
         self.lbl_toast = QLabel("", self)
-        self.lbl_toast.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.lbl_toast.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         bot_bar.addWidget(self.lbl_toast)
 
+        # Download Action Button (Icon Only - Scaled)
         self.btn_download_all = QPushButton(self)
         self.btn_download_all.setObjectName("DownloadAllButton")
-        self.btn_download_all.setFixedHeight(34)
-        self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 13)
+        self.btn_download_all.setFixedSize(48, 38)
+        self.btn_download_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 18)
         self.btn_download_all.clicked.connect(self.start_download)
         bot_bar.addWidget(self.btn_download_all)
 
@@ -375,11 +420,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Enter), self, self.start_download)
 
     def clear_media_grid(self) -> None:
-        """Compatibility alias for clearing all media cards in queue."""
         self.clear_all_cards()
 
     def _setup_logging(self) -> None:
-        """Configures QtLogHandler to intercept application logs and forward them to the UI."""
         self.log_handler = QtLogHandler()
         formatter = logging.Formatter(
             "[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s", "%H:%M:%S"
@@ -393,16 +436,13 @@ class MainWindow(QMainWindow):
 
     def apply_translations(self) -> None:
         self.lbl_app_brand.setText(self.tr_text("app_title"))
-        self.btn_import_cookie.setText(self.tr_text("btn_cookie"))
+        self.btn_import_cookie.setToolTip(self.tr_text("dialog_import_cookie"))
         self.url_container.input_edit.setPlaceholderText(
             self.tr_text("input_placeholder")
         )
-        self.url_container.btn_add.setText(self.tr_text("btn_add"))
-        self.url_container.btn_clear_all.setText(self.tr_text("btn_clear_urls"))
         self.chk_clipboard.setText(self.tr_text("auto_clipboard"))
         self.lbl_profile_filter.setText(self.tr_text("profile_filter_label"))
 
-        # Update Profile Mode combo items without resetting selection
         curr_mode_idx = self.combo_profile_mode.currentIndex()
         self.combo_profile_mode.blockSignals(True)
         self.combo_profile_mode.clear()
@@ -419,18 +459,18 @@ class MainWindow(QMainWindow):
         self.combo_profile_mode.blockSignals(False)
 
         is_inspecting = self.inspect_worker and self.inspect_worker.isRunning()
-        self.btn_inspect.setText(
+        self.btn_inspect.setToolTip(
             self.tr_text("inspect_cancel" if is_inspecting else "inspect_media")
         )
 
-        self.btn_select_all.setText(self.tr_text("btn_select_all"))
-        self.btn_delete_selected.setText(self.tr_text("btn_delete"))
-        self.btn_clear_completed.setText(self.tr_text("btn_clear_completed"))
-        self.btn_change_folder.setText(self.tr_text("btn_change_folder"))
-        self.btn_open_folder.setText(self.tr_text("btn_open_folder"))
+        self.btn_select_all.setToolTip(self.tr_text("btn_select_all"))
+        self.btn_delete_selected.setToolTip(self.tr_text("btn_delete"))
+        self.btn_clear_completed.setToolTip(self.tr_text("btn_clear_completed"))
+        self.btn_change_folder.setToolTip(self.tr_text("btn_change_folder"))
+        self.btn_open_folder.setToolTip(self.tr_text("btn_open_folder"))
 
         is_downloading = self.download_worker and self.download_worker.isRunning()
-        self.btn_download_all.setText(
+        self.btn_download_all.setToolTip(
             self.tr_text(
                 "btn_cancel_download" if is_downloading else "btn_download_selected"
             )
@@ -444,7 +484,7 @@ class MainWindow(QMainWindow):
         self.update_cookie_status()
 
     def _set_button_icon(
-        self, button: QPushButton, name: str, color: str = "#FFFFFF", size: int = 13
+        self, button: QPushButton, name: str, color: str = "#FFFFFF", size: int = 16
     ) -> None:
         icon = get_icon(name, color=color, size=size)
         if icon:
@@ -501,8 +541,8 @@ class MainWindow(QMainWindow):
     def start_inspection(self) -> None:
         if self.inspect_worker and self.inspect_worker.isRunning():
             self.inspect_worker.cancel()
-            self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 13)
-            self.btn_inspect.setText(self.tr_text("inspect_media"))
+            self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 18)
+            self.btn_inspect.setToolTip(self.tr_text("inspect_media"))
             self.lbl_status.setText(self.tr_text("status_ready"))
             self._update_action_button_states()
             return
@@ -514,13 +554,12 @@ class MainWindow(QMainWindow):
 
         self.url_container.clear()
         self.progress_bar.setValue(0)
-        self._set_button_icon(self.btn_inspect, "stop", "#FFFFFF", 13)
-        self.btn_inspect.setText(self.tr_text("inspect_cancel"))
+        self._set_button_icon(self.btn_inspect, "stop", "#FFFFFF", 18)
+        self.btn_inspect.setToolTip(self.tr_text("inspect_cancel"))
         self.lbl_status.setText(self.tr_text("status_inspecting"))
 
         self.tab_widget.setCurrentIndex(0)
 
-        # Retrieve integer limit value stored in the item's userData
         raw_limit_data = (
             self.combo_batch_limit.currentData()
             if hasattr(self, "combo_batch_limit")
@@ -577,31 +616,29 @@ class MainWindow(QMainWindow):
         card.card_clicked.connect(self._on_card_clicked)
         card.selection_changed.connect(self.update_selection_counter)
 
-        count = self.media_grid_layout.count()
-        if count > 0:
-            self.media_grid_layout.insertWidget(count - 1, card)
-        else:
-            self.media_grid_layout.addWidget(card)
+        new_key = extract_chronological_key(item_data)
 
-        self.cards.append(card)
+        target_idx = len(self.cards)
+        for idx, existing_card in enumerate(self.cards):
+            existing_key = extract_chronological_key(existing_card.get_item_data())
+            if new_key > existing_key:
+                target_idx = idx
+                break
+
+        self.cards.insert(target_idx, card)
+        self.media_grid_layout.insertWidget(target_idx, card)
+
         logger.info(
             f"✓ Added [{card.item_data.get('media_type', 'MEDIA')}] "
             f"@{card.item_data.get('username', 'unknown')} - "
-            f"{card.item_data.get('shortcode', 'no_code')}"
+            f"{card.item_data.get('shortcode', 'no_code')} (Key: {new_key})"
         )
         self.update_selection_counter()
         self._update_action_button_states()
-        self.smooth_scroll_queue_to_bottom()
-
-    def _connect_card_signals(self, card: MediaCard) -> None:
-        """Connect individual card signals."""
-        card.card_clicked.connect(self._on_card_clicked)
-        card.selection_changed.connect(self.update_selection_counter)
 
     def _on_card_clicked(
         self, card: MediaCard, modifiers: Optional[Qt.KeyboardModifier] = None
     ) -> None:
-        """Handle media card toggle, multi-select, and range selection."""
         if modifiers is None:
             modifiers = Qt.KeyboardModifier.NoModifier
 
@@ -609,7 +646,6 @@ class MainWindow(QMainWindow):
         if not cards or card not in cards:
             return
 
-        # Shift + Click (Range Selection)
         if modifiers & Qt.KeyboardModifier.ShiftModifier:
             last_card = getattr(self, "_last_selected_card", None)
             if last_card and last_card in cards:
@@ -621,7 +657,6 @@ class MainWindow(QMainWindow):
                     cards[i].set_selected(target_state)
             else:
                 card.toggle_selected()
-        # Plain Click or Ctrl + Click -> Toggle Selection
         else:
             card.toggle_selected()
 
@@ -629,10 +664,6 @@ class MainWindow(QMainWindow):
         self.update_selection_counter()
 
     def toggle_select_all(self) -> None:
-        """
-        Toggles all cards between Selected and Deselected.
-        If all are currently selected, deselects all; otherwise selects all.
-        """
         cards = self.get_all_media_cards()
         if not cards:
             return
@@ -669,8 +700,8 @@ class MainWindow(QMainWindow):
 
     def on_inspection_finished(self, count: int) -> None:
         self.progress_bar.setValue(100)
-        self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 13)
-        self.btn_inspect.setText(self.tr_text("inspect_media"))
+        self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 18)
+        self.btn_inspect.setToolTip(self.tr_text("inspect_media"))
         self.lbl_status.setText(
             self.tr_text("status_inspection_done", count=len(self.cards))
         )
@@ -683,7 +714,7 @@ class MainWindow(QMainWindow):
     def start_download(self) -> None:
         if self.download_worker and self.download_worker.isRunning():
             self.download_worker.cancel()
-            self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 13)
+            self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 18)
             self.lbl_status.setText(self.tr_text("status_download_cancelled"))
             self.show_toast(self.tr_text("toast_download_cancelled"))
             self._update_action_button_states()
@@ -698,7 +729,6 @@ class MainWindow(QMainWindow):
         ]
 
         if not selected_cards:
-            # Check if user had cards selected but all of them were already downloaded
             already_done = any(
                 c.is_selected
                 and (
@@ -713,11 +743,16 @@ class MainWindow(QMainWindow):
                 self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
             return
 
+        selected_cards.sort(
+            key=lambda card_obj: extract_chronological_key(card_obj.get_item_data()),
+            reverse=True,
+        )
+
         items = [c.get_item_data() for c in selected_cards]
         for card in selected_cards:
             card.set_status("queued")
 
-        self._set_button_icon(self.btn_download_all, "stop", "#FFFFFF", 13)
+        self._set_button_icon(self.btn_download_all, "stop", "#FFFFFF", 18)
         self.lbl_status.setText(self.tr_text("status_downloading", count=len(items)))
 
         self.download_worker = DownloadWorker(
@@ -754,12 +789,11 @@ class MainWindow(QMainWindow):
             if cid == str(item_id):
                 card.set_status("finished" if ok else "error")
                 if ok:
-                    # Automatically uncheck completed items from active selection
                     card.set_selected(False)
         self.update_selection_counter()
 
     def _on_download_finished(self, success_count: int) -> None:
-        self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 13)
+        self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 18)
         self.progress_bar.setValue(100)
 
         for card in self.cards:
@@ -782,7 +816,6 @@ class MainWindow(QMainWindow):
             self.remove_card(card)
 
     def update_selection_counter(self) -> None:
-        """Update header selection counter, tab title, and action buttons."""
         cards = self.get_all_media_cards()
         total = len(cards)
         selected = sum(1 for c in cards if c.is_selected)
@@ -791,24 +824,22 @@ class MainWindow(QMainWindow):
         self.tab_widget.setTabText(0, f"Media Queue ({selected}/{total})")
 
         if total > 0 and selected == total:
-            self.btn_select_all.setText(
+            self.btn_select_all.setToolTip(
                 self.tr_text("btn_deselect_all")
                 if "btn_deselect_all" in TRANSLATIONS.get(self.current_lang, {})
                 else "Deselect All"
             )
         else:
-            self.btn_select_all.setText(self.tr_text("btn_select_all"))
+            self.btn_select_all.setToolTip(self.tr_text("btn_select_all"))
 
         self._update_action_button_states()
 
     def select_all_cards(self) -> None:
-        """Explicitly select all cards in the queue."""
         for card in self.get_all_media_cards():
             card.set_selected(True)
         self.update_selection_counter()
 
     def deselect_all_cards(self) -> None:
-        """Explicitly deselect all cards in the queue."""
         for card in self.get_all_media_cards():
             card.set_selected(False)
         self.update_selection_counter()
@@ -825,7 +856,6 @@ class MainWindow(QMainWindow):
             self.update_selection_counter()
 
     def delete_selected_cards(self) -> None:
-        """Remove only the actively selected media cards from the queue."""
         selected_cards = [c for c in list(self.cards) if c.is_selected]
         if not selected_cards:
             self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
@@ -835,7 +865,6 @@ class MainWindow(QMainWindow):
             self.remove_card(card)
 
     def clear_completed_cards(self) -> None:
-        """Remove all cards that have finished downloading."""
         completed_cards = [
             c
             for c in list(self.cards)
@@ -906,11 +935,9 @@ class MainWindow(QMainWindow):
         self.save_settings()
 
     def _resolve_settings_file(self) -> str:
-        from utils.file_utils import get_app_dir
         return os.path.join(get_app_dir(), "config", "settings.json")
 
     def load_settings(self) -> None:
-        """Loads persistent user preferences and last window geometry from settings.json."""
         settings_path = self._resolve_settings_file()
         if os.path.exists(settings_path):
             try:
@@ -930,7 +957,6 @@ class MainWindow(QMainWindow):
                 logger.debug("Failed to load settings: %s", e)
 
     def save_settings(self) -> None:
-        """Persists current link preferences, profile mode, save path, and window geometry."""
         settings_path = self._resolve_settings_file()
         try:
             os.makedirs(os.path.dirname(settings_path), exist_ok=True)
@@ -950,12 +976,10 @@ class MainWindow(QMainWindow):
             logger.debug("Failed to save settings: %s", e)
 
     def closeEvent(self, event) -> None:
-        """Saves all settings and window state upon exit."""
         self.save_settings()
         super().closeEvent(event)
 
     def _update_action_button_states(self) -> None:
-        """Central state machine enforcing disabled/enabled safety rules across all buttons."""
         is_inspecting = bool(self.inspect_worker and self.inspect_worker.isRunning())
         is_downloading = bool(self.download_worker and self.download_worker.isRunning())
 
@@ -969,24 +993,31 @@ class MainWindow(QMainWindow):
             or getattr(c, "is_finished", False)
         )
 
-        # 1. Inspect Button
         if is_downloading:
             self.btn_inspect.setEnabled(False)
         else:
             self.btn_inspect.setEnabled(True)
 
-        # 2. Download Button
+        if is_inspecting:
+            self._set_button_icon(self.btn_inspect, "stop", "#FFFFFF", 18)
+            self.btn_inspect.setToolTip(self.tr_text("inspect_cancel"))
+        else:
+            self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 18)
+            self.btn_inspect.setToolTip(self.tr_text("inspect_media"))
+
         if is_downloading:
             self.btn_download_all.setEnabled(True)
-            self.btn_download_all.setText(self.tr_text("btn_cancel_download"))
+            self._set_button_icon(self.btn_download_all, "stop", "#FFFFFF", 18)
+            self.btn_download_all.setToolTip(self.tr_text("btn_cancel_download"))
         elif is_inspecting or selected_count == 0:
             self.btn_download_all.setEnabled(False)
-            self.btn_download_all.setText(self.tr_text("btn_download_selected"))
+            self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 18)
+            self.btn_download_all.setToolTip(self.tr_text("btn_download_selected"))
         else:
             self.btn_download_all.setEnabled(True)
-            self.btn_download_all.setText(self.tr_text("btn_download_selected"))
+            self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 18)
+            self.btn_download_all.setToolTip(self.tr_text("btn_download_selected"))
 
-        # 3. Queue Action Buttons
         if hasattr(self, "btn_select_all"):
             self.btn_select_all.setEnabled(total_count > 0 and not is_downloading)
 
@@ -1000,7 +1031,6 @@ class MainWindow(QMainWindow):
                 completed_count > 0 and not is_downloading
             )
 
-        # 4. Settings & Environment Controls
         if hasattr(self, "btn_import_cookie"):
             self.btn_import_cookie.setEnabled(not is_inspecting and not is_downloading)
 
@@ -1013,13 +1043,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "combo_batch_limit"):
             self.combo_batch_limit.setEnabled(not is_inspecting and not is_downloading)
 
-        # 5. URL Input Bar Actions
         if hasattr(self, "url_container"):
             url_count = self.url_container.count()
             self.url_container.btn_clear_all.setEnabled(
                 url_count > 0 and not is_inspecting
             )
-
-            # Disable adding during inspection
             input_has_text = bool(self.url_container.input_edit.text().strip())
             self.url_container.btn_add.setEnabled(input_has_text and not is_inspecting)

@@ -7,27 +7,34 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-# Support alphanumeric, underscore, and dot characters in usernames
-PROFILE_REGEX = re.compile(
-    r"^(?:https?://)?(?:www\.)?instagram\.com/(?!(?:p|reel|reels|stories|explore|direct|accounts|tv)/)([a-zA-Z0-9_.]+)/?",
-    re.IGNORECASE,
-)
+# Base64 shortcode alphabet used by Instagram
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 RESERVED_ROOT_PATHS = {
     "p",
+    "post",
     "reel",
     "reels",
     "tv",
     "stories",
+    "highlights",
     "explore",
     "direct",
     "accounts",
     "api",
     "graphql",
     "developer",
+    "about",
+    "legal",
+    "share",
 }
+
+PROFILE_REGEX = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am|ig\.me)/(?!(?:p|post|reel|reels|stories|highlights|explore|direct|accounts|tv|share|developer|api)/)([a-zA-Z0-9_.]+)/?",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -55,29 +62,23 @@ class NormalizedMedia:
 
 
 class UnifiedInstagramParser:
-    """Normalizes polymorphic Instagram payloads (GraphQL ASTs & Web REST items)
-
-    into a unified type-safe data model.
-    """
+    """Normalizes polymorphic Instagram payloads into a unified type-safe data model."""
 
     @classmethod
     def parse_graphql_node(cls, node: dict[str, Any]) -> NormalizedMedia | None:
         if not isinstance(node, dict):
             return None
 
-        # Resolve polymorphic ID / Shortcode
         media_id = str(node.get("id") or node.get("pk") or "")
         shortcode = str(node.get("code") or node.get("shortcode") or "")
         if not media_id and not shortcode:
             return None
 
-        # Resolve Owner context
         owner_data = node.get("owner") or node.get("user")
         owner_dict = owner_data if isinstance(owner_data, dict) else {}
         owner_username = str(owner_dict.get("username") or "")
         owner_id = str(owner_dict.get("id") or owner_dict.get("pk") or "")
 
-        # Resolve Captions
         caption = ""
         caption_data = node.get("edge_media_to_caption")
         if isinstance(caption_data, dict):
@@ -98,14 +99,12 @@ class UnifiedInstagramParser:
         taken_at = int(node.get("taken_at_timestamp") or node.get("taken_at") or 0)
         display_url = str(node.get("display_url") or node.get("display_src") or "")
 
-        # Determine Media Type
         typename = str(node.get("__typename") or "")
         is_video_flag = bool(node.get("is_video") or node.get("media_type") == 2)
 
         assets: list[MediaAsset] = []
         carousel_children: list[NormalizedMedia] = []
 
-        # Case 1: Carousel / Sidecar Container
         sidecar_data = node.get("edge_sidecar_to_children") or node.get(
             "carousel_media"
         )
@@ -131,7 +130,6 @@ class UnifiedInstagramParser:
             if not display_url and carousel_children:
                 display_url = carousel_children[0].display_url
 
-        # Case 2: Video Asset (Reels, Clip, Single Video Post)
         elif is_video_flag or typename == "GraphVideo":
             media_type = "video"
             video_url = str(node.get("video_url") or "")
@@ -166,7 +164,6 @@ class UnifiedInstagramParser:
             if isinstance(dash_xml, str) and assets:
                 assets[0].dash_manifest = dash_xml
 
-        # Case 3: Single Image Asset
         else:
             media_type = "image"
             display_resources = node.get("display_resources")
@@ -209,15 +206,11 @@ class UnifiedInstagramParser:
         )
 
 
-ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-
-
 def sanitize_instagram_url(url: str) -> str:
-    """Strip tracking and pagination query parameters from the Instagram URL."""
+    """Strip tracking and pagination query parameters from an Instagram URL."""
     if not url:
         return ""
     parsed = urlparse(url.strip())
-    # Retain scheme and netloc if present
     path = parsed.path.rstrip("/")
     return (
         f"https://www.instagram.com{path}"
@@ -231,17 +224,7 @@ def extract_username_from_url(url: str) -> str | None:
     match = PROFILE_REGEX.search(url.strip())
     if match:
         username = match.group(1).strip()
-        # Ensure it is not a system route
-        if username.lower() not in {
-            "p",
-            "reel",
-            "reels",
-            "stories",
-            "explore",
-            "direct",
-            "accounts",
-            "tv",
-        }:
+        if username.lower() not in RESERVED_ROOT_PATHS:
             return username
     return None
 
@@ -252,7 +235,8 @@ def extract_instagram_urls(text: str) -> List[str]:
         return []
 
     pattern = re.compile(
-        r'https?://(?:www\.)?instagram\.com/[^\s"\'<>]+', re.IGNORECASE
+        r'https?://(?:www\.)?(?:instagram\.com|ddinstagram\.com|kkinstagram\.com|instagr\.am|ig\.me)/[^\s"\'<>]+',
+        re.IGNORECASE,
     )
     matches = pattern.findall(text)
 
@@ -265,7 +249,7 @@ def extract_instagram_urls(text: str) -> List[str]:
 
 
 def normalize_url(url: str) -> str:
-    """Sanitizes Instagram URLs by removing tracking parameters and carousel slide indices."""
+    """Sanitizes Instagram URLs by removing tracking parameters and cleaning formatting."""
     if not url or not isinstance(url, str):
         return ""
     cleaned = url.strip()
@@ -273,8 +257,7 @@ def normalize_url(url: str) -> str:
     cleaned = re.sub(r"[?&](?:igsh|utm_[^&=]+|hl|locale)=[^&#]*", "", cleaned).rstrip(
         "?&#"
     )
-    cleaned = cleaned.split("?")[0].rstrip("/")
-    return cleaned
+    return cleaned.split("?")[0].rstrip("/")
 
 
 def id_to_shortcode(media_id: int | str) -> str:
@@ -294,10 +277,22 @@ def id_to_shortcode(media_id: int | str) -> str:
     return "".join(reversed(shortcode_chars))
 
 
+def shortcode_to_id(shortcode: str) -> Optional[int]:
+    """Converts an Instagram Base64 shortcode to a numeric media ID."""
+    if not shortcode or not isinstance(shortcode, str):
+        return None
+    media_id = 0
+    for char in shortcode:
+        if char not in ALPHABET:
+            return None
+        media_id = (media_id * 64) + ALPHABET.index(char)
+    return media_id
+
+
 def parse_instagram_url(url: str) -> Dict[str, Any]:
     """
-    Parses and normalizes Instagram URLs into routing targets matching InspectWorker's schema.
-    Supports raw URLs, handle strings (@username), and query stripping.
+    Parses and normalizes Instagram URLs into structured routing targets.
+    Handles standard posts, reels, stories, highlights, share redirects, and raw handles.
     """
     cleaned_url = (url or "").strip()
     if not cleaned_url:
@@ -309,7 +304,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "identifier": None,
         }
 
-    # Handle raw usernames prefixed with @
+    # 1. Handle raw usernames prefixed with @
     if cleaned_url.startswith("@"):
         clean_user = cleaned_url.lstrip("@").strip()
         return {
@@ -320,13 +315,14 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "identifier": f"{clean_user}_all_posts",
         }
 
-    # Handle domainless / shorthand input paths
+    # 2. Add scheme if domainless
     if not cleaned_url.startswith(("http://", "https://")):
         cleaned_url = "https://www.instagram.com/" + cleaned_url.lstrip("/")
 
     parsed = urlparse(cleaned_url)
     path = parsed.path.strip("/")
     segments = [seg for seg in path.split("/") if seg]
+    query_params = parse_qs(parsed.query)
 
     if not segments:
         return {
@@ -337,14 +333,40 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "identifier": None,
         }
 
+    # Filter out 'share' wrappers: /share/p/{code}, /share/reel/{code}, /share/{code}
+    if segments[0].lower() == "share":
+        segments = segments[1:]
+        if not segments:
+            return {
+                "valid": False,
+                "type": "unknown",
+                "username": None,
+                "shortcode": None,
+                "identifier": None,
+            }
+
     first = segments[0].lower()
 
-    # Direct posts / reels / TV: /p/{code}, /reel/{code}, /reels/{code}, /tv/{code}
-    if first in {"p", "post", "reel", "reels", "tv"} and len(segments) >= 2:
-        code = segments[1]
-        media_type = "reel" if first in {"reel", "reels"} else "post"
-        if "img_index=" in parsed.query:
+    # 3. Direct Posts, Reels, and TV Items
+    if first in {"p", "post", "reel", "reels", "tv", "r"}:
+        code = segments[1] if len(segments) >= 2 else None
+        if not code:
+            return {
+                "valid": False,
+                "type": "unknown",
+                "username": None,
+                "shortcode": None,
+                "identifier": None,
+            }
+
+        is_carousel = "img_index" in query_params or "carousel" in cleaned_url
+        if is_carousel:
             media_type = "carousel"
+        elif first in {"reel", "reels"}:
+            media_type = "reel"
+        else:
+            media_type = "post"
+
         return {
             "valid": True,
             "type": media_type,
@@ -353,19 +375,34 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "identifier": code,
         }
 
-    # Stories: /stories/{username}/{story_id?}
-    if first == "stories" and len(segments) >= 2:
-        user = segments[1]
+    # 4. Stories Routing: /stories/{username}/{story_id?}
+    if first == "stories":
+        user = segments[1] if len(segments) >= 2 else None
         story_id = segments[2] if len(segments) >= 3 else None
         return {
-            "valid": True,
+            "valid": bool(user),
             "type": "story" if story_id else "story_user",
             "username": user,
             "shortcode": story_id,
-            "identifier": story_id or f"{user}_all_stories",
+            "identifier": story_id or (f"{user}_all_stories" if user else None),
         }
 
-    # User Profile or Reels Tab: /{username}/ or /{username}/reels/
+    # 5. Highlights: /stories/highlights/{id}/ or /s/{id}
+    if first in {"highlights", "s"} or (
+        first == "stories"
+        and len(segments) >= 2
+        and segments[1].lower() == "highlights"
+    ):
+        code = segments[-1]
+        return {
+            "valid": True,
+            "type": "highlight",
+            "username": None,
+            "shortcode": code,
+            "identifier": code,
+        }
+
+    # 6. User Profile or Reels Tab: /{username}/ or /{username}/reels/
     if first not in RESERVED_ROOT_PATHS:
         username = segments[0].lstrip("@")
         if len(segments) >= 2 and segments[1].lower() in {"reels", "reel"}:
@@ -391,18 +428,6 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
         "shortcode": None,
         "identifier": None,
     }
-
-
-def shortcode_to_id(shortcode: str) -> Optional[int]:
-    """Converts an Instagram Base64 shortcode to a numeric media ID."""
-    if not shortcode or not isinstance(shortcode, str):
-        return None
-    media_id = 0
-    for char in shortcode:
-        if char not in ALPHABET:
-            return None
-        media_id = (media_id * 64) + ALPHABET.index(char)
-    return media_id
 
 
 def is_standalone_video(media_dict: Dict[str, Any]) -> bool:
