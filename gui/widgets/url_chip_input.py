@@ -7,8 +7,24 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QKeySequence
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    pyqtSignal,
+    QRectF,
+)
+from PyQt6.QtGui import (
+    QFont,
+    QKeySequence,
+    QLinearGradient,
+    QPainterPath,
+    QPen,
+    QColor,
+    QPainter,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -24,6 +40,54 @@ from PyQt6.QtWidgets import (
 
 from core.parser import extract_instagram_urls, parse_instagram_url
 from gui.icons import get_icon
+
+
+class URLGlassThumbnailPod(QFrame):
+    """
+    Frosted glass thumbnail and media-type badge pod.
+    Combines optical acrylic backing with vector iconography and specular rim lighting.
+    """
+
+    def __init__(self, target_type: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.target_type = target_type.upper()
+        self.setFixedSize(40, 40)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = float(self.width()), float(self.height())
+        rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 9.0, 9.0)
+
+        # 1. Frosted Backing Fill
+        fill_grad = QLinearGradient(0, 0, 0, h)
+        fill_grad.setColorAt(0.0, QColor(32, 28, 48, 200))
+        fill_grad.setColorAt(1.0, QColor(18, 16, 26, 230))
+        painter.fillPath(path, fill_grad)
+
+        # 2. Specular Rim Stroke
+        border_grad = QLinearGradient(0, 0, w, h)
+        border_grad.setColorAt(0.0, QColor(255, 255, 255, 90))
+        border_grad.setColorAt(0.6, QColor(225, 48, 108, 60))
+        border_grad.setColorAt(1.0, QColor(255, 255, 255, 20))
+        painter.setPen(QPen(border_grad, 1.0))
+        painter.drawPath(path)
+
+        # 3. Ambient Media Glyph
+        painter.save()
+        painter.setClipPath(path)
+        icon_color = "#E1306C" if "REEL" in self.target_type else "#38BDF8"
+        icon_name = "search" if "PROFILE" in self.target_type else "link"
+        icon = get_icon(icon_name, color=icon_color, size=18)
+        if icon and not icon.isNull():
+            pix = icon.pixmap(18, 18)
+            painter.drawPixmap(int((w - 18) / 2), int((h - 18) / 2), pix)
+        painter.restore()
+
+        painter.end()
 
 
 class URLItemCard(QFrame):
@@ -81,35 +145,40 @@ class URLItemCard(QFrame):
         self.setStyleSheet(
             """
             QFrame#URLItemCard {
-                background-color: rgba(22, 22, 32, 0.72);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 10px;
+                background-color: rgba(24, 22, 35, 0.65);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 12px;
             }
             QFrame#URLItemCard:hover {
-                background-color: rgba(30, 30, 46, 0.88);
-                border: 1px solid rgba(225, 48, 108, 0.35);
+                background-color: rgba(32, 28, 48, 0.85);
+                border: 1px solid rgba(225, 48, 108, 0.45);
             }
             """
         )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 8, 12, 8)
-        layout.setSpacing(14)
+        layout.setContentsMargins(10, 8, 12, 8)
+        layout.setSpacing(12)
 
+        # Glassmorphic Image/Icon Pod
+        self.thumb_pod = URLGlassThumbnailPod(self.target_type, self)
+        layout.addWidget(self.thumb_pod)
+
+        # Media Type Badge
         self.lbl_type = QLabel(self.target_type, self)
         self.lbl_type.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.lbl_type.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_type.setFixedWidth(98)
-        self.lbl_type.setFixedHeight(30)
+        self.lbl_type.setFixedWidth(86)
+        self.lbl_type.setFixedHeight(28)
         self.lbl_type.setStyleSheet(
             f"""
             QLabel {{
                 background-color: {bg_col};
                 color: {text_col};
                 border: 1px solid {border_col};
-                border-radius: 7px;
+                border-radius: 6px;
                 font-weight: 700;
-                font-size: 11.5px;
+                font-size: 11px;
                 letter-spacing: 0.5px;
             }}
             """
@@ -135,37 +204,15 @@ class URLItemCard(QFrame):
 
         self.btn_delete = QPushButton(self)
         self.btn_delete.setObjectName("CardDeleteButton")
-        self.btn_delete.setFixedSize(34, 34)
+        self.btn_delete.setFixedSize(36, 36)
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_delete.setToolTip("Remove target")
 
-        del_icon = get_icon("trash", color="#94A3B8", size=15) or get_icon(
-            "cancel", color="#94A3B8", size=14
-        )
+        del_icon = get_icon("trash", color="#94A3B8", size=15)
         if del_icon:
             self.btn_delete.setIcon(del_icon)
             self.btn_delete.setIconSize(QSize(15, 15))
-        else:
-            self.btn_delete.setText("✕")
 
-        self.btn_delete.setStyleSheet(
-            """
-            QPushButton#CardDeleteButton {
-                background-color: rgba(255, 255, 255, 0.04);
-                color: #A0A0B2;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
-            }
-            QPushButton#CardDeleteButton:hover {
-                background-color: rgba(239, 68, 68, 0.22);
-                border: 1px solid rgba(239, 68, 68, 0.40);
-                color: #FFFFFF;
-            }
-            QPushButton#CardDeleteButton:pressed {
-                background-color: rgba(185, 28, 28, 0.40);
-            }
-            """
-        )
         self.btn_delete.clicked.connect(lambda: self.deleted.emit(self.url))
         layout.addWidget(self.btn_delete)
 

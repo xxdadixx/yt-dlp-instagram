@@ -4,10 +4,23 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-from PyQt6.QtCore import QSize, Qt, pyqtSlot
-from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+from typing import Optional
+
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, pyqtSlot
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QRadialGradient,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PyQt6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -33,89 +46,54 @@ class LogViewerWidget(QWidget):
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
 
-        # 1. Header Bar: Title + Icon Action Buttons
+        # 1. Header Bar: Glass Badge + Title + Action Buttons
         header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(10)
+
+        self.diagnostic_badge = GlassDiagnosticBadge(self)
+        header_layout.addWidget(self.diagnostic_badge)
+
         header_label = QLabel("Process Activity & Diagnostics")
         header_label.setStyleSheet(
-            "font-weight: bold; font-size: 13px; color: #E0E0E0;"
+            "font-weight: bold; font-size: 13px; color: #E2E8F0;"
         )
         header_layout.addWidget(header_label)
 
         header_layout.addStretch()
 
-        # Export Logs Button (Icon Only)
+        # Export Logs Button
         self.export_btn = QPushButton(self)
-        self.export_btn.setFixedSize(30, 28)
+        self.export_btn.setObjectName("GlassActionButton")
+        self.export_btn.setFixedSize(36, 32)
         self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.export_btn.setToolTip("Export Activity Logs")
-        export_icon = get_icon("export", color="#38BDF8", size=14)
+        export_icon = get_icon("export", color="#38BDF8", size=15)
         if export_icon:
             self.export_btn.setIcon(export_icon)
-            self.export_btn.setIconSize(QSize(14, 14))
-
-        self.export_btn.setStyleSheet(
-            """
-            QPushButton {
-                background-color: rgba(56, 189, 248, 0.12);
-                border: 1px solid rgba(56, 189, 248, 0.35);
-                border-radius: 6px;
-                padding: 0px;
-            }
-            QPushButton:hover {
-                background-color: rgba(56, 189, 248, 0.25);
-                border: 1px solid #38BDF8;
-            }
-            QPushButton:pressed {
-                background-color: rgba(14, 116, 144, 0.40);
-            }
-            QPushButton:disabled {
-                background-color: rgba(255, 255, 255, 0.02);
-                border: 1px solid rgba(255, 255, 255, 0.05);
-            }
-            """
-        )
+            self.export_btn.setIconSize(QSize(15, 15))
         self.export_btn.clicked.connect(self.export_logs)
         header_layout.addWidget(self.export_btn)
 
-        # Clear Logs Button (Icon Only)
+        # Clear Logs Button
         self.clear_btn = QPushButton(self)
-        self.clear_btn.setFixedSize(30, 28)
+        self.clear_btn.setObjectName("GlassActionButton")
+        self.clear_btn.setFixedSize(36, 32)
         self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clear_btn.setToolTip("Clear Logs")
-        clear_icon = get_icon("trash", color="#CBD5E1", size=13)
+        clear_icon = get_icon("trash", color="#CBD5E1", size=14)
         if clear_icon:
             self.clear_btn.setIcon(clear_icon)
-            self.clear_btn.setIconSize(QSize(13, 13))
-
-        self.clear_btn.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #2D3238;
-                border: 1px solid #3E444C;
-                border-radius: 6px;
-                padding: 0px;
-            }
-            QPushButton:hover {
-                background-color: #383E46;
-            }
-            QPushButton:pressed {
-                background-color: #1F2327;
-            }
-            QPushButton:disabled {
-                background-color: rgba(255, 255, 255, 0.02);
-                border: 1px solid rgba(255, 255, 255, 0.05);
-            }
-            """
-        )
+            self.clear_btn.setIconSize(QSize(14, 14))
         self.clear_btn.clicked.connect(self.clear_logs)
         header_layout.addWidget(self.clear_btn)
 
         layout.addLayout(header_layout)
 
-        # 2. Log Output Viewport
+        # 2. Log Output Viewport (Frosted Dark Glass)
         self.text_edit = QPlainTextEdit(self)
         self.text_edit.setReadOnly(True)
         self.text_edit.setMaximumBlockCount(2000)
@@ -123,11 +101,11 @@ class LogViewerWidget(QWidget):
         self.text_edit.setStyleSheet(
             """
             QPlainTextEdit {
-                background-color: #121417;
+                background-color: rgba(18, 16, 26, 0.75);
                 color: #D4D4D4;
-                border: 1px solid #282C34;
-                border-radius: 6px;
-                padding: 8px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 10px;
+                padding: 10px;
             }
             """
         )
@@ -189,3 +167,61 @@ class LogViewerWidget(QWidget):
 
     def get_logs(self) -> str:
         return self.text_edit.toPlainText()
+
+
+class GlassDiagnosticBadge(QFrame):
+    """
+    Sub-surface glass pod providing real-time engine telemetry and pulse indicator.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(28, 28)
+        self._status_color = QColor(16, 185, 129)  # Green / Ready
+
+    def set_status_color(self, color_hex: str) -> None:
+        self._status_color = QColor(color_hex)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = float(self.width()), float(self.height())
+        rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 8.0, 8.0)
+
+        # 1. Frosted Plate
+        grad = QLinearGradient(0, 0, 0, h)
+        grad.setColorAt(0.0, QColor(32, 28, 48, 180))
+        grad.setColorAt(1.0, QColor(16, 14, 25, 210))
+        painter.fillPath(path, grad)
+
+        # 2. Specular Edge
+        pen_grad = QLinearGradient(0, 0, w, h)
+        pen_grad.setColorAt(0.0, QColor(255, 255, 255, 60))
+        pen_grad.setColorAt(1.0, QColor(255, 255, 255, 10))
+        painter.setPen(QPen(pen_grad, 1.0))
+        painter.drawPath(path)
+
+        # 3. Pulsing Status Node
+        node_center = QPointF(w / 2.0, h / 2.0)
+        glow = QRadialGradient(node_center, 6.0)
+        glow.setColorAt(0.0, self._status_color)
+        glow.setColorAt(
+            1.0,
+            QColor(
+                self._status_color.red(),
+                self._status_color.green(),
+                self._status_color.blue(),
+                0,
+            ),
+        )
+        painter.fillPath(path, glow)
+
+        painter.setBrush(self._status_color)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(node_center, 3.0, 3.0)
+
+        painter.end()

@@ -8,7 +8,17 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from PyQt6.QtCore import QByteArray, QPoint, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QByteArray,
+    QPoint,
+    QPointF,
+    QRectF,
+    Qt,
+    pyqtSignal,
+    QPropertyAnimation,
+    pyqtProperty,
+    QEasingCurve,
+)
 from PyQt6.QtGui import (
     QColor,
     QFont,
@@ -171,101 +181,131 @@ class ThumbnailHoverPopup(QWidget):
 
 
 class Elevated3DThumbnail(QLabel):
-    """3D Elevated Thumbnail casting ambient occlusion shadows."""
+    """
+    Liquid Glass 3D Thumbnail Pod (Google M3 Principles):
+    - Sub-pixel QPainterPath clipping with dual-layer border strokes.
+    - Specular cursor-reactive lighting.
+    - Lerp-interpolated ambient pink/purple bloom shadow.
+    """
 
     clicked = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._raw_pixmap: Optional[QPixmap] = None
+        self._rendered_pixmap: Optional[QPixmap] = None
         self._preview_popup: Optional[ThumbnailHoverPopup] = None
 
-        self.setFixedSize(82, 82)
+        self.setFixedSize(84, 84)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setText("...")
-        self.setStyleSheet(
-            """
-            QLabel {
-                background-color: #171522;
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 12px;
-                color: #64748B;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            """
-        )
+        self.setMouseTracking(True)
 
+        self._hover_progress: float = 0.0
+        self._cursor_pos: QPointF = QPointF(-100.0, -100.0)
+
+        # Ambient chromatic occlusion shadow
         self._elev_shadow = QGraphicsDropShadowEffect(self)
         self._elev_shadow.setBlurRadius(16)
         self._elev_shadow.setOffset(0, 4)
         self._elev_shadow.setColor(QColor(0, 0, 0, 160))
         self.setGraphicsEffect(self._elev_shadow)
 
+        # Hover property animation
+        self._anim = QPropertyAnimation(self, b"hoverProgress", self)
+        self._anim.setDuration(200)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    @pyqtProperty(float)
+    def hoverProgress(self) -> float:
+        return self._hover_progress
+
+    @hoverProgress.setter
+    def hoverProgress(self, val: float) -> None:
+        self._hover_progress = val
+        blur = 16.0 + (10.0 * val)
+        if val > 0.05:
+            # Shift from dark drop shadow to Instagram crimson ambient bloom
+            self._elev_shadow.setColor(QColor(225, 48, 108, int(130 * val)))
+        else:
+            self._elev_shadow.setColor(QColor(0, 0, 0, 160))
+        self._elev_shadow.setBlurRadius(blur)
+        self.update()
+
     def set_thumbnail_pixmap(self, pixmap: QPixmap) -> None:
         self._raw_pixmap = pixmap
         if not pixmap or pixmap.isNull():
-            self.setText("NO IMG")
+            self._rendered_pixmap = None
+            self.update()
             return
 
+        target_size = 84
         scaled = pixmap.scaled(
-            82,
-            82,
+            target_size,
+            target_size,
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation,
         )
-        crop_x = max(0, (scaled.width() - 82) // 2)
-        crop_y = max(0, (scaled.height() - 82) // 2)
-        cropped = scaled.copy(crop_x, crop_y, 82, 82)
+        crop_x = max(0, (scaled.width() - target_size) // 2)
+        crop_y = max(0, (scaled.height() - target_size) // 2)
+        cropped = scaled.copy(crop_x, crop_y, target_size, target_size)
 
-        rounded = QPixmap(82, 82)
+        # Mask inside a smooth rounded container
+        rounded = QPixmap(target_size, target_size)
         rounded.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(rounded)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p = QPainter(rounded)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, 82, 82), 12.0, 12.0)
-        painter.setClipPath(path)
-        painter.drawPixmap(0, 0, cropped)
-        painter.end()
+        path.addRoundedRect(QRectF(0, 0, target_size, target_size), 12.0, 12.0)
+        p.setClipPath(path)
+        p.drawPixmap(0, 0, cropped)
+        p.end()
 
+        self._rendered_pixmap = rounded
         self.setText("")
-        self.setPixmap(rounded)
+        self.update()
 
     def enterEvent(self, event) -> None:
-        self._elev_shadow.setBlurRadius(22)
-        self._elev_shadow.setOffset(0, 6)
-        self._elev_shadow.setColor(QColor(225, 48, 108, 120))
+        self._anim.stop()
+        self._anim.setStartValue(self._hover_progress)
+        self._anim.setEndValue(1.0)
+        self._anim.start()
 
         if self._raw_pixmap and not self._raw_pixmap.isNull():
             if not self._preview_popup:
                 self._preview_popup = ThumbnailHoverPopup()
-
             self._preview_popup.set_preview_pixmap(self._raw_pixmap)
-            global_pos = self.mapToGlobal(QPoint(self.width() + 16, -125))
+            global_pos = self.mapToGlobal(QPoint(self.width() + 14, -120))
             screen = QApplication.primaryScreen()
             if screen:
-                screen_geom = screen.availableGeometry()
-                if global_pos.x() + 290 > screen_geom.right():
+                geom = screen.availableGeometry()
+                if global_pos.x() + 290 > geom.right():
                     global_pos.setX(self.mapToGlobal(QPoint(0, 0)).x() - 300)
-                if global_pos.y() + 370 > screen_geom.bottom():
-                    global_pos.setY(screen_geom.bottom() - 375)
-                if global_pos.y() < screen_geom.top():
-                    global_pos.setY(screen_geom.top() + 10)
-
+                if global_pos.y() + 370 > geom.bottom():
+                    global_pos.setY(geom.bottom() - 375)
+                if global_pos.y() < geom.top():
+                    global_pos.setY(geom.top() + 10)
             self._preview_popup.move(global_pos)
             self._preview_popup.show()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
-        self._elev_shadow.setBlurRadius(16)
-        self._elev_shadow.setOffset(0, 4)
-        self._elev_shadow.setColor(QColor(0, 0, 0, 160))
+        self._anim.stop()
+        self._anim.setStartValue(self._hover_progress)
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+        self._cursor_pos = QPointF(-100.0, -100.0)
+
         if self._preview_popup:
             self._preview_popup.hide()
         super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        self._cursor_pos = event.position()
+        self.update()
+        super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -276,9 +316,82 @@ class Elevated3DThumbnail(QLabel):
         else:
             super().mousePressEvent(event)
 
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        w, h = float(self.width()), float(self.height())
+        rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 12.0, 12.0)
+
+        # 1. Base Glass Tint / Image Content
+        if self._rendered_pixmap:
+            painter.save()
+            painter.setClipPath(path)
+            painter.drawPixmap(0, 0, self._rendered_pixmap)
+            painter.restore()
+        else:
+            base_grad = QLinearGradient(0, 0, 0, h)
+            base_grad.setColorAt(0.0, QColor(28, 24, 40, 220))
+            base_grad.setColorAt(1.0, QColor(16, 14, 24, 240))
+            painter.fillPath(path, base_grad)
+
+            painter.setPen(QColor(148, 163, 184, 180))
+            font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "NO PREVIEW")
+
+        # 2. Specular Surface Sheen
+        sheen_grad = QLinearGradient(0, 0, w, h)
+        sheen_grad.setColorAt(
+            0.0, QColor(255, 255, 255, int(40 + 35 * self._hover_progress))
+        )
+        sheen_grad.setColorAt(
+            0.45, QColor(255, 255, 255, int(10 * self._hover_progress))
+        )
+        sheen_grad.setColorAt(1.0, QColor(0, 0, 0, 60))
+        painter.save()
+        painter.setClipPath(path)
+        painter.fillPath(path, sheen_grad)
+
+        # Radial cursor specular reflection
+        if self._hover_progress > 0 and self._cursor_pos.x() >= 0:
+            specular = QRadialGradient(self._cursor_pos, 70.0)
+            specular.setColorAt(
+                0.0, QColor(255, 255, 255, int(75 * self._hover_progress))
+            )
+            specular.setColorAt(
+                0.6, QColor(225, 48, 108, int(35 * self._hover_progress))
+            )
+            specular.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillPath(path, specular)
+        painter.restore()
+
+        # 3. Specular Micro-Bevel Border
+        border_grad = QLinearGradient(0, 0, w, h)
+        alpha_top = int(60 + 120 * self._hover_progress)
+        alpha_bot = int(20 + 40 * self._hover_progress)
+        border_grad.setColorAt(0.0, QColor(255, 255, 255, alpha_top))
+        border_grad.setColorAt(
+            0.5, QColor(225, 48, 108, int(120 * self._hover_progress))
+        )
+        border_grad.setColorAt(1.0, QColor(255, 255, 255, alpha_bot))
+
+        pen = QPen(border_grad, 1.2)
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+        painter.end()
+
 
 class MediaCard(QFrame):
-    """Liquid Glass Media Card Container with optimized single-pass rendering."""
+    """
+    Liquid Glass Media Card Container.
+    Synthesizes Google M3 elevation with cursor-tracking specular illumination,
+    smooth OutCubic property lerping, and high-DPI micro-bevel rendering.
+    """
 
     card_clicked = pyqtSignal(object, Qt.KeyboardModifier)
     clicked = card_clicked
@@ -299,21 +412,58 @@ class MediaCard(QFrame):
         self.thumb_loader: Optional[ThumbnailLoader] = None
         self._is_cleaned_up: bool = False
 
-        self._cursor_pos: QPointF = QPointF(-100, -100)
+        # Specular and Hover Motion State
+        self._hover_progress: float = 0.0
+        self._cursor_pos: QPointF = QPointF(-200.0, -200.0)
         self._is_hovered: bool = False
+        self._is_pressed: bool = False
+
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setObjectName("LiquidMediaCard")
         self.setFixedHeight(104)
 
+        # Ambient Atmospheric Occlusion Shadow
         self._tray_glow = QGraphicsDropShadowEffect(self)
         self._tray_glow.setOffset(0, 4)
+        self._tray_glow.setBlurRadius(14)
+        self._tray_glow.setColor(QColor(0, 0, 0, 120))
         self.setGraphicsEffect(self._tray_glow)
+
+        # Hover Interpolation Animation
+        self._anim = QPropertyAnimation(self, b"hoverProgress", self)
+        self._anim.setDuration(220)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         self._init_ui()
         self._set_children_transparent()
         self.update_style()
         self._load_thumbnail()
+
+    @pyqtProperty(float)
+    def hoverProgress(self) -> float:
+        return self._hover_progress
+
+    @hoverProgress.setter
+    def hoverProgress(self, val: float) -> None:
+        self._hover_progress = val
+
+        # Choreographed shadow bloom based on selection and hover progress
+        if self._is_selected:
+            blur = 16.0 + (8.0 * val)
+            alpha = int(75 + (55 * val))
+            self._tray_glow.setBlurRadius(blur)
+            self._tray_glow.setColor(QColor(225, 48, 108, alpha))
+        else:
+            blur = 12.0 + (10.0 * val)
+            alpha = int(100 + (40 * val)) if val > 0.05 else 100
+            self._tray_glow.setBlurRadius(blur)
+            self._tray_glow.setColor(
+                QColor(131, 58, 180, int(60 * val))
+                if val > 0.05
+                else QColor(0, 0, 0, alpha)
+            )
+        self.update()
 
     @property
     def is_selected(self) -> bool:
@@ -453,9 +603,10 @@ class MediaCard(QFrame):
         self.set_status(self.status)
         action_col.addWidget(self.lbl_status)
 
+        # Minimum 36x36px touch target bound compliant with M3 guidelines
         self.btn_delete = QPushButton("✕", self)
         self.btn_delete.setObjectName("CardDeleteButton")
-        self.btn_delete.setFixedSize(30, 30)
+        self.btn_delete.setFixedSize(36, 36)
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_delete.setFont(self._get_app_font(size=10, bold=True))
         self.btn_delete.setStyleSheet(
@@ -464,9 +615,9 @@ class MediaCard(QFrame):
                 background-color: rgba(255, 255, 255, 0.04);
                 color: #71717A;
                 border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 15px;
+                border-radius: 18px;
                 padding: 0px;
-                font-size: 12px;
+                font-size: 13px;
             }
             QPushButton#CardDeleteButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #EF4444, stop:1 #DC2626);
@@ -499,85 +650,118 @@ class MediaCard(QFrame):
         ):
             label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
+    def enterEvent(self, event) -> None:
+        self._is_hovered = True
+        self._anim.stop()
+        self._anim.setStartValue(self._hover_progress)
+        self._anim.setEndValue(1.0)
+        self._anim.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._is_hovered = False
+        self._anim.stop()
+        self._anim.setStartValue(self._hover_progress)
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+        self._cursor_pos = QPointF(-200.0, -200.0)
+        super().leaveEvent(event)
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         self._cursor_pos = event.position()
         self.update()
         super().mouseMoveEvent(event)
 
-    def enterEvent(self, event) -> None:
-        self._is_hovered = True
-        self.update_style()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self._is_hovered = False
-        self._cursor_pos = QPointF(-100, -100)
-        self.update_style()
-        self.update()
-        super().leaveEvent(event)
-
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            self._is_pressed = True
+            self.update()
             self.card_clicked.emit(self, event.modifiers())
             event.accept()
         else:
             super().mousePressEvent(event)
 
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._is_pressed:
+            self._is_pressed = False
+            self.update()
+        super().mouseReleaseEvent(event)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         w, h = float(self.width()), float(self.height())
         rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
         card_path = QPainterPath()
         card_path.addRoundedRect(rect, 14.0, 14.0)
 
-        base_grad = QLinearGradient(0, 0, w, h)
-        if self._is_selected:
-            base_grad.setColorAt(0.0, QColor(32, 24, 46, 210))
-            base_grad.setColorAt(1.0, QColor(20, 17, 30, 230))
+        # 1. Base Layer: Deep Frosted Acrylic Fill with dynamic elevation
+        base_grad = QLinearGradient(0, 0, 0, h)
+        if self._is_pressed:
+            base_grad.setColorAt(0.0, QColor(18, 16, 26, 235))
+            base_grad.setColorAt(1.0, QColor(12, 11, 18, 245))
+        elif self._is_selected:
+            alpha_top = int(190 + (35 * self._hover_progress))
+            alpha_bot = int(220 + (25 * self._hover_progress))
+            base_grad.setColorAt(0.0, QColor(34, 26, 50, alpha_top))
+            base_grad.setColorAt(1.0, QColor(20, 17, 32, alpha_bot))
         else:
-            base_grad.setColorAt(0.0, QColor(24, 22, 34, 180))
-            base_grad.setColorAt(1.0, QColor(14, 13, 20, 210))
+            alpha_top = int(175 + (30 * self._hover_progress))
+            alpha_bot = int(205 + (20 * self._hover_progress))
+            base_grad.setColorAt(0.0, QColor(26, 24, 38, alpha_top))
+            base_grad.setColorAt(1.0, QColor(15, 14, 22, alpha_bot))
 
         painter.fillPath(card_path, base_grad)
 
-        if self._is_hovered and self._cursor_pos.x() >= 0:
+        # 2. Dynamic Specular Light (Interactive Cursor Tracking)
+        if self._hover_progress > 0 and self._cursor_pos.x() >= 0:
             specular = QRadialGradient(self._cursor_pos, 180.0)
-            specular_color = (
-                QColor(255, 117, 151, 45)
-                if self._is_selected
-                else QColor(255, 255, 255, 30)
-            )
-            specular.setColorAt(0.0, specular_color)
-            specular.setColorAt(1.0, QColor(255, 255, 255, 0))
+            if self._is_selected:
+                specular.setColorAt(
+                    0.0, QColor(255, 255, 255, int(45 * self._hover_progress))
+                )
+                specular.setColorAt(
+                    0.4, QColor(225, 48, 108, int(30 * self._hover_progress))
+                )
+                specular.setColorAt(1.0, QColor(225, 48, 108, 0))
+            else:
+                specular.setColorAt(
+                    0.0, QColor(255, 255, 255, int(35 * self._hover_progress))
+                )
+                specular.setColorAt(
+                    0.5, QColor(131, 58, 180, int(20 * self._hover_progress))
+                )
+                specular.setColorAt(1.0, QColor(255, 255, 255, 0))
 
             painter.save()
             painter.setClipPath(card_path)
             painter.fillPath(card_path, specular)
             painter.restore()
 
+        # 3. Micro-Bevel Border with Top-Lit Specular Edge
         border_grad = QLinearGradient(0, 0, w, h)
         if self._is_selected:
-            border_grad.setColorAt(0.0, QColor(255, 60, 120, 240))
-            border_grad.setColorAt(0.5, QColor(225, 48, 108, 180))
-            border_grad.setColorAt(1.0, QColor(131, 58, 180, 120))
-            border_width = 1.6
+            alpha_edge = int(190 + (65 * self._hover_progress))
+            border_grad.setColorAt(0.0, QColor(255, 110, 160, alpha_edge))
+            border_grad.setColorAt(
+                0.5, QColor(225, 48, 108, int(180 * self._hover_progress) + 60)
+            )
+            border_grad.setColorAt(1.0, QColor(131, 58, 180, 100))
+            pen_width = 1.4 + (0.4 * self._hover_progress)
         else:
-            if self._is_hovered:
-                border_grad.setColorAt(0.0, QColor(255, 255, 255, 90))
-                border_grad.setColorAt(0.6, QColor(255, 255, 255, 30))
-                border_grad.setColorAt(1.0, QColor(255, 255, 255, 10))
-                border_width = 1.2
-            else:
-                border_grad.setColorAt(0.0, QColor(255, 255, 255, 45))
-                border_grad.setColorAt(0.7, QColor(255, 255, 255, 15))
-                border_grad.setColorAt(1.0, QColor(255, 255, 255, 5))
-                border_width = 1.0
+            alpha_top = int(45 + (85 * self._hover_progress))
+            alpha_mid = int(15 + (45 * self._hover_progress))
+            alpha_bot = int(5 + (20 * self._hover_progress))
+            border_grad.setColorAt(0.0, QColor(255, 255, 255, alpha_top))
+            border_grad.setColorAt(0.6, QColor(225, 48, 108, alpha_mid))
+            border_grad.setColorAt(1.0, QColor(255, 255, 255, alpha_bot))
+            pen_width = 1.0 + (0.3 * self._hover_progress)
 
         pen = QPen()
         pen.setBrush(border_grad)
-        pen.setWidthF(border_width)
+        pen.setWidthF(pen_width)
         painter.setPen(pen)
         painter.drawPath(card_path)
 
@@ -594,15 +778,8 @@ class MediaCard(QFrame):
         self.set_selected(not self._is_selected)
 
     def update_style(self) -> None:
-        if self._is_selected:
-            self._tray_glow.setBlurRadius(22 if self._is_hovered else 16)
-            self._tray_glow.setColor(
-                QColor(225, 48, 108, 95 if self._is_hovered else 70)
-            )
-        else:
-            self._tray_glow.setBlurRadius(14 if self._is_hovered else 10)
-            self._tray_glow.setColor(QColor(0, 0, 0, 140 if self._is_hovered else 100))
-        self.update()
+        # Trigger hoverProgress setter to update drop shadow glow cleanly
+        self.hoverProgress = self._hover_progress
 
     def set_status(self, status: str) -> None:
         self.status = status
@@ -652,6 +829,7 @@ class MediaCard(QFrame):
 
     def cleanup(self) -> None:
         self._is_cleaned_up = True
+        self._anim.stop()
         if hasattr(self, "lbl_thumb") and getattr(
             self.lbl_thumb, "_preview_popup", None
         ):
