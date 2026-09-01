@@ -597,6 +597,7 @@ class MainWindow(QMainWindow):
         self._update_action_button_states()
 
     def add_card(self, item_data: Dict[str, Any]) -> None:
+        """Inserts media item into UI maintaining chronological ordering."""
         new_id = str(
             item_data.get("id")
             or item_data.get("shortcode")
@@ -628,11 +629,6 @@ class MainWindow(QMainWindow):
         self.cards.insert(target_idx, card)
         self.media_grid_layout.insertWidget(target_idx, card)
 
-        logger.info(
-            f"✓ Added [{card.item_data.get('media_type', 'MEDIA')}] "
-            f"@{card.item_data.get('username', 'unknown')} - "
-            f"{card.item_data.get('shortcode', 'no_code')} (Key: {new_key})"
-        )
         self.update_selection_counter()
         self._update_action_button_states()
 
@@ -812,8 +808,23 @@ class MainWindow(QMainWindow):
         self._update_action_button_states()
 
     def clear_all_cards(self) -> None:
-        for card in list(self.cards):
-            self.remove_card(card)
+        """Batches deletion of all media cards to prevent UI layout freezing."""
+        if not self.cards:
+            return
+
+        self.scroll_widget.setUpdatesEnabled(False)
+        try:
+            for card in list(self.cards):
+                self.media_grid_layout.removeWidget(card)
+                card.cleanup()
+                card.setParent(None)
+                card.deleteLater()
+            self.cards.clear()
+        finally:
+            self.scroll_widget.setUpdatesEnabled(True)
+
+        self.update_selection_counter()
+        self._update_action_button_states()
 
     def update_selection_counter(self) -> None:
         cards = self.get_all_media_cards()
@@ -856,31 +867,25 @@ class MainWindow(QMainWindow):
             self.update_selection_counter()
 
     def delete_selected_cards(self) -> None:
-        selected_cards = [c for c in list(self.cards) if c.is_selected]
+        """Batches deletion of selected cards with single layout re-flow."""
+        selected_cards = [c for c in self.cards if c.is_selected]
         if not selected_cards:
             self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
             return
 
-        for card in selected_cards:
-            self.remove_card(card)
+        self.scroll_widget.setUpdatesEnabled(False)
+        try:
+            for card in selected_cards:
+                self.cards.remove(card)
+                self.media_grid_layout.removeWidget(card)
+                card.cleanup()
+                card.setParent(None)
+                card.deleteLater()
+        finally:
+            self.scroll_widget.setUpdatesEnabled(True)
 
-    def clear_completed_cards(self) -> None:
-        completed_cards = [
-            c
-            for c in list(self.cards)
-            if getattr(c, "status", "").lower() == "finished"
-            or getattr(c, "is_finished", False)
-        ]
-        if not completed_cards:
-            self.show_toast(
-                self.tr_text("toast_no_completed")
-                if "toast_no_completed" in TRANSLATIONS.get(self.current_lang, {})
-                else "No completed items to clear."
-            )
-            return
-
-        for card in completed_cards:
-            self.remove_card(card)
+        self.update_selection_counter()
+        self._update_action_button_states()
 
     def update_cookie_status(self) -> None:
         if self.cookie_manager.has_cookies():
@@ -892,6 +897,36 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_cookie_status.setText(self.tr_text("cookie_disconnected"))
             self.lbl_cookie_status.setStyleSheet("color: #A0A0B2;")
+
+    def clear_completed_cards(self) -> None:
+        """Batches removal of finished downloads in a single layout pass."""
+        completed_cards = [
+            c
+            for c in self.cards
+            if getattr(c, "status", "").lower() == "finished"
+            or getattr(c, "is_finished", False)
+        ]
+        if not completed_cards:
+            self.show_toast(
+                self.tr_text("toast_no_completed")
+                if "toast_no_completed" in TRANSLATIONS.get(self.current_lang, {})
+                else "No completed items to clear."
+            )
+            return
+
+        self.scroll_widget.setUpdatesEnabled(False)
+        try:
+            for card in completed_cards:
+                self.cards.remove(card)
+                self.media_grid_layout.removeWidget(card)
+                card.cleanup()
+                card.setParent(None)
+                card.deleteLater()
+        finally:
+            self.scroll_widget.setUpdatesEnabled(True)
+
+        self.update_selection_counter()
+        self._update_action_button_states()
 
     def import_cookie(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -935,7 +970,10 @@ class MainWindow(QMainWindow):
         self.save_settings()
 
     def _resolve_settings_file(self) -> str:
-        return os.path.join(get_app_dir(), "config", "settings.json")
+        """Resolves configuration file in user AppData space."""
+        from utils.file_utils import get_user_data_dir
+
+        return os.path.join(get_user_data_dir(), "settings.json")
 
     def load_settings(self) -> None:
         settings_path = self._resolve_settings_file()

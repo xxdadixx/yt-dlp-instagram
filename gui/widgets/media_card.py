@@ -1,5 +1,6 @@
 """
-gui/widgets/media_card.py - Instagram-styled Media Card with scaled high-DPI thumbnails and hover previews.
+gui/widgets/media_card.py - Instagram-styled Media Card with scaled high-DPI thumbnails,
+specular mouse illumination, and robust QThreadPool thumbnail lifecycle management.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from PyQt6.QtGui import (
     QMouseEvent,
     QPainter,
     QPainterPath,
+    QPen,
     QPixmap,
     QRadialGradient,
 )
@@ -102,9 +104,9 @@ STATUS_STYLES = {
 
 
 class ThumbnailHoverPopup(QWidget):
-    """Floating enlarged thumbnail preview popup with Liquid Glass rim and deep drop shadow."""
+    """Floating enlarged thumbnail preview popup with Liquid Glass rim and drop shadow."""
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(
             parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
         )
@@ -122,7 +124,7 @@ class ThumbnailHoverPopup(QWidget):
                 border: 1.5px solid rgba(225, 48, 108, 0.6);
                 border-radius: 14px;
             }
-        """
+            """
         )
         frame_layout = QVBoxLayout(self.frame)
         frame_layout.setContentsMargins(8, 8, 8, 8)
@@ -169,11 +171,11 @@ class ThumbnailHoverPopup(QWidget):
 
 
 class Elevated3DThumbnail(QLabel):
-    """Top Layer (Z=24px): 3D Elevated Thumbnail casting ambient occlusion shadows."""
+    """3D Elevated Thumbnail casting ambient occlusion shadows."""
 
     clicked = pyqtSignal()
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._raw_pixmap: Optional[QPixmap] = None
         self._preview_popup: Optional[ThumbnailHoverPopup] = None
@@ -192,7 +194,7 @@ class Elevated3DThumbnail(QLabel):
                 font-size: 11px;
                 font-weight: bold;
             }
-        """
+            """
         )
 
         self._elev_shadow = QGraphicsDropShadowEffect(self)
@@ -276,14 +278,14 @@ class Elevated3DThumbnail(QLabel):
 
 
 class MediaCard(QFrame):
-    """2.5D Liquid Glass Media Card Container with scaled high-DPI dimensions."""
+    """Liquid Glass Media Card Container with optimized single-pass rendering."""
 
     card_clicked = pyqtSignal(object, Qt.KeyboardModifier)
     clicked = card_clicked
     selection_changed = pyqtSignal(bool)
     deleted = pyqtSignal(object)
 
-    def __init__(self, media_item: dict, parent: Optional[QWidget] = None):
+    def __init__(self, media_item: dict, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.item_data: Dict[str, Any] = media_item or {}
         self._is_selected: bool = bool(self.item_data.get("selected", True))
@@ -345,12 +347,10 @@ class MediaCard(QFrame):
         layout.setContentsMargins(14, 10, 16, 10)
         layout.setSpacing(16)
 
-        # 1. 3D Elevated Thumbnail (Scaled to 82x82)
         self.lbl_thumb = Elevated3DThumbnail(self)
         self.lbl_thumb.clicked.connect(self.open_image_gallery)
         layout.addWidget(self.lbl_thumb, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        # 2. Middle Layer: Title + Details Row
         details_layout = QVBoxLayout()
         details_layout.setContentsMargins(0, 2, 0, 2)
         details_layout.setSpacing(6)
@@ -364,11 +364,9 @@ class MediaCard(QFrame):
             "color: #FFFFFF; background: transparent; border: none; font-size: 13.5px;"
         )
 
-        if len(raw_title) > 75:
-            display_title = raw_title[:72].rstrip() + "..."
-        else:
-            display_title = raw_title
-
+        display_title = (
+            raw_title[:72].rstrip() + "..." if len(raw_title) > 75 else raw_title
+        )
         self.lbl_title.setText(display_title)
         if full_caption:
             self.lbl_title.setToolTip(full_caption)
@@ -418,7 +416,7 @@ class MediaCard(QFrame):
                 padding: 2px 9px;
                 font-size: 11.5px;
             }}
-        """
+            """
         )
         meta_row.addWidget(self.lbl_badge)
 
@@ -442,7 +440,6 @@ class MediaCard(QFrame):
         details_layout.addLayout(meta_row)
         layout.addLayout(details_layout, stretch=1)
 
-        # 3. Status Capsule & Delete Button
         action_col = QHBoxLayout()
         action_col.setContentsMargins(0, 0, 0, 0)
         action_col.setSpacing(12)
@@ -485,7 +482,7 @@ class MediaCard(QFrame):
                 color: #383842 !important;
                 border: 1px solid rgba(255, 255, 255, 0.02) !important;
             }
-        """
+            """
         )
         self.btn_delete.clicked.connect(lambda: self.deleted.emit(self))
         action_col.addWidget(self.btn_delete)
@@ -548,9 +545,9 @@ class MediaCard(QFrame):
         if self._is_hovered and self._cursor_pos.x() >= 0:
             specular = QRadialGradient(self._cursor_pos, 180.0)
             specular_color = (
-                QColor(255, 255, 255, 30)
-                if not self._is_selected
-                else QColor(255, 117, 151, 45)
+                QColor(255, 117, 151, 45)
+                if self._is_selected
+                else QColor(255, 255, 255, 30)
             )
             specular.setColorAt(0.0, specular_color)
             specular.setColorAt(1.0, QColor(255, 255, 255, 0))
@@ -578,15 +575,13 @@ class MediaCard(QFrame):
                 border_grad.setColorAt(1.0, QColor(255, 255, 255, 5))
                 border_width = 1.0
 
-        painter.strokePath(card_path, painter.pen().color().fromRgb(0, 0, 0, 0))
-        pen = painter.pen()
+        pen = QPen()
         pen.setBrush(border_grad)
         pen.setWidthF(border_width)
         painter.setPen(pen)
         painter.drawPath(card_path)
 
         painter.end()
-        super().paintEvent(event)
 
     def set_selected(self, selected: bool) -> None:
         if self._is_selected != selected:
@@ -625,7 +620,7 @@ class MediaCard(QFrame):
                 font-size: 11px;
                 font-weight: 700;
             }}
-        """
+            """
         )
         if hasattr(self, "btn_delete"):
             self.btn_delete.setEnabled(status.lower() != "downloading")
@@ -665,10 +660,7 @@ class MediaCard(QFrame):
             self.lbl_thumb._preview_popup = None
 
         if self.thumb_loader is not None:
-            if self.thumb_loader.isRunning():
-                self.thumb_loader.cancel()
-                self.thumb_loader.quit()
-                self.thumb_loader.wait(200)
+            self.thumb_loader.cancel()
             self.thumb_loader = None
 
     def open_image_gallery(self) -> None:

@@ -1,7 +1,7 @@
 """
-core/cookie_manager.py - Resilient Instagram cookie importer, manager, and parser.
-Standardizes Netscape cookies.txt, browser-extension JSON, and raw HTTP header strings
-with atomic file writes and 0600 POSIX file permission enforcement.
+core/cookie_manager.py - Resilient Instagram cookie importer and parser.
+Persists normalized Netscape cookies.txt to standard user data directories
+with atomic replacement and 0600 POSIX file permission enforcement.
 """
 
 from __future__ import annotations
@@ -15,13 +15,15 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from utils.file_utils import get_app_dir
+from utils.file_utils import get_user_data_dir
 
 logger = logging.getLogger(__name__)
 
 
 class CookieManager:
-    def __init__(self, cookie_file: Optional[str] = None):
+    """Manages parsing, persistence, and extraction of Instagram authentication tokens."""
+
+    def __init__(self, cookie_file: Optional[str] = None) -> None:
         self.cookies: Dict[str, str] = {}
         self._cookie_string: str = ""
 
@@ -29,14 +31,14 @@ class CookieManager:
             self.cookie_file_path = os.path.abspath(cookie_file)
         else:
             self.cookie_file_path = os.path.join(
-                get_app_dir(), "config", "instagram_cookies.txt"
+                get_user_data_dir(), "instagram_cookies.txt"
             )
 
         if os.path.exists(self.cookie_file_path):
             self.load_from_file(self.cookie_file_path)
 
     def load_from_file(self, file_path: str) -> bool:
-        """Loads and parses cookies from a specified file path."""
+        """Loads and parses cookies from a target file path."""
         return self.import_cookie_file(file_path)
 
     def _read_file_content(self, path: str) -> str:
@@ -201,7 +203,7 @@ class CookieManager:
                             )
                         )
 
-        # 3. Raw header parsing fallback (e.g., "key1=val1; key2=val2")
+        # 3. Raw header parsing fallback (key=value; key2=val2)
         if not cookies:
             cleaned = re.sub(
                 r"^(?:cookie|Cookie):\s*", "", raw_content, flags=re.IGNORECASE
@@ -245,7 +247,6 @@ class CookieManager:
         target_dir = os.path.dirname(os.path.abspath(file_path))
         os.makedirs(target_dir, exist_ok=True)
 
-        # Atomic temp file write in the target directory
         with tempfile.NamedTemporaryFile(
             "w", dir=target_dir, delete=False, encoding="utf-8"
         ) as tf:
