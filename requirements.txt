@@ -1,6 +1,7 @@
 beautifulsoup4>=4.12.3
 certifi>=2024.2.2
 charset-normalizer>=3.3.2
+curl-cffi>=0.7.0
 darkdetect>=0.8.0
 fake-useragent>=1.5.1
 idna>=3.7
@@ -13,3 +14,6 @@ requests>=2.31.0
 urllib3>=2.2.1
 yt-dlp>=2024.4.9
 pyinstaller>=6.5.0
+
+# Optional / Development & Type Checking
+basedpyright>=1.10.0
