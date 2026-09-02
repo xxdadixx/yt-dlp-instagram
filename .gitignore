@@ -55,3 +55,6 @@ instagram_cookies.txt
 Thumbs.db
 ehthumbs.db
 desktop.ini
+# Local Configuration
+config/settings.json
+settings.json

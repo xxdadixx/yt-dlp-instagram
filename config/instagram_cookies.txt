@@ -1,8 +1,0 @@
-# Netscape HTTP Cookie File
-# https://curl.se/rfc/cookie_spec.html
-# This is a template cookie file for Instagram Pro Downloader.
-# Export cookies from your authenticated browser session to populate this file.
-
-# .instagram.com	TRUE	/	TRUE	2147483647	csrftoken	txSy1ulFN8sEj2G81ClqbBCbfcZjUTOf
-# .instagram.com	TRUE	/	TRUE	2147483647	ds_user_id	2320467545
-# .instagram.com	TRUE	/	TRUE	2147483647	sessionid	2320467545%3A5Uiq8qyWrKSTA1%3A15%3AAYgPYy8J70kXxZ2YUxXZcqfWNkS83lES4uYszAUTjLUZ
