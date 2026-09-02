@@ -85,6 +85,7 @@ class DownloadWorker(QThread):
         save_folder: str = "downloads",
         cookie_file: Optional[str] = None,
         cookie_str: Optional[str] = None,
+        quality_preset: str = "best_video",
         queue_items: Optional[List[Dict[str, Any]]] = None,
         output_directory: Optional[str] = None,
         parent=None,
@@ -103,6 +104,7 @@ class DownloadWorker(QThread):
             cookie_file if cookie_file and os.path.exists(cookie_file) else None
         )
         self.cookie_str: Optional[str] = cookie_str
+        self.quality_preset: str = quality_preset
         self._is_cancelled: bool = False
         os.makedirs(self.save_folder, exist_ok=True)
 
@@ -315,18 +317,42 @@ class DownloadWorker(QThread):
                     overall_percent = int(((index + item_percent) / total_items) * 100)
                     self.progress.emit(min(overall_percent, 99))
 
-        ydl_opts = {
+        ydl_opts: Dict[str, Any] = {
             "outtmpl": out_template,
             "quiet": True,
             "no_warnings": True,
             "progress_hooks": [ytdlp_hook],
-            "nocheckcertificate": False,  # Strict TLS Certificate Chain Verification
+            "nocheckcertificate": False,
             "buffersize": 256 * 1024,
             "http_chunk_size": 10485760,
             "concurrent_fragment_downloads": 4,
             "retries": 3,
             "fragment_retries": 3,
         }
+
+        from utils.file_utils import get_ffmpeg_dir
+
+        ffmpeg_bin_dir = get_ffmpeg_dir()
+        if ffmpeg_bin_dir:
+            ydl_opts["ffmpeg_location"] = ffmpeg_bin_dir
+
+        if self.quality_preset == "audio_only":
+            ydl_opts["format"] = "bestaudio/best"
+            ydl_opts["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ]
+        elif self.quality_preset == "720p":
+            ydl_opts["format"] = (
+                "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+            )
+        elif self.quality_preset == "1080p":
+            ydl_opts["format"] = (
+                "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+            )
 
         if self.cookie_file and os.path.exists(self.cookie_file):
             ydl_opts["cookiefile"] = self.cookie_file
@@ -379,12 +405,12 @@ class DownloadWorker(QThread):
                     slide_url.startswith("http://") or slide_url.startswith("https://")
                 ):
                     try:
-                        self._download_direct_stream(
+                        out = self._download_direct_stream(
                             slide_url, slide_path, index, total_items
                         )
-                        if os.path.exists(slide_path):
+                        if out and os.path.isfile(out) and os.path.getsize(out) > 0:
                             saved_any = True
-                            last_path = slide_path
+                            last_path = out
                     except Exception as s_err:
                         if self._is_cancelled:
                             break
@@ -404,7 +430,11 @@ class DownloadWorker(QThread):
         )
         media_type = str(item.get("type") or item.get("media_type") or "video").lower()
         is_video = "image" not in media_type and "photo" not in media_type
-        ext = "mp4" if is_video else "jpg"
+        ext = (
+            "mp3"
+            if self.quality_preset == "audio_only"
+            else ("mp4" if is_video else "jpg")
+        )
         target_path = self._build_filepath(
             item_or_username=username,
             shortcode=shortcode,
@@ -412,7 +442,8 @@ class DownloadWorker(QThread):
         )
 
         is_direct_cdn = bool(
-            direct_url
+            self.quality_preset != "audio_only"
+            and direct_url
             and direct_url.startswith("http")
             and not any(
                 x in direct_url
@@ -422,20 +453,26 @@ class DownloadWorker(QThread):
 
         if is_direct_cdn:
             try:
-                return self._download_direct_stream(
+                stream_res = self._download_direct_stream(
                     direct_url, target_path, index, total_items
                 )
+                if (
+                    stream_res
+                    and os.path.isfile(stream_res)
+                    and os.path.getsize(stream_res) > 0
+                ):
+                    return stream_res
             except Exception as stream_err:
                 if self._is_cancelled:
                     return ""
                 logger.warning(
-                    "Direct stream failed for %s_%s, falling back to yt-dlp: %s",
+                    "Direct stream exception for %s_%s: %s",
                     username,
                     shortcode,
                     stream_err,
                 )
 
-        # 3. yt-dlp Scrape Fallback
+        # 3. yt-dlp Scrape Fallback (executed if direct stream was skipped or produced no output)
         return self._download_via_ytdlp(item, username, shortcode, index, total_items)
 
     def run(self) -> None:

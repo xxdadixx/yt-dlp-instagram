@@ -10,7 +10,7 @@ import logging
 import os
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 # Suppress Windows OLE clipboard mutex retry logs
 os.environ["QT_LOGGING_RULES"] = (
@@ -890,7 +890,7 @@ class MainWindow(QMainWindow):
             self.update_selection_counter()
 
     def delete_selected_cards(self) -> None:
-        """Batches deletion of selected cards with single layout re-flow."""
+        """Batches deletion of selected cards, synchronizing dedup sets and sort keys."""
         selected_cards = [c for c in self.cards if c.is_selected]
         if not selected_cards:
             self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
@@ -899,11 +899,7 @@ class MainWindow(QMainWindow):
         self.scroll_widget.setUpdatesEnabled(False)
         try:
             for card in selected_cards:
-                self.cards.remove(card)
-                self.media_grid_layout.removeWidget(card)
-                card.cleanup()
-                card.setParent(None)
-                card.deleteLater()
+                self.remove_card(card)
         finally:
             self.scroll_widget.setUpdatesEnabled(True)
 
@@ -922,7 +918,7 @@ class MainWindow(QMainWindow):
             self.lbl_cookie_status.setStyleSheet("color: #A0A0B2;")
 
     def clear_completed_cards(self) -> None:
-        """Batches removal of finished downloads in a single layout pass."""
+        """Batches removal of finished downloads with atomic layout and registry sync."""
         completed_cards = [
             c
             for c in self.cards
@@ -940,11 +936,7 @@ class MainWindow(QMainWindow):
         self.scroll_widget.setUpdatesEnabled(False)
         try:
             for card in completed_cards:
-                self.cards.remove(card)
-                self.media_grid_layout.removeWidget(card)
-                card.cleanup()
-                card.setParent(None)
-                card.deleteLater()
+                self.remove_card(card)
         finally:
             self.scroll_widget.setUpdatesEnabled(True)
 

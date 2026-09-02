@@ -332,7 +332,8 @@ def shortcode_to_id(shortcode: str) -> Optional[int]:
 def parse_instagram_url(url: str) -> Dict[str, Any]:
     """
     Parses and normalizes Instagram URLs into structured routing targets.
-    Handles standard posts, reels, stories, highlights, share redirects, and raw handles.
+    Correctly resolves direct posts, vanity-prefixed URLs (/username/p/CODE),
+    reels, stories, highlights, share redirects, and raw handles.
     """
     cleaned_url = (url or "").strip()
     if not cleaned_url:
@@ -373,7 +374,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "identifier": None,
         }
 
-    # Filter out 'share' wrappers: /share/p/{code}, /share/reel/{code}, /share/{code}
+    # Strip out 'share' wrappers (e.g., /share/p/{code}, /share/reel/{code})
     if segments[0].lower() == "share":
         segments = segments[1:]
         if not segments:
@@ -387,7 +388,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
 
     first = segments[0].lower()
 
-    # 3. Direct Posts, Reels, and TV Items
+    # 3. Direct Posts, Reels, and TV Items at root: /p/{code}, /reel/{code}, /tv/{code}
     if first in {"p", "post", "reel", "reels", "tv", "r"}:
         code = segments[1] if len(segments) >= 2 else None
         if not code:
@@ -442,7 +443,28 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "identifier": code,
         }
 
-    # 6. User Profile or Reels Tab: /{username}/ or /{username}/reels/
+    # 6. Vanity-Prefixed Post/Reel URLs: /{username}/p/{code} or /{username}/reel/{code}
+    if first not in RESERVED_ROOT_PATHS and len(segments) >= 3:
+        sub_action = segments[1].lower()
+        if sub_action in {"p", "post", "reel", "reels", "tv", "r"}:
+            code = segments[2]
+            is_carousel = "img_index" in query_params or "carousel" in cleaned_url
+            if is_carousel:
+                media_type = "carousel"
+            elif sub_action in {"reel", "reels"}:
+                media_type = "reel"
+            else:
+                media_type = "post"
+
+            return {
+                "valid": True,
+                "type": media_type,
+                "username": segments[0].lstrip("@"),
+                "shortcode": code,
+                "identifier": code,
+            }
+
+    # 7. User Profile or Dedicated Reels Tab: /{username}/ or /{username}/reels/
     if first not in RESERVED_ROOT_PATHS:
         username = segments[0].lstrip("@")
         if len(segments) >= 2 and segments[1].lower() in {"reels", "reel"}:

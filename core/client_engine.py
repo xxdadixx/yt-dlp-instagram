@@ -50,6 +50,9 @@ class ResilientSession:
     WEB_APP_ID = "936619743392459"
     ASBD_ID = "129477"
 
+    # Status codes that indicate infrastructure/traffic denial rather than client payload issues
+    INFRASTRUCTURE_FAILURE_CODES = frozenset({429, 500, 502, 503, 504})
+
     def __init__(
         self,
         cookies: dict[str, str] | None = None,
@@ -125,17 +128,29 @@ class ResilientSession:
                 logger.info(
                     "Probe succeeded. Circuit breaker transitioning HALF_OPEN -> CLOSED"
                 )
-                self.circuit_state = CircuitState.CLOSED
-                self.failure_counter = 0
-                self.last_state_change = time.time()
+            self.circuit_state = CircuitState.CLOSED
+            self.failure_counter = 0
+            self.last_state_change = time.time()
 
     def _record_failure(self, status_code: int) -> None:
         with self._lock:
+            # Only infrastructure faults and rate limits increment circuit breaker trips
+            if (
+                status_code != 0
+                and status_code not in self.INFRASTRUCTURE_FAILURE_CODES
+            ):
+                logger.debug(
+                    "Non-infrastructure status code %d ignored by circuit breaker.",
+                    status_code,
+                )
+                return
+
             self.failure_counter += 1
             logger.warning(
-                "Request failed with status %d (Failures: %d)",
+                "Upstream fault registered with status %d (Failures: %d/%d)",
                 status_code,
                 self.failure_counter,
+                self.circuit_config.failure_threshold,
             )
             if self.failure_counter >= self.circuit_config.failure_threshold:
                 logger.error(
@@ -273,14 +288,29 @@ class ResilientSession:
                 return res_json
 
         except urllib.error.HTTPError as exc:
+            err_body = ""
+            try:
+                raw_err = exc.read()
+                content_encoding = exc.headers.get("Content-Encoding", "").lower()
+                if "gzip" in content_encoding or (
+                    len(raw_err) >= 2 and raw_err[:2] == b"\x1f\x8b"
+                ):
+                    raw_err = gzip.decompress(raw_err)
+                elif "deflate" in content_encoding:
+                    raw_err = zlib.decompress(raw_err)
+                err_body = raw_err.decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+
             self._record_failure(exc.code)
+            logger.debug(
+                "[%s] HTTP %d Response Body: %s", friendly_name, exc.code, err_body
+            )
+
             if exc.code == 429:
                 raise PermissionError(
                     "Rate limit / HTTP 429 Tripwire triggered."
                 ) from exc
             raise RuntimeError(
-                f"GraphQL execution failed with HTTP {exc.code}"
+                f"GraphQL execution ({friendly_name}) failed with HTTP {exc.code}: {err_body}"
             ) from exc
-        except Exception as exc:
-            self._record_failure(0)
-            raise ConnectionError(f"Fallback request network fault: {exc}") from exc

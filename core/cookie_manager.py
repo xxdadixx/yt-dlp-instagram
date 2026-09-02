@@ -15,7 +15,7 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from utils.file_utils import get_user_data_dir
+from utils.file_utils import get_app_dir, get_user_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -27,41 +27,60 @@ class CookieManager:
         self.cookies: Dict[str, str] = {}
         self._cookie_string: str = ""
 
-        # Scan candidate paths in order of priority
-        candidate_paths: List[str] = []
-        if cookie_file:
-            candidate_paths.append(os.path.abspath(cookie_file))
-
-        # 1. User Application Data (%APPDATA%/InstagramProDownloader)
-        candidate_paths.append(
-            os.path.join(get_user_data_dir(), "instagram_cookies.txt")
-        )
-        # 2. Project Root Directory
-        candidate_paths.append(os.path.abspath("instagram_cookies.txt"))
-        # 3. Project Config Directory
-        candidate_paths.append(
-            os.path.abspath(os.path.join("config", "instagram_cookies.txt"))
-        )
-
+        # Permanent, secure storage target in user application data
         self.cookie_file_path = os.path.join(
             get_user_data_dir(), "instagram_cookies.txt"
         )
 
-        # Auto-load from the first existing candidate containing actual session tokens
+        candidate_paths: List[str] = []
+        if cookie_file:
+            candidate_paths.append(os.path.abspath(cookie_file))
+
+        # Scan candidate locations in order of priority
+        candidate_paths.append(self.cookie_file_path)
+        candidate_paths.append(
+            os.path.abspath(os.path.join(get_app_dir(), "instagram_cookies.txt"))
+        )
+        candidate_paths.append(
+            os.path.abspath(
+                os.path.join(get_app_dir(), "config", "instagram_cookies.txt")
+            )
+        )
+
+        # Auto-load from the first candidate containing actual un-commented session tokens
         for path in candidate_paths:
             if os.path.isfile(path) and os.path.getsize(path) > 0:
                 try:
                     content = self._read_file_content(path)
-                    if any(
-                        token in content
+                    # Exclude comment-only template files
+                    has_tokens = any(
+                        re.search(rf"^(?!#).*\b{token}\b", content, re.MULTILINE)
                         for token in ("sessionid", "csrftoken", "ds_user_id")
-                    ):
-                        if self.import_cookie_file(path):
-                            self.cookie_file_path = os.path.abspath(path)
-                            logger.info("Auto-loaded active cookies from: %s", path)
-                            break
+                    )
+                    if has_tokens and self._load_and_set_memory(content):
+                        # Ensure persistent user storage is synchronized
+                        if os.path.abspath(path) != os.path.abspath(
+                            self.cookie_file_path
+                        ):
+                            self._write_secure_file(
+                                self.cookie_file_path, self._generate_netscape_content()
+                            )
+                        logger.info("Auto-loaded active cookies from: %s", path)
+                        break
                 except Exception as exc:
                     logger.debug("Could not read cookie candidate %s: %s", path, exc)
+
+    def _load_and_set_memory(self, content: str) -> bool:
+        header_str, _ = self._parse_cookie_data(content)
+        if not header_str:
+            return False
+        self.cookies.clear()
+        for pair in header_str.split(";"):
+            if "=" in pair:
+                k, v = pair.strip().split("=", 1)
+                self.cookies[k.strip()] = v.strip()
+        self._cookie_string = header_str
+        return True
 
     def load_from_file(self, file_path: str) -> bool:
         """Loads and parses cookies from a target file path."""
@@ -302,18 +321,13 @@ class CookieManager:
             if not content.strip():
                 return False
 
-            header_str, netscape_content = self._parse_cookie_data(content)
-            if not header_str:
+            if not self._load_and_set_memory(content):
                 return False
 
-            self.cookies.clear()
-            for pair in header_str.split(";"):
-                if "=" in pair:
-                    k, v = pair.strip().split("=", 1)
-                    self.cookies[k.strip()] = v.strip()
-
-            self._cookie_string = header_str
-            self._write_secure_file(self.cookie_file_path, netscape_content)
+            # Always persist to safe user data storage; never overwrite user's source file
+            self._write_secure_file(
+                self.cookie_file_path, self._generate_netscape_content()
+            )
             return True
         except Exception as e:
             logger.error("Failed to import cookie file: %s", e)

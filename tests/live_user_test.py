@@ -1,14 +1,17 @@
 """
-Enhanced Live User Diagnostic CLI with Full Bilingual Localization.
+tests/live_user_test.py - Live User Diagnostic CLI with Full Localization.
+Directly interfaces with InspectWorker across authenticated and unauthenticated pipelines.
 """
+
+from __future__ import annotations
 
 import argparse
 import datetime
 import json
 import os
-import re
 import sys
 from collections import defaultdict
+from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -18,9 +21,9 @@ from PyQt6.QtCore import QCoreApplication
 
 app = QCoreApplication.instance() or QCoreApplication(sys.argv)
 
-from core.inspect_worker import InspectionWorker
+from core.cookie_manager import CookieManager
+from core.inspect_worker import InspectWorker
 
-# Bilingual Text Templates
 I18N = {
     "en": {
         "target": "TARGET USER",
@@ -68,132 +71,52 @@ I18N = {
 
 
 class DualLogger:
-    def __init__(self, filepath: str):
+    def __init__(self, filepath: str) -> None:
         self.terminal = sys.stdout
         self.log_file = open(filepath, "w", encoding="utf-8")
 
-    def write(self, message):
+    def write(self, message: str) -> None:
         self.terminal.write(message)
         self.terminal.flush()
         self.log_file.write(message)
         self.log_file.flush()
 
-    def flush(self):
+    def flush(self) -> None:
         self.terminal.flush()
         self.log_file.flush()
 
-    def close(self):
+    def close(self) -> None:
         self.log_file.close()
-
-
-def resolve_default_cookie() -> str | None:
-    candidate_paths = [
-        os.path.join(PROJECT_ROOT, "cookies.txt"),
-        os.path.join(PROJECT_ROOT, "config", "cookies.txt"),
-        os.path.join(os.getcwd(), "cookies.txt"),
-    ]
-    for path in candidate_paths:
-        if os.path.exists(path):
-            return path
-    return None
 
 
 class EnhancedUserTester:
     def __init__(
         self,
         username: str,
-        cookie_path: str | None = None,
+        cookie_path: Optional[str] = None,
         scope: str = "all",
-        limit: int = 0,
+        limit: int = 36,
         lang: str = "en",
-    ):
+    ) -> None:
         self.username = username.lstrip("@").strip()
-        self.cookie_path = cookie_path or resolve_default_cookie()
+        self.cm = CookieManager(cookie_file=cookie_path)
         self.scope = scope.lower()
         self.limit = limit
         self.lang = "th" if lang.lower() == "th" else "en"
         self.t = I18N[self.lang]
-        self.results = defaultdict(list)
-        self.warnings: list[str] = []
-        self.errors: list[str] = []
-        self.worker: InspectionWorker | None = None
+        self.results: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self.warnings: List[str] = []
+        self.errors: List[str] = []
+        self.worker: Optional[InspectWorker] = None
 
-    def build_targets(self) -> list[dict]:
-        targets = []
-        if self.scope in ("all", "stories", "story"):
-            targets.append(
-                {
-                    "url": f"https://www.instagram.com/stories/{self.username}/",
-                    "scope": "all",
-                }
-            )
-        if self.scope in ("all", "reels", "reel"):
-            targets.append(
-                {
-                    "url": f"https://www.instagram.com/{self.username}/reels/",
-                    "scope": "all",
-                }
-            )
-        if self.scope in ("all", "posts", "feed"):
-            targets.append(
-                {"url": f"https://www.instagram.com/{self.username}/", "scope": "all"}
-            )
-        return targets
+    def build_targets(self) -> List[str]:
+        if self.scope in ("stories", "story"):
+            return [f"https://www.instagram.com/stories/{self.username}/"]
+        if self.scope in ("reels", "reel"):
+            return [f"https://www.instagram.com/{self.username}/reels/"]
+        return [f"https://www.instagram.com/{self.username}/"]
 
-    def _translate_status(self, msg: str) -> str:
-        if self.lang == "en":
-            return msg
-
-        clean = msg.strip()
-
-        # Step headers
-        if "Inspecting [" in clean:
-            m = re.search(r"Inspecting \[(\d+)/(\d+)\]:\s*(\S+)", clean)
-            if m:
-                cur, total, target_id = m.group(1), m.group(2), m.group(3)
-                if "stories" in target_id:
-                    name = "สตอรี่ (Stories)"
-                elif "reels" in target_id:
-                    name = "คลิปรีลส์ (Reels)"
-                else:
-                    name = "หน้าฟีดและรูปภาพ (Posts)"
-                return f"\n[*] กำลังตรวจสอบขั้นตอน [{cur}/{total}]: {name} ของ @{self.username}"
-
-        # Initial Loaders
-        if "Loading Feed from @" in clean:
-            return f"[*] กำลังเชื่อมต่อไปยังหน้า Feed ของ @{self.username}..."
-        if "Connecting to @" in clean:
-            return f"[*] กำลังเชื่อมต่อไปยังหน้า Reels ของ @{self.username}..."
-        if "Fetching active stories" in clean:
-            return f"[*] กำลังค้นหา Stories ที่ยังไม่หมดอายุจาก @{self.username}..."
-
-        # Batch & Pagination
-        if "Fetching Feed page" in clean:
-            m = re.search(r"Fetching Feed page (\d+)", clean)
-            page = m.group(1) if m else "?"
-            return f"[*] กำลังโหลด Feed หน้า {page} จาก @{self.username}..."
-        if "Fetching Reels batch" in clean:
-            m = re.search(r"Fetching Reels batch (\d+)", clean)
-            batch = m.group(1) if m else "?"
-            return f"[*] กำลังดึง Reels ชุดที่ {batch} จาก @{self.username}..."
-
-        # Item counters
-        if "Found [" in clean:
-            m = re.search(
-                r"Found \[(\d+)\]\s*(stories|reels|items)", clean, re.IGNORECASE
-            )
-            if m:
-                count, category = m.group(1), m.group(2).lower()
-                cat_name = (
-                    "สตอรี่"
-                    if category == "stories"
-                    else ("รีลส์" if category == "reels" else "โพสต์")
-                )
-                return f"[*] พบ{cat_name}รายการที่ [{count}] จาก @{self.username}"
-
-        return msg
-
-    def run(self, save_json: bool = True):
+    def run(self, save_json: bool = True) -> None:
         log_dir = os.path.join(PROJECT_ROOT, "logs", "live_tests")
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -205,10 +128,9 @@ class EnhancedUserTester:
 
         try:
             targets = self.build_targets()
+            cfile = self.cm.get_cookie_file_path()
             cookie_desc = (
-                self.t["attached"].format(path=self.cookie_path)
-                if self.cookie_path
-                else self.t["none"]
+                self.t["attached"].format(path=cfile) if cfile else self.t["none"]
             )
 
             print("=======================================================")
@@ -222,13 +144,18 @@ class EnhancedUserTester:
                 )
             print("=======================================================")
 
-            self.worker = InspectionWorker(
-                targets=targets, cookie_path=self.cookie_path, existing_shortcodes=set()
+            self.worker = InspectWorker(
+                targets=targets,
+                cookie_str=self.cm.get_cookie_string(),
+                cookie_file=cfile,
+                profile_mode="reels" if self.scope in ("reels", "reel") else "all",
+                max_items_per_profile=self.limit,
             )
 
-            self.worker.progress_status.connect(self._on_status)
-            self.worker.item_inspected.connect(self._on_item)
-            self.worker.finished_inspection.connect(self._on_finished)
+            self.worker.status_message.connect(self._on_status)
+            self.worker.item_found.connect(self._on_item)
+            self.worker.finished.connect(self._on_finished)
+            self.worker.error.connect(lambda err: self.errors.append(str(err)))
 
             self.worker.start()
             while self.worker.isRunning():
@@ -240,44 +167,45 @@ class EnhancedUserTester:
             sys.stdout = logger.terminal
             logger.close()
 
-    def _on_status(self, msg: str):
-        translated = self._translate_status(msg)
-        print(translated)
+    def _on_status(self, msg: str) -> None:
+        print(f"[*] {msg}")
         if "⚠️" in msg:
-            self.warnings.append(msg.replace("[*]", "").strip())
+            self.warnings.append(msg.strip())
         elif "Error" in msg or "401" in msg or "403" in msg:
-            self.errors.append(msg.replace("[*]", "").strip())
+            self.errors.append(msg.strip())
 
-    def _on_item(self, item: dict):
-        mtype = item.get("media_type", "unknown")
-        if mtype == "video" and len(item.get("raw_media_items", [])) == 0:
-            warn_msg = (
-                f"Video '{item.get('shortcode')}' has 0 CDN streams."
-                if self.lang == "en"
-                else f"วิดีโอ '{item.get('shortcode')}' ไม่มีสตรีม CDN ตรง"
-            )
-            self.warnings.append(warn_msg)
-        self.results[mtype].append(item)
+    def _on_item(self, item: Dict[str, Any]) -> None:
+        raw_type = str(item.get("media_type") or "unknown").upper()
+        if "REEL" in raw_type or "VIDEO" in raw_type:
+            cat = "reels"
+        elif "CAROUSEL" in raw_type:
+            cat = "carousels"
+        elif "STORY" in raw_type:
+            cat = "stories"
+        else:
+            cat = "photos"
 
+        self.results[cat].append(item)
         total_found = sum(len(items) for items in self.results.values())
+
         if 0 < self.limit <= total_found and self.worker:
             print(self.t["limit_reached"].format(limit=self.limit))
             self.worker.cancel()
 
-    def _on_finished(self, total: int):
+    def _on_finished(self, total: int) -> None:
         total_discovered = sum(len(items) for items in self.results.values())
         print(self.t["finished"].format(total=total_discovered))
 
-    def _print_report(self, json_export_path: str | None = None):
+    def _print_report(self, json_export_path: Optional[str] = None) -> None:
         total_discovered = sum(len(items) for items in self.results.values())
         print("=======================================================")
         print(f" {self.t['summary_title'].format(username=self.username)}")
         print("=======================================================")
         print(f" {self.t['total_items']:<32}: {total_discovered}")
-        print(f" {self.t['stories']:<32}: {len(self.results.get('story', []))}")
-        print(f" {self.t['reels']:<32}: {len(self.results.get('video', []))}")
-        print(f" {self.t['carousels']:<32}: {len(self.results.get('carousel', []))}")
-        print(f" {self.t['photos']:<32}: {len(self.results.get('photo', []))}")
+        print(f" {self.t['stories']:<32}: {len(self.results.get('stories', []))}")
+        print(f" {self.t['reels']:<32}: {len(self.results.get('reels', []))}")
+        print(f" {self.t['carousels']:<32}: {len(self.results.get('carousels', []))}")
+        print(f" {self.t['photos']:<32}: {len(self.results.get('photos', []))}")
         print("-------------------------------------------------------")
 
         if self.errors or self.warnings:
@@ -306,7 +234,7 @@ if __name__ == "__main__":
         "-s", "--scope", default="all", choices=["all", "stories", "reels", "posts"]
     )
     parser.add_argument("-c", "--cookie", default=None)
-    parser.add_argument("-n", "--limit", type=int, default=0)
+    parser.add_argument("-n", "--limit", type=int, default=36)
     parser.add_argument(
         "--lang", default="en", choices=["en", "th"], help="Output language"
     )
