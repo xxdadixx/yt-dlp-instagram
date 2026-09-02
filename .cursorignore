@@ -1,6 +1,7 @@
-# Dependencies & Package Managers
+# =========================================================================
+# Dependencies & Virtual Environments
+# =========================================================================
 node_modules/
-.pnpm-store/
 vendor/
 venv/
 .venv/
@@ -8,51 +9,26 @@ env/
 __pycache__/
 *.pyc
 
-# Build Outputs & Bundles
+# =========================================================================
+# Build Outputs & Bundlers
+# =========================================================================
 dist/
 build/
+installer_output/
 out/
-.next/
-.nuxt/
-.output/
 target/
 bin/
 obj/
 
-# Large Lock Files (ลดภาระการประมวลผลข้อความหลายหมื่นบรรทัด)
-package-lock.json
-yarn.lock
-pnpm-lock.yaml
-poetry.lock
-Pipfile.lock
-composer.lock
-
-# Version Control & IDE Metadata
-.git/
-.svn/
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Logs, Cache & Temporary Files
-*.log
-logs/
-tmp/
-temp/
-.cache/
-*.tmp
-coverage/
-.nyc_output/
-
-# Media & Binary Assets
+# =========================================================================
+# Downloaded Media & Large Assets
+# =========================================================================
+downloads/
 *.png
 *.jpg
 *.jpeg
 *.gif
 *.webp
-*.svg
-*.ico
 *.mp4
 *.mp3
 *.wav
@@ -61,11 +37,35 @@ coverage/
 *.tar.gz
 *.exe
 *.dll
-*.so
 *.dylib
 
-# Secrets & Environment Files
+# =========================================================================
+# Logs, Cache & Diagnostics
+# =========================================================================
+logs/
+*.log
+tmp/
+temp/
+.cache/
+*.tmp
+coverage/
+
+# =========================================================================
+# Secrets & Authentication Files
+# =========================================================================
+instagram_cookies.txt
+*cookies*.txt
 .env
 .env.*
 *.pem
 *.key
+
+# =========================================================================
+# Version Control & IDE Metadata
+# =========================================================================
+.git/
+.svn/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
