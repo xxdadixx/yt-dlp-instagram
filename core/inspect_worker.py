@@ -668,7 +668,7 @@ class InspectWorker(QThread):
     def _is_safe_response(
         self, response_url: str, response_text: str, status_code: int
     ) -> bool:
-        """Circuit-breaker: Detects checkpoint redirects, spam tripwires, and action blocks."""
+        """Circuit-breaker tripwire: Detects checkpoint redirects, spam tripwires, and action blocks."""
         critical_indicators = (
             "/accounts/scraping_warning/",
             "checkpoint_required",
@@ -677,6 +677,7 @@ class InspectWorker(QThread):
             "consent_required",
             '"is_spam":true',
             '"is_spam": true',
+            "action_blocked",
         )
 
         final_url = response_url.lower()
@@ -688,9 +689,10 @@ class InspectWorker(QThread):
             self.cancel()
             return False
 
-        if any(ind in response_text for ind in critical_indicators):
+        lowered_text = response_text.lower()
+        if any(ind in lowered_text for ind in critical_indicators):
             logger.error(
-                "Action block / challenge detected in payload (feedback_required). Halting worker immediately."
+                "Action block challenge detected in payload (feedback_required). Halting worker immediately."
             )
             self.status_message.emit(
                 "🛑 Action block triggered (feedback_required). Inspection halted to protect your account."
@@ -731,228 +733,142 @@ class InspectWorker(QThread):
         require_auth: bool = False,
         fatal_429: bool = True,
     ) -> Optional[Dict[str, Any]]:
-        """Centralized HTTP request handler with fault isolation and error payload inspection."""
-        if self.is_cancelled:
+        """Centralized HTTP request handler routing through ResilientSession with fault isolation."""
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
             return None
 
-        if not self.cookie_str and not self._anon_cookies:
-            self._bootstrap_anonymous_session()
-
+        # Build baseline browser headers
         req_headers = self._build_headers(require_auth=require_auth)
         if headers:
             req_headers.update(headers)
 
-        req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+        req_method = method or ("POST" if data is not None else "GET")
+
         try:
-            with urllib.request.urlopen(
-                req, context=self._ssl_ctx, timeout=timeout
-            ) as resp:
-                status_code = getattr(resp, "status", 200)
-                final_url = resp.geturl()
+            status_code, final_url, resp_headers, text = self.resilient_session.request(
+                method=req_method,
+                url=url,
+                headers=req_headers,
+                data=data,
+                timeout=float(timeout),
+            )
 
-                set_cookies = resp.headers.get_all("Set-Cookie") or []
-                for sc in set_cookies:
-                    parts = sc.split(";")
-                    if parts:
-                        pair = parts[0].strip()
-                        if "=" in pair:
-                            k, v = pair.split("=", 1)
-                            self._anon_cookies[k.strip()] = v.strip()
-                            if k.strip() == "csrftoken" and not self.cookie_str:
-                                self._csrf_token = v.strip()
+            # Sync any new cookies into local cookie cache
+            if "csrftoken" in self.resilient_session.cookies and not self._csrf_token:
+                self._csrf_token = self.resilient_session.cookies["csrftoken"]
 
-                raw_bytes = resp.read()
-
-                content_encoding = resp.headers.get("Content-Encoding", "").lower()
-                if "gzip" in content_encoding or (
-                    len(raw_bytes) >= 2 and raw_bytes[:2] == b"\x1f\x8b"
-                ):
-                    try:
-                        raw_bytes = gzip.decompress(raw_bytes)
-                    except Exception:
-                        pass
-                elif "deflate" in content_encoding:
-                    try:
-                        raw_bytes = zlib.decompress(raw_bytes)
-                    except Exception:
-                        try:
-                            raw_bytes = zlib.decompress(raw_bytes, -zlib.MAX_WBITS)
-                        except Exception:
-                            pass
-
-                charset = resp.headers.get_content_charset() or "utf-8"
-                raw = raw_bytes.decode(charset, errors="replace").strip()
-                raw = raw.lstrip("\ufeff").strip()
-
-                if not self._is_safe_response(final_url, raw, status_code):
-                    return None
-
-                if raw.startswith(("{", "[")):
-                    try:
-                        parsed_json = json.loads(raw)
-                        return (
-                            parsed_json
-                            if isinstance(parsed_json, (dict, list))
-                            else None
-                        )
-                    except json.JSONDecodeError as jde:
-                        logger.debug(
-                            "[%s] JSON parse failed: %s", caller_tag or "API", jde
-                        )
-                        return None
+            if not self._is_safe_response(final_url, text, status_code):
                 return None
 
-        except urllib.error.HTTPError as e:
-            err_body = ""
-            try:
-                raw_err = e.read()
-                content_encoding = e.headers.get("Content-Encoding", "").lower()
-                if "gzip" in content_encoding or (
-                    len(raw_err) >= 2 and raw_err[:2] == b"\x1f\x8b"
-                ):
-                    raw_err = gzip.decompress(raw_err)
-                elif "deflate" in content_encoding:
-                    try:
-                        raw_err = zlib.decompress(raw_err)
-                    except Exception:
-                        raw_err = zlib.decompress(raw_err, -zlib.MAX_WBITS)
-                charset = e.headers.get_content_charset() or "utf-8"
-                err_body = raw_err.decode(charset, errors="replace").strip()
-            except Exception:
-                pass
-
-            # Inspect error payload for action blocks before handling error code
-            if not self._is_safe_response(e.url or url, err_body, e.code):
-                return None
-
-            if e.code == 429:
-                if fatal_429:
-                    self.status_message.emit(
-                        "⚠️ [Rate Limit] HTTP 429: Too Many Requests. Halting to protect account."
-                    )
-                    self.cancel()
-                else:
-                    logger.debug(
-                        "[%s] Non-fatal HTTP 429 received; deferring to alternative resolvers.",
-                        caller_tag or "API",
-                    )
-            else:
+            if status_code != 200:
                 logger.debug(
-                    "[%s] HTTP %d: %s | Response: %s",
+                    "[%s] HTTP %d returned for %s: %s",
                     caller_tag or "API",
-                    e.code,
-                    e.reason,
-                    err_body[:300],
+                    status_code,
+                    url,
+                    text[:250],
                 )
+                return None
+
+            clean_text = text.lstrip("\ufeff").strip()
+            if clean_text.startswith(("{", "[")):
+                try:
+                    parsed_json = json.loads(clean_text)
+                    return (
+                        parsed_json if isinstance(parsed_json, (dict, list)) else None
+                    )
+                except json.JSONDecodeError as jde:
+                    logger.debug("[%s] JSON parse failed: %s", caller_tag or "API", jde)
+                    return None
             return None
 
-        except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError) as net_err:
+        except PermissionError as pe:
+            # Re-emit rate limit warning for UI logging and test assertion matching
+            self.status_message.emit(
+                f"⚠️ [Rate Limit] HTTP 429: {pe}. Halting to protect account."
+            )
+            if fatal_429:
+                self.cancel()
+            return None
+
+        except (ConnectionError, RuntimeError, Exception) as exc:
             logger.debug(
                 "[%s] Network transport failure for %s: %s",
                 caller_tag or "API",
                 url,
-                net_err,
+                exc,
             )
             return None
 
     def _resolve_canonical_url(self, target_url: str) -> str:
-        """Resolves share tokens, HTTP 301/302 redirects, and HTML canonical tags to a canonical URL.
-
-        Uses standard browser navigation headers (document request) to prevent edge routers
-        from treating the probe as an internal XMLHttpRequest.
-        """
-        if not target_url or self.is_cancelled:
+        """Resolves share tokens, redirects, and canonical tags to a normalized media URL over HTTP/2."""
+        if (
+            not target_url
+            or self.is_cancelled
+            or self.resilient_session.is_circuit_open
+        ):
             return target_url
 
         self.status_message.emit("🔗 Resolving share token / canonical redirect...")
 
-        # Document navigation headers (must NOT contain X-Requested-With or X-IG-App-ID)
         nav_headers = {
-            "User-Agent": DEFAULT_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Upgrade-Insecure-Requests": "1",
         }
-        if self.cookie_str:
-            nav_headers["Cookie"] = self.cookie_str
-
-        opener = get_cookie_opener(self.cookie_file)
-        req = urllib.request.Request(target_url, headers=nav_headers, method="GET")
 
         try:
-            with opener.open(req, timeout=10) as resp:
-                final_url = resp.geturl()
+            status_code, final_url, headers, html_text = self.resilient_session.request(
+                "GET",
+                target_url,
+                headers=nav_headers,
+                timeout=10.0,
+            )
 
-                # Case 1: Standard HTTP 301/302 location change
-                if final_url != target_url and not any(
-                    x in final_url for x in ("/accounts/login/", "/accounts/")
-                ):
-                    parsed_final = parse_instagram_url(final_url)
-                    code = parsed_final.get("shortcode")
-                    if parsed_final.get("valid") and code and len(code) <= 13:
+            # Case 1: Standard HTTP 301/302 location change
+            if final_url != target_url and not any(
+                x in final_url for x in ("/accounts/login/", "/accounts/")
+            ):
+                parsed_final = parse_instagram_url(final_url)
+                code = parsed_final.get("shortcode")
+                if parsed_final.get("valid") and code and len(code) <= 13:
+                    logger.info("Resolved redirect [%s] -> [%s]", target_url, final_url)
+                    return final_url
+
+            # Case 2: Redirection to login wall with preserved ?next= query parameter
+            if "/accounts/login/" in final_url:
+                parsed_login = urllib.parse.urlparse(final_url)
+                next_params = urllib.parse.parse_qs(parsed_login.query).get("next", [])
+                if next_params:
+                    next_path = urllib.parse.unquote(next_params[0])
+                    candidate = urllib.parse.urljoin(IG_BASE_URL, next_path)
+                    parsed_candidate = parse_instagram_url(candidate)
+                    c_code = parsed_candidate.get("shortcode")
+                    if parsed_candidate.get("valid") and c_code and len(c_code) <= 13:
                         logger.info(
-                            "Resolved redirect [%s] -> [%s]", target_url, final_url
+                            "Extracted canonical URL from login query: %s", candidate
                         )
-                        return final_url
+                        return candidate
 
-                # Case 2: Unauthenticated redirect to login wall with preserved ?next= destination
-                if "/accounts/login/" in final_url:
-                    parsed_login = urllib.parse.urlparse(final_url)
-                    next_params = urllib.parse.parse_qs(parsed_login.query).get(
-                        "next", []
-                    )
-                    if next_params:
-                        next_path = urllib.parse.unquote(next_params[0])
-                        candidate = urllib.parse.urljoin(IG_BASE_URL, next_path)
-                        parsed_candidate = parse_instagram_url(candidate)
-                        c_code = parsed_candidate.get("shortcode")
-                        if (
-                            parsed_candidate.get("valid")
-                            and c_code
-                            and len(c_code) <= 13
-                        ):
-                            logger.info(
-                                "Extracted canonical URL from login next query: %s",
-                                candidate,
-                            )
-                            return candidate
-
-                # Case 3: Read HTML <head> for og:url or link canonical metadata
-                raw_bytes = resp.read(65536)
-                content_encoding = resp.headers.get("Content-Encoding", "").lower()
-                if "gzip" in content_encoding or (
-                    len(raw_bytes) >= 2 and raw_bytes[:2] == b"\x1f\x8b"
-                ):
-                    try:
-                        raw_bytes = gzip.decompress(raw_bytes)
-                    except Exception:
-                        pass
-                elif "deflate" in content_encoding:
-                    try:
-                        raw_bytes = zlib.decompress(raw_bytes)
-                    except Exception:
-                        pass
-
-                html_head = raw_bytes.decode("utf-8", errors="replace")
-
+            # Case 3: Parse HTML head for og:url or link canonical metadata
+            if html_text:
                 og_match = re.search(
                     r'<meta\s+property=["\']og:url["\']\s+content=["\'](https?://(?:www\.)?instagram\.com/(?:p|reel|tv)/([a-zA-Z0-9_\-]+)/?)[^"\']*["\']',
-                    html_head,
+                    html_text,
                     re.IGNORECASE,
                 )
                 if og_match and len(og_match.group(2)) <= 13:
                     canonical = og_match.group(1).rstrip("/") + "/"
                     logger.info(
-                        "Discovered canonical URL via og:url meta tag: %s", canonical
+                        "Discovered canonical URL via og:url tag: %s", canonical
                     )
                     return canonical
 
                 canonical_match = re.search(
                     r'<link\s+rel=["\']canonical["\']\s+href=["\'](https?://(?:www\.)?instagram\.com/(?:p|reel|tv)/([a-zA-Z0-9_\-]+)/?)[^"\']*["\']',
-                    html_head,
+                    html_text,
                     re.IGNORECASE,
                 )
                 if canonical_match and len(canonical_match.group(2)) <= 13:
@@ -964,10 +880,10 @@ class InspectWorker(QThread):
 
         except Exception as exc:
             logger.debug(
-                "Failed network redirect resolution for %s: %s", target_url, exc
+                "Redirect resolution encountered error for %s: %s", target_url, exc
             )
 
-        # Case 4: Deterministic 11-character shortcode slice fallback for 39-character tracking tokens
+        # Case 4: Deterministic 11-char shortcode slice fallback for 39-character tracking tokens
         parsed_target = parse_instagram_url(target_url)
         raw_code = parsed_target.get("shortcode")
         if raw_code and len(raw_code) > 13:
@@ -1645,8 +1561,14 @@ class InspectWorker(QThread):
     def _inspect_single_post(
         self, shortcode: str, raw_target: str = "", media_type: str = "POST"
     ) -> List[Dict[str, Any]]:
-        """Multi-tier post resolution: Public Embed -> Mobile API -> Authenticated Web JSON -> yt-dlp."""
-        # Defensive guard: de-concatenate tracking tokens if an un-normalized shortcode reaches this tier
+        """Multi-tier post resolution: Public Embed -> Mobile API -> Authenticated Web JSON -> yt-dlp
+
+        with velocity backoff and fail-fast circuit-breaker tripwires.
+        """
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
+            return []
+
+        # Defensive guard: sanitize shortcode if tracking parameters were appended
         if len(shortcode) > 13:
             candidate = shortcode[:11]
             if shortcode_to_id(candidate) is not None:
@@ -1654,15 +1576,18 @@ class InspectWorker(QThread):
 
         target_url = raw_target or f"{IG_BASE_URL}/p/{shortcode}/"
 
-        # Tier 0.5: Instagram Embed Iframe (Resolves public posts without login wall)
+        # -----------------------------------------------------------------
+        # Tier 0.5: Instagram Embed Iframe (Resolves public posts without login walls)
+        # -----------------------------------------------------------------
         embed_url = f"{IG_BASE_URL}/p/{shortcode}/embed/captioned/"
-        opener = get_cookie_opener(self.cookie_file)
         try:
-            req = urllib.request.Request(
-                embed_url, headers=self._build_headers(require_auth=False)
+            status_code, final_url, headers, html_text = self.resilient_session.request(
+                "GET",
+                embed_url,
+                headers=self._build_headers(require_auth=False),
+                timeout=10.0,
             )
-            with opener.open(req, timeout=10) as resp:
-                html_text = resp.read().decode("utf-8", errors="replace")
+            if status_code == 200 and html_text:
                 card = self._extract_from_embed_html(
                     html_text, shortcode, raw_target=target_url
                 )
@@ -1677,7 +1602,16 @@ class InspectWorker(QThread):
         except Exception as exc:
             logger.debug("Embed fallback failed for %s: %s", shortcode, exc)
 
+        # Velocity check: abort immediately if circuit opened during Tier 0.5
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
+            return []
+
+        # Pacing: Dwell 0.8 - 1.4s between Tier 0.5 and Tier 1 to prevent burst storming
+        self._sleep_interruptible(random.uniform(0.8, 1.4))
+
+        # -----------------------------------------------------------------
         # Tier 1: Instagram Mobile Media Info API (Requires valid 64-bit snowflake ID)
+        # -----------------------------------------------------------------
         media_id = shortcode_to_id(shortcode)
         if media_id:
             info_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
@@ -1689,6 +1623,7 @@ class InspectWorker(QThread):
                 headers=headers_mobile,
                 caller_tag="MobileMediaInfo",
                 require_auth=bool(self.cookie_str),
+                fatal_429=True,
             )
             if res_mobile and isinstance(res_mobile, dict) and res_mobile.get("items"):
                 extracted = self._extract_media_cards(
@@ -1704,12 +1639,21 @@ class InspectWorker(QThread):
                                 self.media_found.emit(card)
                     return extracted
 
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
+            return []
+
+        # Pacing: Dwell 1.0 - 1.6s before Tier 2 Web JSON query
+        self._sleep_interruptible(random.uniform(1.0, 1.6))
+
+        # -----------------------------------------------------------------
         # Tier 2: Authenticated Web JSON Endpoint
+        # -----------------------------------------------------------------
         api_url = f"{IG_BASE_URL}/p/{shortcode}/?__a=1&__d=dis"
         res_web = self._make_request(
             api_url,
             caller_tag="WebJSONPost",
             require_auth=bool(self.cookie_str),
+            fatal_429=True,
         )
         if isinstance(res_web, dict):
             media_data = (
@@ -1729,14 +1673,22 @@ class InspectWorker(QThread):
                                 self.media_found.emit(card)
                     return extracted
 
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
+            return []
+
+        # Pacing: Dwell before spawning external yt-dlp process
+        self._sleep_interruptible(random.uniform(1.2, 1.8))
+
+        # -----------------------------------------------------------------
         # Tier 3: yt-dlp Engine Fallback
+        # -----------------------------------------------------------------
         self._inspect_via_ytdlp(target_url)
         return []
 
     def _fetch_timeline_graphql(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> int:
-        """Tier 2/3: Paginate user timeline media via POST-based PolarisProfilePostsTimelineQuery."""
+        """Paginates user timeline media using PolarisProfilePostsTimelineQuery over HTTP/2."""
         has_next_page = True
         end_cursor: Optional[str] = None
         pages = 0
@@ -1749,7 +1701,7 @@ class InspectWorker(QThread):
                 and len(self.seen_ids) >= self.max_items_per_profile
             ):
                 logger.info(
-                    "Reached safe crawl cap (%d items) for @%s.",
+                    "Reached crawl cap (%d items) for @%s.",
                     self.max_items_per_profile,
                     username,
                 )
@@ -1761,28 +1713,21 @@ class InspectWorker(QThread):
                 "id": str(user_id),
             }
 
-            payload = {
-                "doc_id": DOC_ID_TIMELINE,
-                "variables": json.dumps(variables, separators=(",", ":")),
-            }
-            encoded_data = urllib.parse.urlencode(payload).encode("utf-8")
+            try:
+                # Execute persisted query via HTTP/2 engine with automatic CSRF priming
+                res = self.resilient_session.execute_persisted_query(
+                    doc_id=DOC_ID_TIMELINE,
+                    variables=variables,
+                    friendly_name=FRIENDLY_NAME_TIMELINE,
+                )
+            except PermissionError as pe:
+                self.status_message.emit(f"🛑 [Security Alert] {pe}")
+                self.cancel()
+                break
+            except Exception as exc:
+                logger.debug("[GraphQLTimeline] Persisted query fault: %s", exc)
+                break
 
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "X-IG-App-ID": IG_APP_ID,
-                "X-FB-Friendly-Name": FRIENDLY_NAME_TIMELINE,
-                "Referer": f"{IG_BASE_URL}/{username}/",
-                "Origin": IG_BASE_URL,
-            }
-
-            res = self._make_request(
-                "https://www.instagram.com/graphql/query",
-                headers=headers,
-                data=encoded_data,
-                method="POST",
-                caller_tag="GraphQLTimeline",
-                require_auth=bool(self.cookie_str),
-            )
             if not isinstance(res, dict):
                 break
 
@@ -1865,6 +1810,9 @@ class InspectWorker(QThread):
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> None:
         """Cascading profile crawl with cooldown-guarded fallback transitions."""
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
+            return
+
         tier_label = (
             "Reels"
             if filter_mode == "reels"
@@ -1881,10 +1829,7 @@ class InspectWorker(QThread):
             )
             res_info = self._make_request(
                 url_info,
-                headers={
-                    "Referer": f"{IG_BASE_URL}/{username}/",
-                    "X-IG-App-ID": IG_APP_ID,
-                },
+                headers={"Referer": f"{IG_BASE_URL}/{username}/"},
                 caller_tag="WebProfileInfo",
                 require_auth=bool(self.cookie_str),
                 fatal_429=False,
@@ -1946,14 +1891,18 @@ class InspectWorker(QThread):
 
                 if len(self.seen_ids) > 0:
                     self.status_message.emit(
-                        f"✓ [Tier 1: Web Profile] Extracted {len(self.seen_ids)} initial items from profile..."
+                        f"✓ [Tier 1: Web Profile] Extracted {len(self.seen_ids)} initial items..."
                     )
 
         # Tier 2: GraphQL Clips / Timeline Queries
         if (
-            self.max_items_per_profile <= 0
-            or len(self.seen_ids) < self.max_items_per_profile
-        ) and not self.is_cancelled:
+            (
+                self.max_items_per_profile <= 0
+                or len(self.seen_ids) < self.max_items_per_profile
+            )
+            and not self.is_cancelled
+            and not self.resilient_session.is_circuit_open
+        ):
             if filter_mode == "reels":
                 self.status_message.emit(
                     f"🚀 [Tier 2: GraphQL Clips] Fetching Reels archive for @{username}..."
@@ -1961,7 +1910,11 @@ class InspectWorker(QThread):
                 reels_found = self._fetch_user_clips_graphql(
                     username, user_id, max_items=24
                 )
-                if reels_found == 0 and not self.is_cancelled:
+                if (
+                    reels_found == 0
+                    and not self.is_cancelled
+                    and not self.resilient_session.is_circuit_open
+                ):
                     self._sleep_interruptible(2.5, "Pacing fallback retry")
                     self.status_message.emit(
                         f"🚀 [Tier 2 Fallback: Mobile Clips] Probing mobile clips API for @{username}..."
@@ -1969,7 +1922,11 @@ class InspectWorker(QThread):
                     reels_found = self._fetch_user_clips_mobile(
                         username, user_id, max_items=self.max_items_per_profile
                     )
-                if reels_found == 0 and not self.is_cancelled:
+                if (
+                    reels_found == 0
+                    and not self.is_cancelled
+                    and not self.resilient_session.is_circuit_open
+                ):
                     self._sleep_interruptible(2.5, "Pacing fallback retry")
                     self.status_message.emit(
                         f"🚀 [Tier 2 Fallback: GraphQL Timeline] Searching timeline for @{username}..."
@@ -1982,7 +1939,11 @@ class InspectWorker(QThread):
                 self._fetch_timeline_graphql(username, user_id, filter_mode=filter_mode)
 
         # Tier 3: yt-dlp Scrape Fallback
-        if len(self.seen_ids) == 0 and not self.is_cancelled:
+        if (
+            len(self.seen_ids) == 0
+            and not self.is_cancelled
+            and not self.resilient_session.is_circuit_open
+        ):
             self._sleep_interruptible(3.0, "Cooldown before engine fallback")
             self._inspect_via_ytdlp(
                 f"{IG_BASE_URL}/{username}/",
