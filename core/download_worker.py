@@ -73,6 +73,29 @@ def extract_chronological_key(item_data: object) -> int:
     return 0
 
 
+def extract_queue_sort_key(item_data: object) -> tuple[int, int, int]:
+    """Extracts a composite monotonic sort key prioritizing URL queue order:
+    (target_index, -chronological_timestamp_or_snowflake, sub_index).
+    """
+    if not isinstance(item_data, dict):
+        return (0, 0, 0)
+
+    payload = cast(dict[str, object], item_data)
+    try:
+        target_idx = int(str(payload.get("target_index") or 0))
+    except (ValueError, TypeError):
+        target_idx = 0
+
+    chrono_key = extract_chronological_key(item_data)
+
+    try:
+        sub_idx = int(str(payload.get("sub_index") or 0))
+    except (ValueError, TypeError):
+        sub_idx = 0
+
+    return (target_idx, -chrono_key, sub_idx)
+
+
 class DownloadWorker(QThread):
     progress: pyqtSignal = pyqtSignal(int)
     item_started: pyqtSignal = pyqtSignal(str)
@@ -103,8 +126,8 @@ class DownloadWorker(QThread):
         super().__init__(parent)
         raw_items: list[dict[str, object]] = list(items or queue_items or [])
 
-        # Strict Chronological Sort: Most Recent (highest timestamp/ID) -> Oldest (lowest)
-        raw_items.sort(key=extract_chronological_key, reverse=True)
+        # Strict Queue Order: Primary = URL Input Order (0 -> N); Secondary = Monotonic Chronological Order
+        raw_items.sort(key=extract_queue_sort_key)
         self.items = raw_items
 
         self.save_folder = os.path.abspath(
@@ -220,10 +243,11 @@ class DownloadWorker(QThread):
     def _download_direct_stream(
         self, url: str, target_path: str, index: int, total_items: int
     ) -> str:
+        """Streams media chunk-by-chunk with dynamic Content-Type extension validation to prevent container mismatch."""
         chunk_size = 256 * 1024  # 256 KB streaming chunks
-        temp_path = f"{target_path}.part"
         req_headers = self._get_download_headers(url)
         completed_successfully = False
+        actual_target_path = target_path
 
         try:
             with self.session.get(
@@ -234,6 +258,36 @@ class DownloadWorker(QThread):
                 verify=True,
             ) as response:
                 response.raise_for_status()
+
+                # Content-Type sniffing: Reconcile payload MIME type with file extension
+                content_type = response.headers.get("Content-Type", "").lower()
+                base_stem, ext = os.path.splitext(actual_target_path)
+
+                if "image/" in content_type:
+                    correct_ext = (
+                        ".jpg"
+                        if "jpeg" in content_type or "jpg" in content_type
+                        else (".webp" if "webp" in content_type else ".png")
+                    )
+                    if ext.lower() in (".mp4", ".m4v", ".mov", ".mkv"):
+                        logger.info(
+                            "MIME-type sniff corrected container: [%s] -> [%s] (%s)",
+                            ext,
+                            correct_ext,
+                            content_type,
+                        )
+                        actual_target_path = base_stem + correct_ext
+                elif "video/" in content_type:
+                    if ext.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                        logger.info(
+                            "MIME-type sniff corrected container: [%s] -> [.mp4] (%s)",
+                            ext,
+                            content_type,
+                        )
+                        actual_target_path = base_stem + ".mp4"
+
+                temp_path = f"{actual_target_path}.part"
+
                 try:
                     total_size = int(response.headers.get("content-length", 0) or 0)
                 except (ValueError, TypeError):
@@ -248,7 +302,7 @@ class DownloadWorker(QThread):
                             raise InterruptedError("Download cancelled by user.")
 
                         if chunk:
-                            _ = f.write(chunk)
+                            f.write(chunk)
                             downloaded_bytes += len(chunk)
 
                             current_time = time.time()
@@ -270,17 +324,23 @@ class DownloadWorker(QThread):
             if self._is_cancelled or self.isInterruptionRequested():
                 raise InterruptedError("Download cancelled by user.")
 
-            os.replace(temp_path, target_path)
+            os.replace(temp_path, actual_target_path)
             completed_successfully = True
-            return target_path
+            return actual_target_path
 
         except (requests.exceptions.RequestException, OSError, InterruptedError) as exc:
             if not self._is_cancelled:
-                logger.warning("Stream failed for target %s: %s", target_path, exc)
+                logger.warning(
+                    "Stream failed for target %s: %s", actual_target_path, exc
+                )
             return ""
 
         finally:
-            if not completed_successfully and os.path.exists(temp_path):
+            if (
+                not completed_successfully
+                and "temp_path" in locals()
+                and os.path.exists(temp_path)
+            ):
                 try:
                     os.remove(temp_path)
                 except OSError:
@@ -297,7 +357,6 @@ class DownloadWorker(QThread):
         if yt_dlp is None or self._is_cancelled or self.isInterruptionRequested():
             return ""
 
-        # Prioritize canonical Instagram web URLs over expiring or CDN media URLs
         raw_url = str(item.get("webpage_url") or item.get("url") or "")
         is_cdn = any(cdn in raw_url for cdn in ("cdninstagram.com", "fbcdn.net"))
 
@@ -404,9 +463,37 @@ class DownloadWorker(QThread):
                 entries_obj = info.get("entries")
                 if isinstance(entries_obj, list) and entries_obj:
                     first_entry = entries_obj[0]
-                    if isinstance(first_entry, dict):
-                        return str(ydl.prepare_filename(first_entry))
-                return str(ydl.prepare_filename(info))
+                    target_entry = (
+                        first_entry if isinstance(first_entry, dict) else info
+                    )
+                else:
+                    target_entry = info
+
+                prepared = str(ydl.prepare_filename(target_entry))
+
+                # If postprocessor converted audio, verify the resulting .mp3 container
+                if self.quality_preset == "audio_only":
+                    mp3_path = os.path.splitext(prepared)[0] + ".mp3"
+                    if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
+                        return mp3_path
+
+                if os.path.isfile(prepared) and os.path.getsize(prepared) > 0:
+                    return prepared
+
+                # Fallback directory scan for generated file matching base stem
+                stem = os.path.splitext(prepared)[0]
+                parent_dir = os.path.dirname(prepared)
+                if os.path.isdir(parent_dir):
+                    for fname in os.listdir(parent_dir):
+                        full_p = os.path.join(parent_dir, fname)
+                        if (
+                            full_p.startswith(stem)
+                            and os.path.isfile(full_p)
+                            and os.path.getsize(full_p) > 0
+                        ):
+                            return full_p
+
+                return prepared
         except Exception as exc:
             if not self._is_cancelled:
                 logger.warning("yt-dlp download failed for %s: %s", url, exc)
@@ -470,15 +557,37 @@ class DownloadWorker(QThread):
                 item, username, shortcode, index, total_items
             )
 
-        # 2. Single Post / Reel / Image -> Direct Stream
+        # 2. Single Post / Reel / Image / Story -> Direct Stream
         direct_url = str(
             item.get("download_url")
             or item.get("media_url")
             or item.get("video_url")
             or ""
         )
-        media_type = str(item.get("type") or item.get("media_type") or "video").lower()
-        is_video = "image" not in media_type and "photo" not in media_type
+
+        # Determine media container extension with explicit boolean precedence
+        if "is_video" in item:
+            is_video = bool(item["is_video"])
+        elif bool(item.get("video_url")):
+            is_video = True
+        else:
+            media_type = str(item.get("type") or item.get("media_type") or "").upper()
+            if "VIDEO" in media_type or "REEL" in media_type:
+                is_video = True
+            elif "IMAGE" in media_type or "PHOTO" in media_type:
+                is_video = False
+            else:
+                # URL heuristic fallback
+                clean_direct = direct_url.lower().split("?")[0]
+                is_image_url = (
+                    any(
+                        clean_direct.endswith(x)
+                        for x in (".jpg", ".jpeg", ".png", ".webp")
+                    )
+                    or "dst-jpg" in direct_url.lower()
+                )
+                is_video = not is_image_url
+
         ext = (
             "mp3"
             if self.quality_preset == "audio_only"
@@ -521,7 +630,7 @@ class DownloadWorker(QThread):
                     stream_err,
                 )
 
-        # 3. yt-dlp Scrape Fallback (executed if direct stream was skipped or produced no output)
+        # 3. yt-dlp Scrape Fallback
         return self._download_via_ytdlp(item, username, shortcode, index, total_items)
 
     @override

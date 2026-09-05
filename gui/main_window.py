@@ -96,12 +96,39 @@ def extract_chronological_key(item_data: Dict[str, Any]) -> int:
     return 0
 
 
+def extract_queue_sort_key(item_data: Dict[str, Any]) -> tuple[int, int, int]:
+    """Extracts a composite monotonic sort key prioritizing URL queue order:
+    (target_index, -chronological_timestamp_or_snowflake, sub_index).
+
+    Lexicographical evaluation guarantees:
+    1. Primary: Strict URL Queue order (0, 1, 2, ...).
+    2. Secondary: Monotonic chronological ordering within that URL (newest first).
+    3. Tertiary: Sub-item sequence index for slide or pagination ordering.
+    """
+    if not isinstance(item_data, dict):
+        return (0, 0, 0)
+
+    try:
+        target_idx = int(str(item_data.get("target_index") or 0))
+    except (ValueError, TypeError):
+        target_idx = 0
+
+    chrono_key = extract_chronological_key(item_data)
+
+    try:
+        sub_idx = int(str(item_data.get("sub_index") or 0))
+    except (ValueError, TypeError):
+        sub_idx = 0
+
+    return (target_idx, -chrono_key, sub_idx)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.cards: List[MediaCard] = []
         self._card_id_set: Set[str] = set()
-        self._card_sort_keys: List[int] = []
+        self._card_sort_keys: List[tuple[int, int, int]] = []
         self._last_selected_index: int = -1
         self._last_selected_card: Optional[MediaCard] = None
         self.inspect_worker: Optional[InspectWorker] = None
@@ -121,11 +148,9 @@ class MainWindow(QMainWindow):
         self.load_settings()
         os.makedirs(self.save_folder, exist_ok=True)
 
-        # Logging and UI initialization
         self._setup_logging()
         self.init_ui()
 
-        # Cookie Manager
         self.cookie_manager = CookieManager()
         self.cookie_str: str = self.cookie_manager.get_cookie_string()
         self.cookie_file: str = self.cookie_manager.get_cookie_file_path() or ""
@@ -599,9 +624,9 @@ class MainWindow(QMainWindow):
         self._update_action_button_states()
 
     def add_card(self, item_data: Dict[str, Any]) -> None:
-        """
-        Inserts media item into UI in O(log N) time using binary search insertion
-        and O(1) deduplication to prevent UI layout freezing.
+        """Inserts media item into UI in O(log N) time using hierarchical binary search.
+
+        Guarantees that items appear in the order of the inspected URL queue.
         """
         import bisect
 
@@ -622,19 +647,15 @@ class MainWindow(QMainWindow):
         card.card_clicked.connect(self._on_card_clicked)
         card.selection_changed.connect(self.update_selection_counter)
 
-        # Monotonic sorting key: reverse order requires bisecting negated keys
-        sort_key = extract_chronological_key(item_data)
-        neg_key = -sort_key
+        # Composite sort key: (target_index, -chrono_key, sub_index)
+        sort_key = extract_queue_sort_key(item_data)
+        target_idx = bisect.bisect_right(self._card_sort_keys, sort_key)
 
-        # Binary search insertion index: O(log N)
-        target_idx = bisect.bisect_right(self._card_sort_keys, neg_key)
-
-        self._card_sort_keys.insert(target_idx, neg_key)
+        self._card_sort_keys.insert(target_idx, sort_key)
         self.cards.insert(target_idx, card)
         if dedup_key:
             self._card_id_set.add(dedup_key)
 
-        # Suspend widget repaint during layout re-indexing
         self.scroll_widget.setUpdatesEnabled(False)
         try:
             self.media_grid_layout.insertWidget(target_idx, card)
@@ -761,9 +782,9 @@ class MainWindow(QMainWindow):
                 self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
             return
 
+        # Sort strictly by the queue order of the URLs and intra-target hierarchy
         selected_cards.sort(
-            key=lambda card_obj: extract_chronological_key(card_obj.get_item_data()),
-            reverse=True,
+            key=lambda card_obj: extract_queue_sort_key(card_obj.get_item_data())
         )
 
         items = [c.get_item_data() for c in selected_cards]
@@ -778,6 +799,7 @@ class MainWindow(QMainWindow):
             save_folder=self.save_folder,
             cookie_file=self.cookie_manager.get_cookie_file_path(),
             cookie_str=self.cookie_manager.get_cookie_string(),
+            quality_preset=self.quality_preset,
             parent=self,
         )
         self.download_worker.progress.connect(self.progress_bar.setValue)
@@ -890,16 +912,39 @@ class MainWindow(QMainWindow):
             self.update_selection_counter()
 
     def delete_selected_cards(self) -> None:
-        """Batches deletion of selected cards, synchronizing dedup sets and sort keys."""
+        """Batches deletion of selected cards with atomic layout updates to prevent event-loop choking."""
         selected_cards = [c for c in self.cards if c.is_selected]
         if not selected_cards:
             self.show_toast(self.tr_text("toast_no_selection"), is_error=True)
             return
 
+        selected_set = set(selected_cards)
         self.scroll_widget.setUpdatesEnabled(False)
         try:
-            for card in selected_cards:
-                self.remove_card(card)
+            # Atomic batch prune from internal indices
+            retained_cards: List[MediaCard] = []
+            retained_keys: List[int] = []
+
+            for card, sort_key in zip(self.cards, self._card_sort_keys):
+                if card in selected_set:
+                    ed = card.get_item_data()
+                    cid = str(
+                        ed.get("id") or ed.get("shortcode") or ed.get("url") or ""
+                    )
+                    c_idx = str(ed.get("carousel_index", ""))
+                    dedup_key = f"{cid}::{c_idx}" if cid else ""
+                    self._card_id_set.discard(dedup_key)
+
+                    self.media_grid_layout.removeWidget(card)
+                    card.cleanup()
+                    card.setParent(None)
+                    card.deleteLater()
+                else:
+                    retained_cards.append(card)
+                    retained_keys.append(sort_key)
+
+            self.cards = retained_cards
+            self._card_sort_keys = retained_keys
         finally:
             self.scroll_widget.setUpdatesEnabled(True)
 
@@ -918,7 +963,7 @@ class MainWindow(QMainWindow):
             self.lbl_cookie_status.setStyleSheet("color: #A0A0B2;")
 
     def clear_completed_cards(self) -> None:
-        """Batches removal of finished downloads with atomic layout and registry sync."""
+        """Batches removal of finished downloads with a single layout reflow pass."""
         completed_cards = [
             c
             for c in self.cards
@@ -933,10 +978,32 @@ class MainWindow(QMainWindow):
             )
             return
 
+        completed_set = set(completed_cards)
         self.scroll_widget.setUpdatesEnabled(False)
         try:
-            for card in completed_cards:
-                self.remove_card(card)
+            retained_cards: List[MediaCard] = []
+            retained_keys: List[int] = []
+
+            for card, sort_key in zip(self.cards, self._card_sort_keys):
+                if card in completed_set:
+                    ed = card.get_item_data()
+                    cid = str(
+                        ed.get("id") or ed.get("shortcode") or ed.get("url") or ""
+                    )
+                    c_idx = str(ed.get("carousel_index", ""))
+                    dedup_key = f"{cid}::{c_idx}" if cid else ""
+                    self._card_id_set.discard(dedup_key)
+
+                    self.media_grid_layout.removeWidget(card)
+                    card.cleanup()
+                    card.setParent(None)
+                    card.deleteLater()
+                else:
+                    retained_cards.append(card)
+                    retained_keys.append(sort_key)
+
+            self.cards = retained_cards
+            self._card_sort_keys = retained_keys
         finally:
             self.scroll_widget.setUpdatesEnabled(True)
 

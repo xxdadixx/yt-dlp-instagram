@@ -35,20 +35,50 @@ class DATA_BLOB(ctypes.Structure):
         ("pbData", ctypes.c_void_p),
     ]
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    _crypt32 = ctypes.windll.crypt32
+    _kernel32 = ctypes.windll.kernel32
+
+    # Strictly bind Win64 pointers and return types to prevent address truncation
+    _crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(DATA_BLOB),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(DATA_BLOB),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(DATA_BLOB),
+    ]
+    _crypt32.CryptProtectData.restype = wintypes.BOOL
+
+    _crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(DATA_BLOB),
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(DATA_BLOB),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(DATA_BLOB),
+    ]
+    _crypt32.CryptUnprotectData.restype = wintypes.BOOL
+
+    _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    _kernel32.LocalFree.restype = ctypes.c_void_p
 
 def encrypt_bytes_dpapi(data: bytes) -> bytes:
     """Encrypts byte buffer using Windows DPAPI tied to the current OS user profile."""
-    if sys.platform != "win32":
+    if sys.platform != "win32" or not data:
         return data
 
     raw_buffer = ctypes.create_string_buffer(data)
-    blob_in = DATA_BLOB(cbData=len(data), pbData=ctypes.addressof(raw_buffer))
+    blob_in = DATA_BLOB(cbData=len(data), pbData=ctypes.cast(raw_buffer, ctypes.c_void_p).value or 0)
     blob_out = DATA_BLOB(cbData=0, pbData=0)
 
-    # CRYPTPROTECT_UI_FORBIDDEN = 0x1
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
-    if crypt32.CryptProtectData(
+    # 0x1 = CRYPTPROTECT_UI_FORBIDDEN
+    success = _crypt32.CryptProtectData(
         ctypes.byref(blob_in),
         "IG_PRO_SESSION",
         None,
@@ -56,25 +86,26 @@ def encrypt_bytes_dpapi(data: bytes) -> bytes:
         None,
         0x1,
         ctypes.byref(blob_out),
-    ):
-        ciphertext = ctypes.string_at(blob_out.pbData, blob_out.cbData)
-        _ = kernel32.LocalFree(blob_out.pbData)  # pyright: ignore[reportAny]
-        return ciphertext
+    )
+    if success and blob_out.pbData:
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            _kernel32.LocalFree(blob_out.pbData)
     return data
 
 
 def decrypt_bytes_dpapi(ciphertext: bytes) -> bytes:
     """Decrypts DPAPI ciphertext buffer for the active Windows user."""
-    if sys.platform != "win32":
+    if sys.platform != "win32" or not ciphertext:
         return ciphertext
 
     raw_buffer = ctypes.create_string_buffer(ciphertext)
-    blob_in = DATA_BLOB(cbData=len(ciphertext), pbData=ctypes.addressof(raw_buffer))
+    blob_in = DATA_BLOB(cbData=len(ciphertext), pbData=ctypes.cast(raw_buffer, ctypes.c_void_p).value or 0)
     blob_out = DATA_BLOB(cbData=0, pbData=0)
 
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
-    if crypt32.CryptUnprotectData(
+    # 0x1 = CRYPTPROTECT_UI_FORBIDDEN
+    success = _crypt32.CryptUnprotectData(
         ctypes.byref(blob_in),
         None,
         None,
@@ -82,10 +113,12 @@ def decrypt_bytes_dpapi(ciphertext: bytes) -> bytes:
         None,
         0x1,
         ctypes.byref(blob_out),
-    ):
-        plaintext = ctypes.string_at(blob_out.pbData, blob_out.cbData)
-        _ = kernel32.LocalFree(blob_out.pbData)  # pyright: ignore[reportAny]
-        return plaintext
+    )
+    if success and blob_out.pbData:
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            _kernel32.LocalFree(blob_out.pbData)
     return ciphertext
 
 
@@ -461,23 +494,26 @@ class CookieManager:
         try:
             length = os.path.getsize(target_path)
             if length > 0:
-                with open(target_path, "ba+", buffering=0) as f:
+                # Mode must begin with 'r', 'w', or 'a'. 'r+b' enables in-place byte overwriting.
+                with open(target_path, "r+b", buffering=0) as f:
                     # Pass 1: Cryptographic pseudo-random bytes
-                    _ = f.seek(0)
-                    _ = f.write(os.urandom(length))
+                    f.seek(0)
+                    f.write(os.urandom(length))
                     f.flush()
                     os.fsync(f.fileno())
 
-                    # Pass 2: Binary zeros
-                    _ = f.seek(0)
-                    _ = f.write(b"\x00" * length)
+                    # Pass 2: Zero fill
+                    f.seek(0)
+                    f.write(b"\x00" * length)
                     f.flush()
                     os.fsync(f.fileno())
 
             os.remove(target_path)
-        except OSError:
+        except OSError as exc:
+            logger.debug("Secure shredding fallback for %s: %s", target_path, exc)
             try:
-                os.remove(target_path)
+                if os.path.exists(target_path):
+                    os.remove(target_path)
             except OSError:
                 pass
 

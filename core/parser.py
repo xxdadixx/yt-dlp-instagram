@@ -313,27 +313,38 @@ def id_to_shortcode(media_id: int | str) -> str:
 
 
 def shortcode_to_id(shortcode: str) -> Optional[int]:
-    """Converts an Instagram Base64 shortcode to a numeric 64-bit media ID."""
+    """Converts an Instagram Base64 shortcode to a numeric 64-bit media ID.
+
+    Rejects strings exceeding 13 characters or decoding to values >= 2^64 to
+    prevent passing overflow integers (e.g., share tokens) to mobile endpoints.
+    """
     if not shortcode or not isinstance(shortcode, str):
         return None
-    # Strip URL artifacts, trailing slashes, or query fragments
+
     clean_code = shortcode.strip().split("?")[0].rstrip("/")
+    # A 64-bit unsigned integer encodes to at most 11 base64 characters (12-13 with padding/safety)
+    if len(clean_code) > 13:
+        return None
+
     media_id = 0
     try:
         for char in clean_code:
             if char not in ALPHABET:
                 return None
             media_id = (media_id * 64) + ALPHABET.index(char)
-        return media_id if media_id > 0 else None
+
+        # Instagram snowflake IDs are 64-bit unsigned integers: 1 <= ID < 2^64
+        if media_id <= 0 or media_id >= (1 << 64):
+            return None
+        return media_id
     except Exception:
         return None
 
 
 def parse_instagram_url(url: str) -> Dict[str, Any]:
-    """
-    Parses and normalizes Instagram URLs into structured routing targets.
-    Correctly resolves direct posts, vanity-prefixed URLs (/username/p/CODE),
-    reels, stories, highlights, share redirects, and raw handles.
+    """Parses and normalizes Instagram URLs into structured routing targets.
+
+    Correctly differentiates canonical media shortcodes from opaque share tokens.
     """
     cleaned_url = (url or "").strip()
     if not cleaned_url:
@@ -343,6 +354,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "username": None,
             "shortcode": None,
             "identifier": None,
+            "is_share_token": False,
         }
 
     # 1. Handle raw usernames prefixed with @
@@ -354,6 +366,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "username": clean_user,
             "shortcode": None,
             "identifier": f"{clean_user}_all_posts",
+            "is_share_token": False,
         }
 
     # 2. Add scheme if domainless
@@ -372,10 +385,12 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "username": None,
             "shortcode": None,
             "identifier": None,
+            "is_share_token": False,
         }
 
-    # Strip out 'share' wrappers (e.g., /share/p/{code}, /share/reel/{code})
-    if segments[0].lower() == "share":
+    # Identify explicit share paths (e.g., /share/p/{token}, /share/reel/{token}, /share/{token})
+    is_explicit_share = segments[0].lower() == "share"
+    if is_explicit_share:
         segments = segments[1:]
         if not segments:
             return {
@@ -384,11 +399,12 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 "username": None,
                 "shortcode": None,
                 "identifier": None,
+                "is_share_token": True,
             }
 
     first = segments[0].lower()
 
-    # 3. Direct Posts, Reels, and TV Items at root: /p/{code}, /reel/{code}, /tv/{code}
+    # 3. Direct Posts, Reels, and TV Items: /p/{code}, /reel/{code}, /tv/{code}
     if first in {"p", "post", "reel", "reels", "tv", "r"}:
         code = segments[1] if len(segments) >= 2 else None
         if not code:
@@ -398,8 +414,11 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 "username": None,
                 "shortcode": None,
                 "identifier": None,
+                "is_share_token": False,
             }
 
+        # Tokens longer than 13 characters are opaque tracking tokens, not shortcodes
+        is_token = is_explicit_share or len(code) > 13
         is_carousel = "img_index" in query_params or "carousel" in cleaned_url
         if is_carousel:
             media_type = "carousel"
@@ -414,6 +433,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "username": None,
             "shortcode": code,
             "identifier": code,
+            "is_share_token": is_token,
         }
 
     # 4. Stories Routing: /stories/{username}/{story_id?}
@@ -426,6 +446,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "username": user,
             "shortcode": story_id,
             "identifier": story_id or (f"{user}_all_stories" if user else None),
+            "is_share_token": False,
         }
 
     # 5. Highlights: /stories/highlights/{id}/ or /s/{id}
@@ -441,6 +462,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "username": None,
             "shortcode": code,
             "identifier": code,
+            "is_share_token": False,
         }
 
     # 6. Vanity-Prefixed Post/Reel URLs: /{username}/p/{code} or /{username}/reel/{code}
@@ -448,6 +470,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
         sub_action = segments[1].lower()
         if sub_action in {"p", "post", "reel", "reels", "tv", "r"}:
             code = segments[2]
+            is_token = len(code) > 13
             is_carousel = "img_index" in query_params or "carousel" in cleaned_url
             if is_carousel:
                 media_type = "carousel"
@@ -462,6 +485,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 "username": segments[0].lstrip("@"),
                 "shortcode": code,
                 "identifier": code,
+                "is_share_token": is_token,
             }
 
     # 7. User Profile or Dedicated Reels Tab: /{username}/ or /{username}/reels/
@@ -474,6 +498,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
                 "username": username,
                 "shortcode": None,
                 "identifier": f"{username}_all_reels",
+                "is_share_token": False,
             }
         return {
             "valid": True,
@@ -481,6 +506,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
             "username": username,
             "shortcode": None,
             "identifier": f"{username}_all_posts",
+            "is_share_token": False,
         }
 
     return {
@@ -489,6 +515,7 @@ def parse_instagram_url(url: str) -> Dict[str, Any]:
         "username": None,
         "shortcode": None,
         "identifier": None,
+        "is_share_token": False,
     }
 
 

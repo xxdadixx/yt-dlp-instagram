@@ -144,33 +144,48 @@ class ThumbnailTask(QRunnable):
 
 
 class ThumbnailLoader(QObject):
-    """Adapter maintaining backwards-compatible API while dispatching tasks to QThreadPool."""
+    """Adapter maintaining thread-safe API and guarded signal dispatch to QThreadPool."""
 
     loaded = pyqtSignal(bytes)
 
     def __init__(self, url: str, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.url = url
+        self._is_cancelled = False
         self._signals = ThumbnailTaskSignals()
         self._signals.loaded.connect(self._on_loaded)
         self._task: Optional[ThumbnailTask] = None
 
     def _on_loaded(self, data: bytes) -> None:
-        self.loaded.emit(data)
+        if self._is_cancelled:
+            return
+        try:
+            self.loaded.emit(data)
+        except RuntimeError:
+            # Catches cases where the underlying C++ QObject has been collected by Qt
+            pass
 
     def start(self) -> None:
-        if not self.url:
+        if not self.url or self._is_cancelled:
             return
+
         cached = GLOBAL_THUMB_CACHE.get(self.url)
         if cached is not None:
             self.loaded.emit(cached)
             return
+
         self._task = ThumbnailTask(self.url, self._signals)
         QThreadPool.globalInstance().start(self._task)
 
     def cancel(self) -> None:
+        """Atomically disconnects listeners and instructs runnable task to abort."""
+        self._is_cancelled = True
         if self._task is not None:
             self._task.cancel()
+        try:
+            self._signals.loaded.disconnect(self._on_loaded)
+        except (TypeError, RuntimeError):
+            pass
 
     @staticmethod
     def load_cached_pixmap(url: str, callback: Callable[[QPixmap], None]) -> bool:
