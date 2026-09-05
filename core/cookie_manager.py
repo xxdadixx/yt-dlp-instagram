@@ -35,6 +35,7 @@ class DATA_BLOB(ctypes.Structure):
         ("pbData", ctypes.c_void_p),
     ]
 
+
 if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
@@ -68,13 +69,16 @@ if sys.platform == "win32":
     _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     _kernel32.LocalFree.restype = ctypes.c_void_p
 
+
 def encrypt_bytes_dpapi(data: bytes) -> bytes:
     """Encrypts byte buffer using Windows DPAPI tied to the current OS user profile."""
     if sys.platform != "win32" or not data:
         return data
 
     raw_buffer = ctypes.create_string_buffer(data)
-    blob_in = DATA_BLOB(cbData=len(data), pbData=ctypes.cast(raw_buffer, ctypes.c_void_p).value or 0)
+    blob_in = DATA_BLOB(
+        cbData=len(data), pbData=ctypes.cast(raw_buffer, ctypes.c_void_p).value or 0
+    )
     blob_out = DATA_BLOB(cbData=0, pbData=0)
 
     # 0x1 = CRYPTPROTECT_UI_FORBIDDEN
@@ -101,7 +105,10 @@ def decrypt_bytes_dpapi(ciphertext: bytes) -> bytes:
         return ciphertext
 
     raw_buffer = ctypes.create_string_buffer(ciphertext)
-    blob_in = DATA_BLOB(cbData=len(ciphertext), pbData=ctypes.cast(raw_buffer, ctypes.c_void_p).value or 0)
+    blob_in = DATA_BLOB(
+        cbData=len(ciphertext),
+        pbData=ctypes.cast(raw_buffer, ctypes.c_void_p).value or 0,
+    )
     blob_out = DATA_BLOB(cbData=0, pbData=0)
 
     # 0x1 = CRYPTPROTECT_UI_FORBIDDEN
@@ -164,9 +171,10 @@ class CookieManager:
 
     def _cleanup_ephemeral_bridge(self) -> None:
         """Process cleanup hook to ensure temporary plaintext files are shredded."""
-        if self._ephemeral_file_path:
-            self._shred_file(self._ephemeral_file_path)
-            self._ephemeral_file_path = None
+        path_to_shred = self._ephemeral_file_path
+        self._ephemeral_file_path = None
+        if path_to_shred and os.path.isfile(path_to_shred):
+            self._shred_file(path_to_shred)
 
     def _auto_load_from_candidates(self, explicit_file: str | None = None) -> None:
         candidate_paths: list[str] = []
@@ -546,7 +554,9 @@ class CookieManager:
             return False
 
     def _generate_ephemeral_bridge(self) -> None:
-        """Constructs an ephemeral, plaintext Netscape cookie file for yt-dlp."""
+        """Constructs an isolated ephemeral, plaintext Netscape cookie file for yt-dlp."""
+        import uuid
+
         self._cleanup_ephemeral_bridge()
 
         if not self.has_cookies():
@@ -554,7 +564,10 @@ class CookieManager:
 
         bridge_dir = get_user_data_dir()
         os.makedirs(bridge_dir, exist_ok=True)
-        bridge_file = os.path.join(bridge_dir, f".session_bridge_{os.getpid()}.tmp")
+        unique_token = uuid.uuid4().hex[:12]
+        bridge_file = os.path.join(
+            bridge_dir, f".session_bridge_{os.getpid()}_{unique_token}.tmp"
+        )
 
         try:
             with open(bridge_file, "w", encoding="utf-8") as f:

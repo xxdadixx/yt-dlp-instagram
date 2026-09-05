@@ -113,6 +113,9 @@ class LogViewerWidget(QWidget):
 
     @pyqtSlot(str, int)
     def append_log(self, message: str, level: int) -> None:
+        v_bar = self.text_edit.verticalScrollBar()
+        at_bottom = v_bar.value() >= (v_bar.maximum() - 4) if v_bar else True
+
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
@@ -128,8 +131,9 @@ class LogViewerWidget(QWidget):
 
         cursor.setCharFormat(fmt)
         cursor.insertText(message + "\n")
-        self.text_edit.setTextCursor(cursor)
-        self.text_edit.ensureCursorVisible()
+
+        if at_bottom and v_bar:
+            v_bar.setValue(v_bar.maximum())
 
     @pyqtSlot()
     def clear_logs(self) -> None:

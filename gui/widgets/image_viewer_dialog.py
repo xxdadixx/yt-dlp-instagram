@@ -238,15 +238,21 @@ class TaskSignals(QObject):
 
 
 class ImageDownloadTask(QRunnable):
-    def __init__(self, index: int, url: str):
+    def __init__(self, index: int, url: str) -> None:
         super().__init__()
         self.index = index
         self.url = url
         self.signals = TaskSignals()
+        self._is_cancelled = False
         self.setAutoDelete(True)
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
 
     @pyqtSlot()
     def run(self) -> None:
+        if not self.url or self._is_cancelled:
+            return
         try:
             req = urllib.request.Request(
                 self.url,
@@ -260,8 +266,10 @@ class ImageDownloadTask(QRunnable):
                 },
             )
             with urllib.request.urlopen(req, timeout=10) as response:
+                if self._is_cancelled:
+                    return
                 data = response.read()
-                if data:
+                if data and not self._is_cancelled:
                     self.signals.image_loaded.emit(self.index, data)
         except Exception as exc:
             logger.debug("Failed to preload slide %d: %s", self.index, exc)
@@ -273,12 +281,14 @@ class ImageViewerDialog(QDialog):
         image_urls: List[str],
         title: str = "",
         parent: Optional[QWidget] = None,
-    ):
+    ) -> None:
         super().__init__(parent)
         self.image_urls = image_urls
         self.post_title = title
         self.current_index = 0
         self.pixmap_cache: Dict[int, QPixmap] = {}
+        self._active_tasks: List[ImageDownloadTask] = []
+        self._is_teardown = False
         self.thread_pool = QThreadPool(self)
         self.thread_pool.setMaxThreadCount(4)
 
@@ -402,14 +412,20 @@ class ImageViewerDialog(QDialog):
             if idx not in self.pixmap_cache and url.startswith("http"):
                 task = ImageDownloadTask(idx, url)
                 task.signals.image_loaded.connect(self._on_image_downloaded)
+                self._active_tasks.append(task)
                 self.thread_pool.start(task)
 
     def _on_image_downloaded(self, index: int, data: bytes) -> None:
+        if self._is_teardown:
+            return
         pixmap = QPixmap()
         if pixmap.loadFromData(QByteArray(data)):
             self.pixmap_cache[index] = pixmap
-            if index == self.current_index:
-                self.viewport.update_current_pixmap(pixmap)
+            if index == self.current_index and not self._is_teardown:
+                try:
+                    self.viewport.update_current_pixmap(pixmap)
+                except RuntimeError:
+                    pass
 
     def _load_and_display(
         self, is_initial: bool = False, direction: str = "next"
@@ -457,14 +473,24 @@ class ImageViewerDialog(QDialog):
         if self.current_index in self.pixmap_cache:
             self.viewport.set_image_direct(self.pixmap_cache[self.current_index])
 
-    def closeEvent(self, event) -> None:
+    def _abort_workers(self) -> None:
+        self._is_teardown = True
+        for task in self._active_tasks:
+            task.cancel()
+            try:
+                task.signals.image_loaded.disconnect(self._on_image_downloaded)
+            except (TypeError, RuntimeError):
+                pass
+        self._active_tasks.clear()
         self.thread_pool.clear()
-        self.thread_pool.waitForDone(100)
+        self.thread_pool.waitForDone(150)
+
+    def closeEvent(self, event) -> None:
+        self._abort_workers()
         super().closeEvent(event)
 
     def reject(self) -> None:
-        self.thread_pool.clear()
-        self.thread_pool.waitForDone(100)
+        self._abort_workers()
         super().reject()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:

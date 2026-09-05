@@ -36,6 +36,7 @@ try:
         DEFAULT_PAGE_SIZE,
         DEFAULT_REQUEST_TIMEOUT,
         DEFAULT_USER_AGENT,
+        IG_API_BASE_URL,
         IG_APP_ID,
         IG_BASE_URL,
         IG_CLIPS_USER_URL,
@@ -61,6 +62,7 @@ except ImportError:
     MOBILE_USER_AGENT = "Instagram 300.0.0.29.110 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100)"
     USER_AGENT = DEFAULT_USER_AGENT
     IG_BASE_URL = "https://www.instagram.com"
+    IG_API_BASE_URL = "https://i.instagram.com/api/v1"
     IG_APP_ID = "936619743392459"
     IG_WEB_PROFILE_INFO_URL = (
         "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
@@ -366,6 +368,16 @@ class InspectWorker(QThread):
             except Exception as e:
                 logger.debug("Failed to auto-load cookies from CookieManager: %s", e)
 
+        # Parse cookie map for ResilientSession (curl_cffi Chrome impersonation)
+        cookie_dict: Dict[str, str] = {}
+        if self.cookie_str:
+            for pair in self.cookie_str.split(";"):
+                if "=" in pair:
+                    k, v = pair.strip().split("=", 1)
+                    cookie_dict[k.strip()] = v.strip()
+
+        self.resilient_session = ResilientSession(cookies=cookie_dict)
+
         if self.cookie_str or self.cookie_file:
             logger.info("Session initialized: Authenticated cookies ACTIVE.")
         else:
@@ -656,21 +668,19 @@ class InspectWorker(QThread):
     def _is_safe_response(
         self, response_url: str, response_text: str, status_code: int
     ) -> bool:
-        """
-        Circuit-breaker: Detects checkpoint redirects, scraping warnings, and rate limits.
-        Aborts immediately only on account-threatening safety checkpoints.
-        """
-        # Critical account-jeopardizing endpoints that MUST trip the circuit breaker
-        critical_safety_indicators = (
+        """Circuit-breaker: Detects checkpoints, scraping warnings, and action blocks."""
+        critical_indicators = (
             "/accounts/scraping_warning/",
             "checkpoint_required",
             "challenge_required",
             "feedback_required",
             "consent_required",
+            '"is_spam":true',
+            '"is_spam": true',
         )
 
         final_url = response_url.lower()
-        if any(ind in final_url for ind in critical_safety_indicators):
+        if any(ind in final_url for ind in critical_indicators):
             logger.error("Scraping warning/checkpoint detected in URL: %s", final_url)
             self.status_message.emit(
                 "⚠️ Safety checkpoint triggered. Inspection paused to safeguard account."
@@ -678,20 +688,12 @@ class InspectWorker(QThread):
             self.cancel()
             return False
 
-        if any(
-            ind in response_text
-            for ind in (
-                "checkpoint_required",
-                "challenge_required",
-                "feedback_required",
-                "consent_required",
-            )
-        ):
+        if any(ind in response_text for ind in critical_indicators):
             logger.error(
-                "Scraping warning/checkpoint detected in payload. Aborting worker."
+                "Action block / challenge detected in payload (feedback_required). Halting worker."
             )
             self.status_message.emit(
-                "⚠️ Safety checkpoint triggered in payload. Aborting to protect account."
+                "🛑 Action block triggered (feedback_required). Paused to protect your account."
             )
             self.cancel()
             return False
@@ -706,7 +708,6 @@ class InspectWorker(QThread):
             self.cancel()
             return False
 
-        # Unauthenticated redirects to /accounts/login/ indicate restricted access, NOT an account tripwire
         if "/accounts/login/" in final_url:
             logger.debug(
                 "Endpoint redirected to login (unauthenticated or restricted target)."
@@ -730,11 +731,7 @@ class InspectWorker(QThread):
         require_auth: bool = False,
         fatal_429: bool = True,
     ) -> Optional[Dict[str, Any]]:
-        """Centralized HTTP request handler with decompression, cookie tracking, and fault isolation.
-
-        The fatal_429 parameter allows speculative lookups (e.g., username resolvers) to fail
-        gracefully without prematurely tripping the global worker cancellation circuit breaker.
-        """
+        """Centralized HTTP request handler with decompression and fault isolation."""
         if self.is_cancelled:
             return None
 
@@ -823,6 +820,10 @@ class InspectWorker(QThread):
                 err_body = raw_err.decode(charset, errors="replace").strip()
             except Exception:
                 pass
+
+            # Critical: Check error response body for action blocks/checkpoints
+            if not self._is_safe_response(e.url or url, err_body, e.code):
+                return None
 
             if e.code == 429:
                 if fatal_429:
@@ -984,11 +985,40 @@ class InspectWorker(QThread):
         return target_url
 
     def _get_user_id(self, username: str) -> Optional[str]:
-        """Resolves username to Instagram User ID using an isolated multi-strategy resolver."""
+        """Resolves username to Instagram User ID and populates profile cache."""
         username = username.lower().strip().lstrip("@")
         self.status_message.emit(f"🔍 [Resolver] Fetching User ID for @{username}...")
 
-        # Strategy 1: Base HTML Scraper (Fastest, zero rate-limit penalty, extracts ID from page metadata)
+        # Strategy 1: Web Profile Info Endpoint (Primary: Populates initial media cache + UID)
+        try:
+            url_info = (
+                f"{IG_BASE_URL}/api/v1/users/web_profile_info/?username={username}"
+            )
+            res_info = self._make_request(
+                url_info,
+                headers={
+                    "Referer": f"{IG_BASE_URL}/{username}/",
+                    "X-IG-App-ID": IG_APP_ID,
+                },
+                caller_tag="WebProfileInfo",
+                require_auth=bool(self.cookie_str),
+                fatal_429=False,
+            )
+            if res_info and isinstance(res_info, dict):
+                user_data = res_info.get("data", {}).get("user") or res_info.get("user")
+                if user_data:
+                    self._profile_cache[username] = user_data
+                    uid = user_data.get("id") or user_data.get("pk")
+                    if uid:
+                        uid_str = str(uid)
+                        self.status_message.emit(
+                            f"✓ [Resolver] Found User ID: {uid_str} (@{username})"
+                        )
+                        return uid_str
+        except Exception as e:
+            logger.debug("WebProfileInfo resolver failed: %s", e)
+
+        # Strategy 2: Base HTML Scraper (Fallback for UID only)
         try:
             profile_url = f"{IG_BASE_URL}/{username}/"
             req = urllib.request.Request(
@@ -1027,34 +1057,6 @@ class InspectWorker(QThread):
         except Exception as e:
             logger.debug("HTML scraper resolver failed: %s", e)
 
-        # Strategy 2: Web Profile Info Endpoint (Marked fatal_429=False to prevent killing the worker)
-        try:
-            url1 = f"{IG_BASE_URL}/api/v1/users/web_profile_info/?username={username}"
-            res1 = self._make_request(
-                url1,
-                headers={
-                    "Referer": f"{IG_BASE_URL}/{username}/",
-                    "X-IG-App-ID": IG_APP_ID,
-                },
-                caller_tag="WebProfileInfo",
-                require_auth=bool(self.cookie_str),
-                fatal_429=False,
-            )
-
-            if res1 and isinstance(res1, dict):
-                user_data = res1.get("data", {}).get("user") or res1.get("user")
-                if user_data:
-                    self._profile_cache[username] = user_data
-                    uid = user_data.get("id") or user_data.get("pk")
-                    if uid:
-                        uid_str = str(uid)
-                        self.status_message.emit(
-                            f"✓ [Resolver] Found User ID: {uid_str} (@{username})"
-                        )
-                        return uid_str
-        except Exception as e:
-            logger.debug("WebProfileInfo resolver failed: %s", e)
-
         # Strategy 3: TopSearch Query Endpoint
         try:
             url3 = f"{IG_BASE_URL}/web/search/topsearch/?query={username}"
@@ -1080,15 +1082,120 @@ class InspectWorker(QThread):
 
         return None
 
+    def _fetch_user_clips_graphql(
+        self, username: str, user_id: str, max_items: int = 24
+    ) -> int:
+        """Paginates user Reels archive using PolarisClipsTimelineProfileQuery via ResilientSession."""
+        has_next_page = True
+        end_cursor: Optional[str] = None
+        pages = 0
+        found_count = 0
+        max_pages = self._get_max_pages_ceiling(page_size=max_items)
+
+        try:
+            numeric_uid = int(str(user_id).strip())
+        except (ValueError, TypeError):
+            numeric_uid = 0
+
+        while has_next_page and pages < max_pages and not self.is_cancelled:
+            if (
+                self.max_items_per_profile > 0
+                and len(self.seen_ids) >= self.max_items_per_profile
+            ):
+                break
+
+            variables = {
+                "data": {
+                    "include_feed_video": True,
+                    "page_size": max_items,
+                    "target_user_id": numeric_uid,
+                },
+                "after": end_cursor if end_cursor else None,
+                "before": None,
+                "first": max_items,
+                "last": None,
+            }
+
+            try:
+                res = self.resilient_session.execute_persisted_query(
+                    doc_id=DOC_ID_USER_CLIPS,
+                    variables=variables,
+                    friendly_name=FRIENDLY_NAME_CLIPS,
+                )
+            except PermissionError as pe:
+                self.status_message.emit(f"🛑 [Rate Limit] {pe}")
+                self.cancel()
+                break
+            except Exception as exc:
+                logger.debug("[GraphQLClips] Persisted query fault: %s", exc)
+                break
+
+            if not isinstance(res, dict):
+                break
+
+            data_root = res.get("data", {}) if isinstance(res, dict) else {}
+            clips_conn = (
+                data_root.get("xdt_api__v1__clips__user__connection_v2")
+                or data_root.get("xdt_api__v1__clips__user__connection")
+                or {}
+            )
+            edges = clips_conn.get("edges") if isinstance(clips_conn, dict) else None
+
+            if not isinstance(edges, list) or not edges:
+                break
+
+            for edge in edges:
+                if self.is_cancelled:
+                    return found_count
+                if not isinstance(edge, dict):
+                    continue
+
+                node = edge.get("node") if isinstance(edge.get("node"), dict) else edge
+                media = (
+                    node.get("media") if isinstance(node.get("media"), dict) else node
+                )
+
+                for card in self._extract_media_cards(
+                    media, fallback_username=username
+                ):
+                    card["media_type"] = "REEL"
+                    with self._lock:
+                        cid = str(card["id"])
+                        if cid not in self.seen_ids:
+                            self.seen_ids.add(cid)
+                            self.item_found.emit(card)
+                            self.media_found.emit(card)
+                            found_count += 1
+
+            page_info = (
+                clips_conn.get("page_info") if isinstance(clips_conn, dict) else {}
+            )
+            if isinstance(page_info, dict):
+                has_next_page = bool(page_info.get("has_next_page", False))
+                end_cursor = page_info.get("end_cursor")
+            else:
+                has_next_page = False
+
+            pages += 1
+            self.status_message.emit(
+                f"✓ [GraphQL Clips] Page {pages}: {len(self.seen_ids)} Reels found..."
+            )
+
+            if has_next_page and not self.is_cancelled:
+                self._apply_gaussian_pacing()
+                self._apply_macro_pacing(pages)
+
+        return found_count
+
     def _fetch_user_clips_mobile(
         self, username: str, user_id: str, max_items: int = 72
     ) -> int:
-        """Tier 3: User Clips API using web session headers matching browser cookies."""
-        url = f"{IG_BASE_URL}/api/v1/clips/user/"
+        """Mobile private API fallback routing to i.instagram.com."""
+        url = f"{IG_API_BASE_URL}/clips/user/"
         headers = self._build_headers(
             referer=f"{IG_BASE_URL}/{username}/reels/",
             require_auth=bool(self.cookie_str),
-            is_mobile=False,
+            is_mobile=True,
         )
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
@@ -1120,7 +1227,7 @@ class InspectWorker(QThread):
                 headers=headers,
                 data=encoded_payload,
                 method="POST",
-                caller_tag="WebUserClips",
+                caller_tag="MobileUserClips",
                 require_auth=bool(self.cookie_str),
             )
 
@@ -1161,7 +1268,7 @@ class InspectWorker(QThread):
 
             pages += 1
             self.status_message.emit(
-                f"✓ [Clips API] Page {pages}: {len(self.seen_ids)} Reels found..."
+                f"✓ [Mobile Clips API] Page {pages}: {len(self.seen_ids)} Reels found..."
             )
 
             if has_next_page and not self.is_cancelled:
@@ -1616,56 +1723,6 @@ class InspectWorker(QThread):
         self._inspect_via_ytdlp(target_url)
         return []
 
-    def _inspect_single_target(self, raw_target: str) -> None:
-        """Inspects an individual target URL across chained tiers with canonical pre-resolution."""
-        if self.is_cancelled:
-            return
-
-        target = parse_instagram_url(raw_target)
-
-        # Pre-resolve share tokens, redirect URLs, and concatenated 39-character tracking tokens
-        code = target.get("shortcode")
-        if (
-            target.get("is_share_token")
-            or (code and len(code) > 13)
-            or "/share/" in raw_target
-        ):
-            resolved_url = self._resolve_canonical_url(raw_target)
-            if resolved_url != raw_target:
-                raw_target = resolved_url
-                target = parse_instagram_url(raw_target)
-
-        ttype = target.get("type")
-        username = target.get("username")
-        shortcode = target.get("shortcode")
-
-        if ttype in ("reel", "post", "carousel", "tv") and shortcode:
-            self._inspect_single_post(shortcode, raw_target=raw_target)
-        elif ttype == "story" and username:
-            uid = self._get_user_id(username)
-            if uid:
-                self._fetch_stories_web(username, uid)
-            else:
-                self._inspect_via_ytdlp(raw_target, default_username=username)
-        elif ttype in ("profile", "profile_reels") and username:
-            effective_mode = "reels" if ttype == "profile_reels" else self.profile_mode
-            uid = self._get_user_id(username)
-            if uid:
-                self._fetch_all_profile_media_web(
-                    username, uid, filter_mode=effective_mode
-                )
-            else:
-                self._inspect_via_ytdlp(
-                    raw_target, default_username=username, filter_mode=effective_mode
-                )
-
-            if len(self.seen_ids) == 0 and not self.is_cancelled:
-                self._inspect_via_ytdlp(
-                    raw_target, default_username=username, filter_mode=effective_mode
-                )
-        else:
-            self._inspect_via_ytdlp(raw_target)
-
     def _fetch_timeline_graphql(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> int:
@@ -1797,7 +1854,7 @@ class InspectWorker(QThread):
     def _fetch_all_profile_media_web(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> None:
-        """Cascading profile crawl: Cached Web Profile -> Web Feed Pagination -> yt-dlp Fallback."""
+        """Cascading profile crawl with cooldown-guarded fallback transitions."""
         tier_label = (
             "Reels"
             if filter_mode == "reels"
@@ -1807,8 +1864,28 @@ class InspectWorker(QThread):
             f"🚀 [Tier 1: Web Profile] Crawling {tier_label} for @{username}..."
         )
 
-        # Tier 1: Extract initial media batch from _profile_cache if present
         cached_profile = self._profile_cache.get(username, {})
+        if not cached_profile and not self.is_cancelled:
+            url_info = (
+                f"{IG_BASE_URL}/api/v1/users/web_profile_info/?username={username}"
+            )
+            res_info = self._make_request(
+                url_info,
+                headers={
+                    "Referer": f"{IG_BASE_URL}/{username}/",
+                    "X-IG-App-ID": IG_APP_ID,
+                },
+                caller_tag="WebProfileInfo",
+                require_auth=bool(self.cookie_str),
+                fatal_429=False,
+            )
+            if res_info and isinstance(res_info, dict):
+                cached_profile = (
+                    res_info.get("data", {}).get("user") or res_info.get("user") or {}
+                )
+                if cached_profile:
+                    self._profile_cache[username] = cached_profile
+
         if cached_profile and not self.is_cancelled:
             timeline_obj = cached_profile.get("edge_owner_to_timeline_media") or {}
             edges = timeline_obj.get("edges") if isinstance(timeline_obj, dict) else []
@@ -1862,18 +1939,41 @@ class InspectWorker(QThread):
                         f"✓ [Tier 1: Web Profile] Extracted {len(self.seen_ids)} initial items from profile..."
                     )
 
-        # Tier 2: Paginate Web Feed (handles both Posts and Reels via max_id cursor)
+        # Tier 2: GraphQL Clips / Timeline Queries
         if (
             self.max_items_per_profile <= 0
             or len(self.seen_ids) < self.max_items_per_profile
         ) and not self.is_cancelled:
-            self.status_message.emit(
-                f"🚀 [Tier 2: Web Feed API] Fetching feed for @{username}..."
-            )
-            self._fetch_user_feed_web(username, user_id, filter_mode=filter_mode)
+            if filter_mode == "reels":
+                self.status_message.emit(
+                    f"🚀 [Tier 2: GraphQL Clips] Fetching Reels archive for @{username}..."
+                )
+                reels_found = self._fetch_user_clips_graphql(
+                    username, user_id, max_items=24
+                )
+                if reels_found == 0 and not self.is_cancelled:
+                    self._sleep_interruptible(2.5, "Pacing fallback retry")
+                    self.status_message.emit(
+                        f"🚀 [Tier 2 Fallback: Mobile Clips] Probing mobile clips API for @{username}..."
+                    )
+                    reels_found = self._fetch_user_clips_mobile(
+                        username, user_id, max_items=self.max_items_per_profile
+                    )
+                if reels_found == 0 and not self.is_cancelled:
+                    self._sleep_interruptible(2.5, "Pacing fallback retry")
+                    self.status_message.emit(
+                        f"🚀 [Tier 2 Fallback: GraphQL Timeline] Searching timeline for @{username}..."
+                    )
+                    self._fetch_timeline_graphql(username, user_id, filter_mode="reels")
+            else:
+                self.status_message.emit(
+                    f"🚀 [Tier 2: GraphQL Timeline] Fetching timeline posts for @{username}..."
+                )
+                self._fetch_timeline_graphql(username, user_id, filter_mode=filter_mode)
 
-        # Tier 3: yt-dlp Engine Fallback if zero items were discovered
+        # Tier 3: yt-dlp Scrape Fallback
         if len(self.seen_ids) == 0 and not self.is_cancelled:
+            self._sleep_interruptible(3.0, "Cooldown before engine fallback")
             self._inspect_via_ytdlp(
                 f"{IG_BASE_URL}/{username}/",
                 default_username=username,
@@ -2100,13 +2200,12 @@ class InspectWorker(QThread):
             )
 
     def _inspect_single_target(self, raw_target: str) -> None:
-        """Inspects an individual target URL across chained tiers with direct story snowflake resolution."""
+        """Inspects an individual target URL across chained tiers with story snowflake resolution."""
         if self.is_cancelled:
             return
 
         target = parse_instagram_url(raw_target)
 
-        # Pre-resolve share tokens, redirect URLs, and concatenated tracking tokens
         code = target.get("shortcode")
         if (
             target.get("is_share_token")
@@ -2133,7 +2232,7 @@ class InspectWorker(QThread):
                 self.status_message.emit(
                     f"🔍 [Story] Inspecting story media ID #{shortcode} directly..."
                 )
-                info_url = f"https://i.instagram.com/api/v1/media/{shortcode}/info/"
+                info_url = f"{IG_API_BASE_URL}/media/{shortcode}/info/"
                 headers_mobile = self._build_headers(
                     is_mobile=True, require_auth=bool(self.cookie_str)
                 )
@@ -2165,14 +2264,13 @@ class InspectWorker(QThread):
                                     self.media_found.emit(card)
                         return
 
-            # Fallback path: Resolve User ID and inspect tray
             uid = self._get_user_id(username)
             if uid:
                 self._fetch_stories_web(username, uid, target_story_id=shortcode)
             else:
                 self._inspect_via_ytdlp(raw_target, default_username=username)
 
-        # 3. Full Profile Feeds or Dedicated Reels
+        # 3. Profile Media (Grid, Clips, and Reels Tab)
         elif ttype in ("profile", "profile_reels") and username:
             effective_mode = "reels" if ttype == "profile_reels" else self.profile_mode
             uid = self._get_user_id(username)
@@ -2181,11 +2279,6 @@ class InspectWorker(QThread):
                     username, uid, filter_mode=effective_mode
                 )
             else:
-                self._inspect_via_ytdlp(
-                    raw_target, default_username=username, filter_mode=effective_mode
-                )
-
-            if len(self.seen_ids) == 0 and not self.is_cancelled:
                 self._inspect_via_ytdlp(
                     raw_target, default_username=username, filter_mode=effective_mode
                 )

@@ -145,6 +145,17 @@ class ResilientSession:
                 )
                 return
 
+            now = time.time()
+            if self.circuit_state == CircuitState.HALF_OPEN:
+                logger.error(
+                    "Probe request failed in HALF_OPEN state with status %d. Tripping immediately to OPEN.",
+                    status_code,
+                )
+                self.circuit_state = CircuitState.OPEN
+                self.failure_counter = self.circuit_config.failure_threshold
+                self.last_state_change = now
+                return
+
             self.failure_counter += 1
             logger.warning(
                 "Upstream fault registered with status %d (Failures: %d/%d)",
@@ -157,7 +168,7 @@ class ResilientSession:
                     "Failure threshold reached. Tripping circuit breaker to OPEN."
                 )
                 self.circuit_state = CircuitState.OPEN
-                self.last_state_change = time.time()
+                self.last_state_change = now
 
     def pace_request(
         self,

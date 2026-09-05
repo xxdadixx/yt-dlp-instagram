@@ -241,9 +241,15 @@ class DownloadWorker(QThread):
         return headers
 
     def _download_direct_stream(
-        self, url: str, target_path: str, index: int, total_items: int
+        self,
+        url: str,
+        target_path: str,
+        index: int,
+        total_items: int,
+        sub_index: int = 0,
+        sub_total: int = 1,
     ) -> str:
-        """Streams media chunk-by-chunk with dynamic Content-Type extension validation to prevent container mismatch."""
+        """Streams media chunk-by-chunk with Content-Type extension validation and normalized progress pacing."""
         chunk_size = 256 * 1024  # 256 KB streaming chunks
         req_headers = self._get_download_headers(url)
         completed_successfully = False
@@ -306,18 +312,20 @@ class DownloadWorker(QThread):
                             downloaded_bytes += len(chunk)
 
                             current_time = time.time()
-                            if (
-                                current_time - last_signal_time >= 0.05
-                                or downloaded_bytes == total_size
+                            if current_time - last_signal_time >= 0.05 or (
+                                total_size > 0 and downloaded_bytes == total_size
                             ):
                                 last_signal_time = current_time
-                                item_percent = (
+                                slide_fraction = (
                                     (downloaded_bytes / total_size)
                                     if total_size > 0
                                     else 0.0
                                 )
+                                intra_item_progress = (
+                                    sub_index + slide_fraction
+                                ) / max(1, sub_total)
                                 overall_percent = int(
-                                    ((index + item_percent) / total_items) * 100
+                                    ((index + intra_item_progress) / total_items) * 100
                                 )
                                 self.progress.emit(min(overall_percent, 99))
 
@@ -502,7 +510,7 @@ class DownloadWorker(QThread):
     def _process_single_item(
         self, item: dict[str, object], index: int, total_items: int
     ) -> str:
-        if self._is_cancelled:
+        if self._is_cancelled or self.isInterruptionRequested():
             return ""
 
         username = str(item.get("username") or item.get("uploader") or "instagram_user")
@@ -516,11 +524,14 @@ class DownloadWorker(QThread):
                 for s in cast(list[object], raw_slides)
                 if isinstance(s, dict)
             ]
+            total_slides = len(slides_list)
             saved_any = False
             last_path = ""
+
             for s_idx, slide in enumerate(slides_list, start=1):
-                if self._is_cancelled:
-                    break
+                if self._is_cancelled or self.isInterruptionRequested():
+                    return ""
+
                 slide_url = str(
                     slide.get("download_url")
                     or slide.get("video_url")
@@ -539,17 +550,22 @@ class DownloadWorker(QThread):
                 if slide_url.startswith(("http://", "https://")):
                     try:
                         out = self._download_direct_stream(
-                            slide_url, slide_path, index, total_items
+                            slide_url,
+                            slide_path,
+                            index,
+                            total_items,
+                            sub_index=s_idx - 1,
+                            sub_total=total_slides,
                         )
                         if out and os.path.isfile(out) and os.path.getsize(out) > 0:
                             saved_any = True
                             last_path = out
                     except Exception as s_err:
-                        if self._is_cancelled:
-                            break
+                        if self._is_cancelled or self.isInterruptionRequested():
+                            return ""
                         logger.debug("Slide %d direct stream failed: %s", s_idx, s_err)
 
-            if self._is_cancelled:
+            if self._is_cancelled or self.isInterruptionRequested():
                 return ""
             if saved_any:
                 return last_path
@@ -565,7 +581,6 @@ class DownloadWorker(QThread):
             or ""
         )
 
-        # Determine media container extension with explicit boolean precedence
         if "is_video" in item:
             is_video = bool(item["is_video"])
         elif bool(item.get("video_url")):
@@ -577,7 +592,6 @@ class DownloadWorker(QThread):
             elif "IMAGE" in media_type or "PHOTO" in media_type:
                 is_video = False
             else:
-                # URL heuristic fallback
                 clean_direct = direct_url.lower().split("?")[0]
                 is_image_url = (
                     any(
@@ -621,7 +635,7 @@ class DownloadWorker(QThread):
                 ):
                     return stream_res
             except Exception as stream_err:
-                if self._is_cancelled:
+                if self._is_cancelled or self.isInterruptionRequested():
                     return ""
                 logger.warning(
                     "Direct stream exception for %s_%s: %s",
@@ -629,6 +643,9 @@ class DownloadWorker(QThread):
                     shortcode,
                     stream_err,
                 )
+
+        if self._is_cancelled or self.isInterruptionRequested():
+            return ""
 
         # 3. yt-dlp Scrape Fallback
         return self._download_via_ytdlp(item, username, shortcode, index, total_items)
