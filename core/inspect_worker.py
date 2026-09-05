@@ -668,7 +668,7 @@ class InspectWorker(QThread):
     def _is_safe_response(
         self, response_url: str, response_text: str, status_code: int
     ) -> bool:
-        """Circuit-breaker: Detects checkpoints, scraping warnings, and action blocks."""
+        """Circuit-breaker: Detects checkpoint redirects, spam tripwires, and action blocks."""
         critical_indicators = (
             "/accounts/scraping_warning/",
             "checkpoint_required",
@@ -683,27 +683,27 @@ class InspectWorker(QThread):
         if any(ind in final_url for ind in critical_indicators):
             logger.error("Scraping warning/checkpoint detected in URL: %s", final_url)
             self.status_message.emit(
-                "⚠️ Safety checkpoint triggered. Inspection paused to safeguard account."
+                "🛑 Safety checkpoint triggered. Inspection paused to safeguard account."
             )
             self.cancel()
             return False
 
         if any(ind in response_text for ind in critical_indicators):
             logger.error(
-                "Action block / challenge detected in payload (feedback_required). Halting worker."
+                "Action block / challenge detected in payload (feedback_required). Halting worker immediately."
             )
             self.status_message.emit(
-                "🛑 Action block triggered (feedback_required). Paused to protect your account."
+                "🛑 Action block triggered (feedback_required). Inspection halted to protect your account."
             )
             self.cancel()
             return False
 
         if status_code == 429:
             logger.warning(
-                "HTTP 429 Too Many Requests detected. Activating circuit breaker."
+                "HTTP 429 Too Many Requests detected. Tripping circuit breaker."
             )
             self.status_message.emit(
-                "⚠️ HTTP 429 (Too Many Requests). Pausing inspection to protect account."
+                "⚠️ HTTP 429 (Too Many Requests). Halting inspection to protect account."
             )
             self.cancel()
             return False
@@ -731,7 +731,7 @@ class InspectWorker(QThread):
         require_auth: bool = False,
         fatal_429: bool = True,
     ) -> Optional[Dict[str, Any]]:
-        """Centralized HTTP request handler with decompression and fault isolation."""
+        """Centralized HTTP request handler with fault isolation and error payload inspection."""
         if self.is_cancelled:
             return None
 
@@ -821,14 +821,14 @@ class InspectWorker(QThread):
             except Exception:
                 pass
 
-            # Critical: Check error response body for action blocks/checkpoints
+            # Inspect error payload for action blocks before handling error code
             if not self._is_safe_response(e.url or url, err_body, e.code):
                 return None
 
             if e.code == 429:
                 if fatal_429:
                     self.status_message.emit(
-                        "⚠️ [Rate Limit] HTTP 429: Too Many Requests. Pausing to protect account."
+                        "⚠️ [Rate Limit] HTTP 429: Too Many Requests. Halting to protect account."
                     )
                     self.cancel()
                 else:
@@ -1097,6 +1097,16 @@ class InspectWorker(QThread):
         except (ValueError, TypeError):
             numeric_uid = 0
 
+        # Ensure ResilientSession is instantiated with active session cookies
+        if not hasattr(self, "resilient_session") or self.resilient_session is None:
+            cookie_dict: Dict[str, str] = {}
+            if self.cookie_str:
+                for pair in self.cookie_str.split(";"):
+                    if "=" in pair:
+                        k, v = pair.strip().split("=", 1)
+                        cookie_dict[k.strip()] = v.strip()
+            self.resilient_session = ResilientSession(cookies=cookie_dict)
+
         while has_next_page and pages < max_pages and not self.is_cancelled:
             if (
                 self.max_items_per_profile > 0
@@ -1104,7 +1114,7 @@ class InspectWorker(QThread):
             ):
                 break
 
-            variables = {
+            variables: Dict[str, Any] = {
                 "data": {
                     "include_feed_video": True,
                     "page_size": max_items,
@@ -1123,7 +1133,7 @@ class InspectWorker(QThread):
                     friendly_name=FRIENDLY_NAME_CLIPS,
                 )
             except PermissionError as pe:
-                self.status_message.emit(f"🛑 [Rate Limit] {pe}")
+                self.status_message.emit(f"🛑 [Security Alert] {pe}")
                 self.cancel()
                 break
             except Exception as exc:
