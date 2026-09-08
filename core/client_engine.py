@@ -53,8 +53,23 @@ class ResilientSession:
     INFRASTRUCTURE_FAILURE_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
     CRITICAL_AUTH_FAILURE_CODES: frozenset[int] = frozenset({401, 403})
 
+    HARD_ACTION_BLOCK_SIGNALS: frozenset[str] = frozenset(
+        {
+            "feedback_required",
+            "checkpoint_required",
+            "checkpoint_url",
+            "challenge_required",
+            "challenge_context",
+            "consent_required",
+            "is_spam",
+            "scraping_warning",
+            "action_blocked",
+        }
+    )
+
     ACTION_BLOCK_SIGNALS: frozenset[str] = frozenset(
         {
+            *HARD_ACTION_BLOCK_SIGNALS,
             "feedback_required",
             "checkpoint_required",
             "checkpoint_url",
@@ -200,19 +215,23 @@ class ResilientSession:
     def _record_failure(
         self, status_code: int, response_text: str = "", was_authenticated: bool = False
     ) -> None:
-        """Inspects failure conditions and quarantines tainted sessions without deadlocking the app."""
+        """Inspects failure conditions and quarantines tainted sessions without deadlocking public pipelines."""
         with self._lock:
             now = time.time()
             lowered_text = response_text.lower()
-            is_action_block = any(
-                sig in lowered_text for sig in self.ACTION_BLOCK_SIGNALS
-            )
             is_rate_limit = status_code == 429
             is_auth_failure = status_code in self.CRITICAL_AUTH_FAILURE_CODES
 
-            # If action block occurred on an authenticated call, quarantine the bad cookies
+            is_hard_action_block = any(
+                sig in lowered_text for sig in self.HARD_ACTION_BLOCK_SIGNALS
+            )
+            is_generic_action_block = any(
+                sig in lowered_text for sig in self.ACTION_BLOCK_SIGNALS
+            )
+
+            # Case A: Authenticated session rejected by challenge or rate limit -> Quarantine cookies
             if (
-                (is_action_block or is_rate_limit)
+                (is_generic_action_block or is_rate_limit)
                 and was_authenticated
                 and not self.cookies_quarantined
             ):
@@ -220,13 +239,21 @@ class ResilientSession:
                     "⚠️ [Cookie Quarantine] Active session cookies rejected by Meta (HTTP %d, action_block=%s). "
                     "Quarantining cookies and downgrading session to Public Mode.",
                     status_code,
-                    is_action_block,
+                    is_generic_action_block,
                 )
                 self.cookies_quarantined = True
                 return
 
-            # If unauthenticated request encounters 429 or action block, trip the global circuit breaker
-            if is_action_block or is_rate_limit:
+            # Case B: Unauthenticated request encountering HTTP 401/403 login wall -> Expected public boundary
+            if not was_authenticated and is_auth_failure:
+                logger.debug(
+                    "Unauthenticated request encountered HTTP %d auth gate; bypassing circuit breaker trip.",
+                    status_code,
+                )
+                return
+
+            # Case C: Genuine IP-level blocks (HTTP 429 or Hard Checkpoints) -> Trip global circuit breaker
+            if is_rate_limit or is_hard_action_block:
                 logger.error(
                     "CRITICAL: Unauthenticated WAF action block or HTTP 429 detected (status=%d). "
                     "Tripping circuit breaker immediately to OPEN.",
@@ -237,7 +264,7 @@ class ResilientSession:
                 self.last_state_change = now
                 return
 
-            if is_auth_failure:
+            if is_auth_failure and was_authenticated:
                 self.failure_counter += 1
                 if self.failure_counter >= self.circuit_config.failure_threshold:
                     self.trip_circuit_breaker(
@@ -362,11 +389,20 @@ class ResilientSession:
                 return status_code, final_url, resp_headers, text
 
             self._record_failure(status_code, text, was_authenticated=effective_auth)
+
+            # Tripwire enforcement: Only 429 and Hard Checkpoints trigger terminal PermissionError
             if status_code == 429 and not effective_auth:
                 raise PermissionError("Rate limit / HTTP 429 Tripwire triggered.")
-            for signal in self.ACTION_BLOCK_SIGNALS:
-                if signal in text.lower() and not effective_auth:
-                    raise PermissionError(f"Action block challenge triggered: {signal}")
+
+            if (
+                not effective_auth
+                and status_code not in self.CRITICAL_AUTH_FAILURE_CODES
+            ):
+                for signal in self.HARD_ACTION_BLOCK_SIGNALS:
+                    if signal in text.lower():
+                        raise PermissionError(
+                            f"Action block challenge triggered: {signal}"
+                        )
 
             return status_code, final_url, resp_headers, text
 
@@ -492,7 +528,7 @@ class ResilientSession:
 
         if status_code != 200:
             lowered = text.lower()
-            if any(sig in lowered for sig in self.ACTION_BLOCK_SIGNALS):
+            if any(sig in lowered for sig in self.HARD_ACTION_BLOCK_SIGNALS):
                 raise PermissionError(
                     f"Action block in GraphQL response ({friendly_name}): {text[:200]}"
                 )
