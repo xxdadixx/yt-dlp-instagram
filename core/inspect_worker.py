@@ -353,6 +353,100 @@ class YTDLPQuietLogger:
         pass
 
 
+def _find_graphql_nodes_recursive(
+    obj: Any, max_depth: int = 18
+) -> list[dict[str, Any]]:
+    """Recursively traverses arbitrary JSON/Relay trees to discover Instagram media nodes
+    regardless of nesting depth (__bbox, ScheduledServerJS, RelayPrefetchedStreamCache).
+
+    Defined at module scope to enable global recursive resolution under Python LEGB rules.
+    """
+    if max_depth <= 0:
+        return []
+    nodes: list[dict[str, Any]] = []
+
+    if isinstance(obj, dict):
+        is_media_node = (
+            ("shortcode" in obj or "code" in obj)
+            and ("id" in obj or "pk" in obj)
+            and any(
+                k in obj
+                for k in (
+                    "display_url",
+                    "video_url",
+                    "image_versions2",
+                    "video_versions",
+                    "edge_media_to_caption",
+                    "taken_at_timestamp",
+                    "media_type",
+                )
+            )
+        )
+        if is_media_node:
+            nodes.append(obj)
+        else:
+            for val in obj.values():
+                if isinstance(val, (dict, list)):
+                    nodes.extend(_find_graphql_nodes_recursive(val, max_depth - 1))
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                nodes.extend(_find_graphql_nodes_recursive(item, max_depth - 1))
+
+    return nodes
+
+
+def _extract_shortcodes_from_html(html_text: str) -> list[str]:
+    """Extracts valid post and reel shortcodes from SSR HTML markup and embedded script tags."""
+    if not html_text:
+        return []
+    candidates: list[str] = []
+
+    # 1. SSR anchor tags (/p/{code}, /reel/{code}, /reels/{code})
+    candidates.extend(
+        re.findall(
+            r"/(?:p|reel|reels)/([a-zA-Z0-9_\-]{9,15})/?", html_text, re.IGNORECASE
+        )
+    )
+
+    # 2. JSON key-value patterns ("shortcode": "...", "code": "...")
+    candidates.extend(
+        re.findall(
+            r'["\'](?:shortcode|code)["\']\s*:\s*["\']([a-zA-Z0-9_\-]{9,15})["\']',
+            html_text,
+            re.IGNORECASE,
+        )
+    )
+
+    seen: set[str] = set()
+    ordered_codes: list[str] = []
+    reserved: frozenset[str] = frozenset(
+        {
+            "reels",
+            "reel",
+            "feed",
+            "stories",
+            "explore",
+            "channel",
+            "tagged",
+            "audio",
+            "direct",
+        }
+    )
+
+    for code in candidates:
+        cleaned = code.strip()
+        if (
+            cleaned not in seen
+            and cleaned.lower() not in reserved
+            and not cleaned.isdigit()
+        ):
+            seen.add(cleaned)
+            ordered_codes.append(cleaned)
+
+    return ordered_codes
+
+
 class InspectWorker(QThread):
     progress = pyqtSignal(int)
     item_found = pyqtSignal(dict)
@@ -363,9 +457,9 @@ class InspectWorker(QThread):
     inspection_finished = pyqtSignal(int)
     error_occurred = pyqtSignal(str)
 
-    MAX_CONCURRENT_INSPECTS = 1
+    MAX_CONCURRENT_INSPECTS: int = 1
 
-    # Bind static helpers to the class definition for backward-compatible self-dispatch
+    # Bind module-level pure helpers to class namespace for backward compatibility
     _find_graphql_nodes_recursive = staticmethod(_find_graphql_nodes_recursive)
     _extract_shortcodes_from_html = staticmethod(_extract_shortcodes_from_html)
 
@@ -507,19 +601,25 @@ class InspectWorker(QThread):
         return None
 
     def _extract_from_embed_html(
-        self, html_text: str, shortcode: str, raw_target: str = ""
+        self,
+        html_text: str,
+        shortcode: str,
+        raw_target: str = "",
+        fallback_username: str = "",
     ) -> Optional[Dict[str, Any]]:
-        """Extracts media metadata from Instagram captioned embed HTML documents.
+        """Extracts media metadata from captioned embed HTML documents.
 
-        Supports window.__additionalDataLoaded payloads, application/json script tags,
-        and direct iframe DOM scraping when JSON data blocks are omitted by Meta.
+        Accurately identifies video streams vs. photo posts and assigns direct CDN
+        streaming endpoints to download_url without forcing video mode on images.
         """
+        import html
+
         if not html_text:
             return None
 
         media_data: Optional[Dict[str, Any]] = None
 
-        # 1. Extract payload from window.__additionalDataLoaded('/p/...', {...})
+        # 1. Extract payload from window.__additionalDataLoaded
         match_add_data = re.search(
             r"window\.__additionalDataLoaded\([^,]+,\s*(\{.+?\})\s*\);",
             html_text,
@@ -536,7 +636,7 @@ class InspectWorker(QThread):
             except Exception as exc:
                 logger.debug("Failed to decode __additionalDataLoaded payload: %s", exc)
 
-        # 2. Fallback: Search for JSON config embedded in application/json script tags
+        # 2. Fallback: Search for JSON config in application/json script tags
         if not media_data:
             match_script = re.search(
                 r'<script\s+type="application/json"[^>]*>(\{.*?"shortcode_media".*?\})</script>',
@@ -550,7 +650,7 @@ class InspectWorker(QThread):
                 except Exception:
                     pass
 
-        # 3. Fallback: Direct DOM parsing from iframe embed HTML
+        # 3. Direct DOM & Embed HTML parsing
         if not media_data:
             img_match = (
                 re.search(
@@ -570,91 +670,106 @@ class InspectWorker(QThread):
                 )
             )
 
-            if img_match:
-                thumb_url = img_match.group(1).replace("&amp;", "&")
-                username_match = re.search(
-                    r'<a[^>]+class=["\'][^"\']*UsernameText[^"\']*["\'][^>]*>([^<]+)</a>',
+            thumb_url = img_match.group(1).replace("&amp;", "&") if img_match else ""
+
+            # Check for authentic video element sources
+            video_match = (
+                re.search(r'<video[^>]+src=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                or re.search(r'<source[^>]+src=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+            )
+            extracted_video_url = video_match.group(1).replace("&amp;", "&") if video_match else ""
+
+            # Classify video strictly by the presence of video indicators, NOT self.profile_mode
+            is_video = bool(
+                extracted_video_url
+                or "EmbeddedMediaVideo" in html_text
+                or "video_url" in html_text
+                or "/reel/" in raw_target.lower()
+                or "/reels/" in raw_target.lower()
+            )
+
+            # Extract pure username handle
+            detected_user = ""
+            cap_user_match = re.search(
+                r'<a[^>]+class=["\'][^"\']*CaptionUsername[^"\']*["\'][^>]*>\s*@?([a-zA-Z0-9_\.]+)\s*</a>',
+                html_text,
+                re.IGNORECASE,
+            )
+            if cap_user_match:
+                detected_user = cap_user_match.group(1).strip()
+
+            if not detected_user:
+                header_href = re.search(
+                    r'<a[^>]+href=["\'](?:https?://(?:www\.)?instagram\.com)?/([a-zA-Z0-9_\.]+)/?(?:\?[^"\']*)?["\'][^>]*class=["\'][^"\']*(?:Username|Avatar|Header|CaptionUsername)[^"\']*["\']',
                     html_text,
                     re.IGNORECASE,
-                ) or re.search(
-                    r'<div[^>]+class=["\'][^"\']*HeaderAvatar[^"\']*["\'][^>]*>.*?<span[^>]*>([^<]+)</span>',
-                    html_text,
-                    re.DOTALL | re.IGNORECASE,
                 )
-                detected_user = (
-                    username_match.group(1).strip() if username_match else "instagram"
-                )
+                if header_href:
+                    candidate = header_href.group(1).strip()
+                    if candidate.lower() not in ("p", "reel", "reels", "tv", "stories", "explore"):
+                        detected_user = candidate
 
-                caption_match = re.search(
-                    r'<div[^>]+class=["\'][^"\']*Caption[^"\']*["\'][^>]*>(.*?)</div>',
-                    html_text,
-                    re.DOTALL | re.IGNORECASE,
-                )
-                raw_caption = ""
-                if caption_match:
-                    raw_caption = re.sub(r"<[^>]+>", "", caption_match.group(1)).strip()
+            if not detected_user or detected_user.lower() in ("instagram", "p", "reel"):
+                detected_user = fallback_username or "instagram"
 
-                is_video = (
-                    "EmbeddedMediaVideo" in html_text
-                    or "video_url" in html_text
-                    or "/reel/" in raw_target.lower()
-                    or "/reels/" in raw_target.lower()
-                    or self.profile_mode == "reels"
-                )
+            caption_match = re.search(
+                r'<div[^>]+class=["\'][^"\']*Caption[^"\']*["\'][^>]*>(.*?)</div>',
+                html_text,
+                re.DOTALL | re.IGNORECASE,
+            )
+            raw_caption = ""
+            if caption_match:
+                raw_caption = re.sub(r"<[^>]+>", "", caption_match.group(1)).strip()
+                raw_caption = html.unescape(raw_caption)
 
-                b_type = "REEL" if is_video else "IMAGE"
-                first_line = (
-                    raw_caption.splitlines()[0].strip()
-                    if raw_caption
-                    else f"Instagram {b_type} #{shortcode}"
-                )
+            b_type = "REEL" if is_video else "IMAGE"
+            first_line = (
+                raw_caption.splitlines()[0].strip()
+                if raw_caption
+                else f"Instagram {b_type} #{shortcode}"
+            )
 
-                self._current_sub_index += 1
-                return {
-                    "id": shortcode,
-                    "shortcode": shortcode,
-                    "title": first_line,
-                    "username": detected_user,
-                    "url": raw_target or f"{IG_BASE_URL}/p/{shortcode}/",
-                    "thumbnail_url": thumb_url,
-                    "video_url": "",
-                    "download_url": f"{IG_BASE_URL}/p/{shortcode}/",
-                    "caption": raw_caption,
-                    "duration": 0.0,
-                    "view_count": 0,
-                    "like_count": 0,
-                    "media_type": b_type,
-                    "is_video": is_video,
-                    "quality": self.quality_preset,
-                    "selected": True,
-                    "status": "ready",
-                    "target_index": getattr(self, "_current_target_index", 0),
-                    "sub_index": self._current_sub_index,
-                }
+            # Assign direct CDN endpoint to download_url
+            if is_video and extracted_video_url:
+                effective_download_url = extracted_video_url
+            elif thumb_url:
+                effective_download_url = thumb_url
+            else:
+                effective_download_url = raw_target or f"{IG_BASE_URL}/p/{shortcode}/"
+
+            self._current_sub_index += 1
+            return {
+                "id": shortcode,
+                "shortcode": shortcode,
+                "title": first_line,
+                "username": detected_user,
+                "url": raw_target or f"{IG_BASE_URL}/p/{shortcode}/",
+                "thumbnail_url": thumb_url,
+                "video_url": extracted_video_url,
+                "download_url": effective_download_url,
+                "caption": raw_caption,
+                "duration": 0.0,
+                "view_count": 0,
+                "like_count": 0,
+                "media_type": b_type,
+                "is_video": is_video,
+                "quality": self.quality_preset,
+                "selected": True,
+                "status": "ready",
+                "target_index": getattr(self, "_current_target_index", 0),
+                "sub_index": self._current_sub_index,
+            }
 
         if media_data and isinstance(media_data, dict):
-            cards = self._extract_media_cards(media_data, raw_target=raw_target)
+            cards = self._extract_media_cards(
+                media_data,
+                raw_target=raw_target,
+                fallback_username=fallback_username,
+            )
             if cards:
                 card = dict(cards[0])
-                if "img_index=" in raw_target:
-                    m_idx = re.search(r"img_index=(\d+)", raw_target)
-                    if m_idx:
-                        idx = int(m_idx.group(1))
-                        slides = card.get("slides", [])
-                        if isinstance(slides, list) and 1 <= idx <= len(slides):
-                            selected_slide = slides[idx - 1]
-                            card["thumbnail_url"] = selected_slide.get(
-                                "thumbnail_url"
-                            ) or card.get("thumbnail_url", "")
-                            card["download_url"] = selected_slide.get(
-                                "download_url"
-                            ) or card.get("download_url", "")
-                            if selected_slide.get("is_video"):
-                                card["video_url"] = selected_slide.get("video_url", "")
-                                card["media_type"] = "REEL"
-                            else:
-                                card["media_type"] = "IMAGE"
-                            card["title"] = f"{card.get('title', '')} (Slide {idx})"
+                if fallback_username and card.get("username") in ("", "instagram"):
+                    card["username"] = fallback_username
                 return card
 
         return None
@@ -1968,11 +2083,9 @@ class InspectWorker(QThread):
         raw_target: str = "",
         media_type: str = "POST",
         filter_mode: Optional[str] = None,
+        fallback_username: str = "",
     ) -> List[Dict[str, Any]]:
-        """Multi-tier post resolution: Public Embed -> Mobile API -> Authenticated Web JSON -> yt-dlp
-
-        with velocity backoff and fail-fast circuit-breaker tripwires.
-        """
+        """Multi-tier post resolution with fallback username preservation."""
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return []
 
@@ -1995,7 +2108,10 @@ class InspectWorker(QThread):
             )
             if status_code == 200 and html_text:
                 card = self._extract_from_embed_html(
-                    html_text, shortcode, raw_target=target_url
+                    html_text,
+                    shortcode,
+                    raw_target=target_url,
+                    fallback_username=fallback_username,
                 )
                 if card:
                     is_vid = bool(card.get("is_video"))
@@ -2038,7 +2154,9 @@ class InspectWorker(QThread):
                     and res_mobile.get("items")
                 ):
                     extracted = self._extract_media_cards(
-                        res_mobile["items"][0], raw_target=target_url
+                        res_mobile["items"][0],
+                        raw_target=target_url,
+                        fallback_username=fallback_username,
                     )
                     if extracted:
                         valid_items: List[Dict[str, Any]] = []
@@ -2079,7 +2197,9 @@ class InspectWorker(QThread):
                 )
                 if isinstance(media_data, dict):
                     extracted = self._extract_media_cards(
-                        media_data, raw_target=target_url
+                        media_data,
+                        raw_target=target_url,
+                        fallback_username=fallback_username,
                     )
                     if extracted:
                         valid_items: List[Dict[str, Any]] = []
@@ -2105,7 +2225,11 @@ class InspectWorker(QThread):
         self._sleep_interruptible(random.uniform(1.2, 1.8))
 
         # Tier 3: yt-dlp Engine Fallback
-        self._inspect_via_ytdlp(target_url, filter_mode=filter_mode or "all")
+        self._inspect_via_ytdlp(
+            target_url,
+            default_username=fallback_username,
+            filter_mode=filter_mode or "all",
+        )
         return []
 
     def _fetch_timeline_graphql(
@@ -2237,102 +2361,10 @@ class InspectWorker(QThread):
 
         return found_count
 
-    def _find_graphql_nodes_recursive(
-        obj: Any, max_depth: int = 18
-    ) -> List[Dict[str, Any]]:
-        """Recursively traverses arbitrary JSON/Relay trees to discover Instagram media nodes
-
-        regardless of nesting (__bbox, ScheduledServerJS, RelayPrefetchedStreamCache).
-        Defined at module scope to enable recursive self-resolution under LEGB scoping rules.
-        """
-        if max_depth <= 0:
-            return []
-        nodes: List[Dict[str, Any]] = []
-
-        if isinstance(obj, dict):
-            is_media_node = (
-                ("shortcode" in obj or "code" in obj)
-                and ("id" in obj or "pk" in obj)
-                and any(
-                    k in obj
-                    for k in (
-                        "display_url",
-                        "video_url",
-                        "image_versions2",
-                        "video_versions",
-                        "edge_media_to_caption",
-                        "taken_at_timestamp",
-                        "media_type",
-                    )
-                )
-            )
-            if is_media_node:
-                nodes.append(obj)
-            else:
-                for val in obj.values():
-                    if isinstance(val, (dict, list)):
-                        nodes.extend(_find_graphql_nodes_recursive(val, max_depth - 1))
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, (dict, list)):
-                    nodes.extend(_find_graphql_nodes_recursive(item, max_depth - 1))
-
-        return nodes
-
-    def _extract_shortcodes_from_html(html_text: str) -> List[str]:
-        """Extracts valid post and reel shortcodes from SSR HTML markup and embedded script tags."""
-        if not html_text:
-            return []
-        candidates: List[str] = []
-
-        # 1. SSR anchor tags (/p/{code}, /reel/{code}, /reels/{code})
-        candidates.extend(
-            re.findall(
-                r"/(?:p|reel|reels)/([a-zA-Z0-9_\-]{9,15})/?", html_text, re.IGNORECASE
-            )
-        )
-
-        # 2. JSON key-value patterns ("shortcode": "...", "code": "...")
-        candidates.extend(
-            re.findall(
-                r'["\'](?:shortcode|code)["\']\s*:\s*["\']([a-zA-Z0-9_\-]{9,15})["\']',
-                html_text,
-                re.IGNORECASE,
-            )
-        )
-
-        seen: Set[str] = set()
-        ordered_codes: List[str] = []
-        reserved = frozenset(
-            {
-                "reels",
-                "reel",
-                "feed",
-                "stories",
-                "explore",
-                "channel",
-                "tagged",
-                "audio",
-                "direct",
-            }
-        )
-
-        for code in candidates:
-            cleaned = code.strip()
-            if (
-                cleaned not in seen
-                and cleaned.lower() not in reserved
-                and not cleaned.isdigit()
-            ):
-                seen.add(cleaned)
-                ordered_codes.append(cleaned)
-
-        return ordered_codes
-
     def _inspect_via_ytdlp(
         self, url: str, default_username: str = "", filter_mode: str = "all"
     ) -> None:
-        """Tier 4: yt-dlp flat extractor fallback with circuit-breaker protection."""
+        """Tier 4: yt-dlp flat extractor fallback extracting clean account handles from URLs."""
         if (
             self.is_cancelled
             or self.resilient_session.is_circuit_open
@@ -2398,13 +2430,28 @@ class InspectWorker(QThread):
                 if not entries:
                     return
 
-                uploader = (
-                    info.get("uploader")
-                    or entries[0].get("uploader")
-                    or default_username
-                    or "instagram"
-                )
+                first_entry = entries[0]
 
+                # Resolve actual handle from channel/uploader URL, skipping pure numeric IDs
+                uploader_handle = ""
+                for url_field in ("uploader_url", "channel_url"):
+                    u_val = str(first_entry.get(url_field) or info.get(url_field) or "")
+                    m = re.search(r"instagram\.com/([a-zA-Z0-9_\.]+)/?", u_val)
+                    if m and m.group(1).lower() not in ("p", "reel", "reels"):
+                        uploader_handle = m.group(1)
+                        break
+
+                if not uploader_handle:
+                    raw_id_candidate = str(first_entry.get("uploader_id") or info.get("uploader_id") or "").strip()
+                    if raw_id_candidate and not raw_id_candidate.isdigit():
+                        uploader_handle = raw_id_candidate
+
+                if not uploader_handle:
+                    raw_user_candidate = str(first_entry.get("uploader") or info.get("uploader") or "").strip()
+                    if re.match(r"^[a-zA-Z0-9_\.]{3,30}$", raw_user_candidate):
+                        uploader_handle = raw_user_candidate
+
+                uploader_handle = uploader_handle or default_username or "instagram"
                 t_idx = getattr(self, "_current_target_index", 0)
 
                 for idx, entry in enumerate(entries, start=1):
@@ -2450,7 +2497,7 @@ class InspectWorker(QThread):
                         "shortcode": item_code,
                         "title": entry.get("title")
                         or f"Instagram {badge_type} #{item_code}",
-                        "username": entry.get("uploader") or uploader,
+                        "username": uploader_handle,
                         "url": card_url,
                         "thumbnail_url": entry.get("thumbnail") or "",
                         "video_url": entry.get("url") if has_video else "",
@@ -2554,7 +2601,7 @@ class InspectWorker(QThread):
             )
 
     def _inspect_single_target(self, raw_target: str) -> None:
-        """Inspects an individual target URL across chained tiers with fail-fast circuit checks."""
+        """Inspects an individual target URL across chained tiers with fallback handle preservation."""
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return
 
@@ -2575,13 +2622,17 @@ class InspectWorker(QThread):
             return
 
         ttype = target.get("type")
-        username = target.get("username")
+        username = target.get("username") or ""
         shortcode = target.get("shortcode")
         t_idx = getattr(self, "_current_target_index", 0)
 
         # 1. Direct Post / Reel / Carousel
         if ttype in ("reel", "post", "carousel", "tv") and shortcode:
-            self._inspect_single_post(shortcode, raw_target=raw_target)
+            self._inspect_single_post(
+                shortcode,
+                raw_target=raw_target,
+                fallback_username=username,
+            )
 
         # 2. Instagram Story Inspection
         elif ttype in ("story", "story_user") and username:

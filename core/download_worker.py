@@ -375,7 +375,7 @@ class DownloadWorker(QThread):
         else:
             url = raw_url or str(item.get("download_url") or "")
 
-        clean_user = sanitize_filename(username, fallback="instagram_user")
+        clean_user = sanitize_filename(username, fallback="instagram")
         clean_code = sanitize_filename(shortcode, fallback="media")
         is_carousel = "carousel" in str(item.get("media_type", "")).lower() or bool(
             item.get("carousel_count")
@@ -479,7 +479,50 @@ class DownloadWorker(QThread):
 
                 prepared = str(ydl.prepare_filename(target_entry))
 
-                # If postprocessor converted audio, verify the resulting .mp3 container
+                # Extract handle rather than full display name
+                real_handle = ""
+                for u_field in ("uploader_url", "channel_url"):
+                    u_val = str(target_entry.get(u_field) or "")
+                    m = re.search(r"instagram\.com/([a-zA-Z0-9_\.]+)/?", u_val)
+                    if m and m.group(1).lower() not in ("p", "reel", "reels"):
+                        real_handle = m.group(1)
+                        break
+
+                if not real_handle:
+                    raw_id_candidate = str(
+                        target_entry.get("uploader_id") or ""
+                    ).strip()
+                    if raw_id_candidate and not raw_id_candidate.isdigit():
+                        real_handle = raw_id_candidate
+
+                is_current_invalid = (
+                    clean_user.lower() == "instagram"
+                    or clean_user.isdigit()
+                    or ("_" not in clean_user and " " in clean_user)
+                )
+
+                if (
+                    real_handle
+                    and real_handle.lower() != "instagram"
+                    and is_current_invalid
+                ):
+                    sanitized_real_user = sanitize_filename(
+                        real_handle, fallback="instagram"
+                    )
+                    dir_name, base_name = os.path.split(prepared)
+                    prefix_to_strip = f"{clean_user}_"
+                    if base_name.startswith(prefix_to_strip):
+                        new_base_name = (
+                            f"{sanitized_real_user}_{base_name[len(prefix_to_strip):]}"
+                        )
+                        renamed_path = os.path.join(dir_name, new_base_name)
+                        try:
+                            if os.path.isfile(prepared):
+                                os.replace(prepared, renamed_path)
+                                prepared = renamed_path
+                        except OSError as ren_err:
+                            logger.debug("Failed to rename yt-dlp file: %s", ren_err)
+
                 if self.quality_preset == "audio_only":
                     mp3_path = os.path.splitext(prepared)[0] + ".mp3"
                     if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
@@ -488,7 +531,6 @@ class DownloadWorker(QThread):
                 if os.path.isfile(prepared) and os.path.getsize(prepared) > 0:
                     return prepared
 
-                # Fallback directory scan for generated file matching base stem
                 stem = os.path.splitext(prepared)[0]
                 parent_dir = os.path.dirname(prepared)
                 if os.path.isdir(parent_dir):
@@ -502,7 +544,37 @@ class DownloadWorker(QThread):
                             return full_p
 
                 return prepared
+
         except Exception as exc:
+            # Automatic Photo Recovery: If yt-dlp fails with "No video formats found",
+            # recover the high-resolution photo from the thumbnail CDN stream
+            err_msg = str(exc)
+            if "No video formats found" in err_msg or "is not a video" in err_msg:
+                thumb = str(item.get("thumbnail_url") or "")
+                if (
+                    thumb
+                    and thumb.startswith("http")
+                    and any(cdn in thumb for cdn in ("cdninstagram.com", "fbcdn.net"))
+                ):
+                    logger.info(
+                        "yt-dlp identified non-video post. Recovering high-res image for %s...",
+                        shortcode,
+                    )
+                    fallback_img_path = self._build_filepath(
+                        item_or_username=username,
+                        shortcode=shortcode,
+                        ext="jpg",
+                    )
+                    streamed_img = self._download_direct_stream(
+                        thumb, fallback_img_path, index, total_items
+                    )
+                    if (
+                        streamed_img
+                        and os.path.isfile(streamed_img)
+                        and os.path.getsize(streamed_img) > 0
+                    ):
+                        return streamed_img
+
             if not self._is_cancelled:
                 logger.warning("yt-dlp download failed for %s: %s", url, exc)
             return ""
@@ -513,8 +585,35 @@ class DownloadWorker(QThread):
         if self._is_cancelled or self.isInterruptionRequested():
             return ""
 
-        username = str(item.get("username") or item.get("uploader") or "instagram_user")
-        shortcode = str(item.get("shortcode") or item.get("id") or f"media_{index}")
+        raw_user = str(item.get("username") or "").strip()
+        shortcode = str(
+            item.get("shortcode") or item.get("id") or f"media_{index}"
+        ).strip()
+
+        # Sanitize and resolve handle
+        is_numeric_id = raw_user.isdigit()
+        is_generic = raw_user.lower() in ("instagram", "instagram_user", "")
+        has_invalid_chars = bool(re.search(r"[^\w\.]", raw_user))
+
+        if is_numeric_id or is_generic or has_invalid_chars:
+            raw_url = str(item.get("url") or item.get("webpage_url") or "")
+            m_user = re.search(
+                r"instagram\.com/([a-zA-Z0-9_\.]+)/(?:p|reel|reels|tv)/",
+                raw_url,
+                re.IGNORECASE,
+            )
+            if m_user and m_user.group(1).lower() not in ("p", "reel", "reels", "tv"):
+                raw_user = m_user.group(1)
+            else:
+                caption = str(item.get("caption") or item.get("title") or "")
+                cap_match = re.match(r"^([a-zA-Z0-9_\.]{3,30})", caption)
+                if cap_match and cap_match.group(1).lower() != "instagram":
+                    raw_user = cap_match.group(1)
+                elif is_numeric_id or is_generic:
+                    raw_user = "instagram"
+
+        clean_user = re.sub(r"[^a-zA-Z0-9_\.]+", "_", raw_user).strip("_")
+        username = clean_user if clean_user else "instagram"
 
         # 1. Multi-Item Carousel -> Direct Stream Each Slide
         raw_slides: object = item.get("slides")
@@ -580,27 +679,27 @@ class DownloadWorker(QThread):
             or item.get("video_url")
             or ""
         )
+        thumb_url = str(item.get("thumbnail_url") or "")
 
+        # Reconcile media type
         if "is_video" in item:
             is_video = bool(item["is_video"])
         elif bool(item.get("video_url")):
             is_video = True
         else:
             media_type = str(item.get("type") or item.get("media_type") or "").upper()
-            if "VIDEO" in media_type or "REEL" in media_type:
-                is_video = True
-            elif "IMAGE" in media_type or "PHOTO" in media_type:
-                is_video = False
-            else:
-                clean_direct = direct_url.lower().split("?")[0]
-                is_image_url = (
-                    any(
-                        clean_direct.endswith(x)
-                        for x in (".jpg", ".jpeg", ".png", ".webp")
-                    )
-                    or "dst-jpg" in direct_url.lower()
-                )
-                is_video = not is_image_url
+            is_video = "VIDEO" in media_type or "REEL" in media_type
+
+        # If direct_url is a webpage URL and this item is a photo, use thumbnail_url as CDN target
+        is_web_url = any(
+            x in direct_url for x in ("/p/", "/reel/", "/reels/", "/tv/", "/stories/")
+        )
+        if (
+            (not direct_url or is_web_url)
+            and not is_video
+            and thumb_url.startswith("http")
+        ):
+            direct_url = thumb_url
 
         ext = (
             "mp3"
