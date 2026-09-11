@@ -73,7 +73,6 @@ class ResilientSession:
             "login_required",
             "rate limited",
             "please wait a few minutes",
-            "execution error",
         }
     )
 
@@ -214,7 +213,7 @@ class ResilientSession:
     def _record_failure(
         self, status_code: int, response_text: str = "", was_authenticated: bool = False
     ) -> None:
-        """Inspects failure conditions and immediately trips on rate limits or hard action blocks."""
+        """Inspects failure conditions and trips on rate limits or authentic action blocks."""
         with self._lock:
             lowered_text = response_text.lower()
             is_rate_limit = status_code == 429
@@ -232,12 +231,12 @@ class ResilientSession:
                     self.cookies_quarantined = True
                 return
 
-            # Quarantines tainted credentials on soft action blocks without deadlocking public pipelines
+            # Quarantines credentials ONLY on explicit account authentication challenges
             if was_authenticated and any(
                 sig in lowered_text for sig in self.ACTION_BLOCK_SIGNALS
             ):
                 logger.warning(
-                    "⚠️ [Cookie Quarantine] Active session cookies rejected by Meta (HTTP %d). "
+                    "⚠️ [Cookie Quarantine] Session challenged by Meta (HTTP %d). "
                     "Quarantining credentials and falling back to Public Mode.",
                     status_code,
                 )
@@ -259,9 +258,12 @@ class ResilientSession:
                     )
                 return
 
-            if not (
-                status_code in self.INFRASTRUCTURE_FAILURE_CODES or status_code == 0
-            ):
+            # Exclude standard GraphQL 400 Bad Request / doc_id errors from infrastructure tripping
+            if status_code == 400 and "execution error" in lowered_text:
+                logger.debug("GraphQL query schema/doc_id rejected (HTTP 400). Skipping infrastructure trip.")
+                return
+
+            if not (status_code in self.INFRASTRUCTURE_FAILURE_CODES or status_code == 0):
                 return
 
             if self.circuit_state == CircuitState.HALF_OPEN:
