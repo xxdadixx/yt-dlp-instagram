@@ -260,10 +260,14 @@ class ResilientSession:
 
             # Exclude standard GraphQL 400 Bad Request / doc_id errors from infrastructure tripping
             if status_code == 400 and "execution error" in lowered_text:
-                logger.debug("GraphQL query schema/doc_id rejected (HTTP 400). Skipping infrastructure trip.")
+                logger.debug(
+                    "GraphQL query schema/doc_id rejected (HTTP 400). Skipping infrastructure trip."
+                )
                 return
 
-            if not (status_code in self.INFRASTRUCTURE_FAILURE_CODES or status_code == 0):
+            if not (
+                status_code in self.INFRASTRUCTURE_FAILURE_CODES or status_code == 0
+            ):
                 return
 
             if self.circuit_state == CircuitState.HALF_OPEN:
@@ -405,10 +409,7 @@ class ResilientSession:
                     self.trip_circuit_breaker(f"Action block in payload ({signal})")
                     raise PermissionError(f"Action block challenge triggered: {signal}")
 
-            if status_code == 429:
-                self.trip_circuit_breaker("HTTP 429 Rate Limit encountered")
-                raise PermissionError("Rate limit / HTTP 429 Tripwire triggered.")
-
+            # Do NOT trip circuit breaker on raw HTTP 429; record failure and allow tier fallback
             if status_code == 200:
                 self._record_success()
                 return status_code, final_url, resp_headers, text
