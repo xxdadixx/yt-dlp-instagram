@@ -533,6 +533,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(350, self._process_clipboard)
 
     def _process_clipboard(self) -> None:
+        """Processes copied clipboard content and triggers immediate URL deck auto-scrolling."""
         if not self.auto_clipboard:
             return
         try:
@@ -550,8 +551,10 @@ class MainWindow(QMainWindow):
                     self.url_container.add_url_chip(u)
                 self.show_toast(self.tr_text("toast_pasted", count=len(urls)))
                 self.tab_widget.setCurrentIndex(1)
-        except Exception:
-            pass
+                # Resynchronize scroll viewport after tab switch
+                QTimer.singleShot(80, self.url_container.smooth_scroll_to_bottom)
+        except Exception as exc:
+            logger.debug("Clipboard processing error: %s", exc)
 
     def _on_urls_list_updated(self) -> None:
         count = self.url_container.count()
@@ -624,10 +627,7 @@ class MainWindow(QMainWindow):
         self._update_action_button_states()
 
     def add_card(self, item_data: Dict[str, Any]) -> None:
-        """Inserts media item into UI in O(log N) time using hierarchical binary search.
-
-        Guarantees that items appear in the order of the inspected URL queue.
-        """
+        """Inserts media item into UI in O(log N) time and smoothly scrolls it into view."""
         import bisect
 
         new_id = str(
@@ -664,6 +664,9 @@ class MainWindow(QMainWindow):
 
         self.update_selection_counter()
         self._update_action_button_states()
+
+        # Smoothly track and scroll newly inspected media cards into view
+        QTimer.singleShot(60, lambda: self.smooth_scroll_queue_to_card(card))
 
     def _on_card_clicked(
         self, card: MediaCard, modifiers: Optional[Qt.KeyboardModifier] = None
@@ -705,13 +708,60 @@ class MainWindow(QMainWindow):
 
         self.update_selection_counter()
 
+    def smooth_scroll_queue_to_card(self, card: MediaCard) -> None:
+        """Calculates precise card bounds and animates the viewport to bring it into focus."""
+        v_bar = self.scroll_area.verticalScrollBar()
+        if not v_bar or card not in self.cards:
+            return
+
+        self.scroll_widget.adjustSize()
+        card_geom = card.geometry()
+        card_top = card_geom.top()
+        card_bottom = card_geom.bottom()
+
+        viewport_h = self.scroll_area.viewport().height()
+        current_scroll = v_bar.value()
+
+        # If card extends beyond bottom of viewport, scroll to reveal it
+        if card_bottom > (current_scroll + viewport_h):
+            target_val = min(v_bar.maximum(), card_bottom - viewport_h + 14)
+        elif card_top < current_scroll:
+            target_val = max(0, card_top - 14)
+        else:
+            return  # Card is already fully visible
+
+        if (
+            self._queue_scroll_anim
+            and self._queue_scroll_anim.state() == QPropertyAnimation.State.Running
+        ):
+            self._queue_scroll_anim.stop()
+
+        self._queue_scroll_anim = QPropertyAnimation(v_bar, b"value", self)
+        self._queue_scroll_anim.setDuration(260)
+        self._queue_scroll_anim.setStartValue(current_scroll)
+        self._queue_scroll_anim.setEndValue(target_val)
+        self._queue_scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._queue_scroll_anim.start()
+
     def smooth_scroll_queue_to_bottom(self) -> None:
+        """Smoothly animates the Media Queue scroll area to the absolute bottom."""
         v_bar = self.scroll_area.verticalScrollBar()
         if not v_bar:
             return
+
+        self.scroll_widget.adjustSize()
         target_val = v_bar.maximum()
+        if target_val <= 0:
+            return
+
+        if (
+            self._queue_scroll_anim
+            and self._queue_scroll_anim.state() == QPropertyAnimation.State.Running
+        ):
+            self._queue_scroll_anim.stop()
+
         self._queue_scroll_anim = QPropertyAnimation(v_bar, b"value", self)
-        self._queue_scroll_anim.setDuration(350)
+        self._queue_scroll_anim.setDuration(280)
         self._queue_scroll_anim.setStartValue(v_bar.value())
         self._queue_scroll_anim.setEndValue(target_val)
         self._queue_scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)

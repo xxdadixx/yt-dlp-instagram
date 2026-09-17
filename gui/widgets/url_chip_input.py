@@ -11,10 +11,11 @@ from PyQt6.QtCore import (
     QEasingCurve,
     QEvent,
     QPropertyAnimation,
+    QRectF,
     QSize,
     Qt,
+    QTimer,
     pyqtSignal,
-    QRectF,
 )
 from PyQt6.QtGui import (
     QFont,
@@ -380,7 +381,8 @@ class URLChipInput(QWidget):
 
         if found_any:
             self.input_edit.clear()
-            self.smooth_scroll_to_bottom()
+            # Defer scroll so Qt layout updates container height first
+            QTimer.singleShot(60, self.smooth_scroll_to_bottom)
             return True
         return False
 
@@ -409,6 +411,8 @@ class URLChipInput(QWidget):
             self.list_layout.addWidget(card)
 
         self._sync_state()
+        # Ensure scroll fires whenever a chip is added (manual entry, paste, or clipboard)
+        QTimer.singleShot(60, self.smooth_scroll_to_bottom)
         return True
 
     def remove_url(self, url: str) -> None:
@@ -431,12 +435,25 @@ class URLChipInput(QWidget):
         self.urls_changed.emit()
 
     def smooth_scroll_to_bottom(self) -> None:
+        """Forces container geometry synchronization and smoothly scrolls to the latest URL chip."""
         v_bar = self.scroll_area.verticalScrollBar()
         if not v_bar:
             return
+
+        # Force Qt to calculate the newly added widget's geometry immediately
+        self.list_container.adjustSize()
         target_val = v_bar.maximum()
+        if target_val <= 0:
+            return
+
+        if (
+            self._scroll_anim
+            and self._scroll_anim.state() == QPropertyAnimation.State.Running
+        ):
+            self._scroll_anim.stop()
+
         self._scroll_anim = QPropertyAnimation(v_bar, b"value", self)
-        self._scroll_anim.setDuration(350)
+        self._scroll_anim.setDuration(280)
         self._scroll_anim.setStartValue(v_bar.value())
         self._scroll_anim.setEndValue(target_val)
         self._scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)

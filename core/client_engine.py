@@ -53,23 +53,25 @@ class ResilientSession:
     INFRASTRUCTURE_FAILURE_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
     CRITICAL_AUTH_FAILURE_CODES: frozenset[int] = frozenset({401, 403})
 
+    # Critical security signals that indicate a genuine account checkpoint or ban
     HARD_ACTION_BLOCK_SIGNALS: frozenset[str] = frozenset(
         {
-            "feedback_required",
             "checkpoint_required",
             "checkpoint_url",
             "challenge_required",
             "challenge_context",
             "consent_required",
-            "is_spam",
             "scraping_warning",
             "action_blocked",
         }
     )
 
+    # Informational / rate-limiting signals that quarantine cookies without freezing the session
     ACTION_BLOCK_SIGNALS: frozenset[str] = frozenset(
         {
             *HARD_ACTION_BLOCK_SIGNALS,
+            "feedback_required",
+            "is_spam",
             "login_required",
             "rate limited",
             "please wait a few minutes",
@@ -213,7 +215,10 @@ class ResilientSession:
     def _record_failure(
         self, status_code: int, response_text: str = "", was_authenticated: bool = False
     ) -> None:
-        """Inspects failure conditions and trips on rate limits or authentic action blocks."""
+        """Inspects failure conditions and increments failure counters toward the threshold.
+
+        Does NOT immediately trip the circuit breaker on a single HTTP 429.
+        """
         with self._lock:
             lowered_text = response_text.lower()
             is_rate_limit = status_code == 429
@@ -222,10 +227,10 @@ class ResilientSession:
             )
             is_auth_failure = status_code in self.CRITICAL_AUTH_FAILURE_CODES
 
-            # Fail-fast condition: IP-level rate limits or challenge blocks trip circuit globally
-            if is_rate_limit or is_hard_action_block:
+            # Fail-fast ONLY on genuine account checkpoints or challenge blocks
+            if is_hard_action_block:
                 self.trip_circuit_breaker(
-                    f"WAF Challenge/Rate Limit (status={status_code}, hard_block={is_hard_action_block})"
+                    f"WAF Challenge/Action Block (status={status_code}, signal=hard_block)"
                 )
                 if was_authenticated:
                     self.cookies_quarantined = True
@@ -236,8 +241,8 @@ class ResilientSession:
                 sig in lowered_text for sig in self.ACTION_BLOCK_SIGNALS
             ):
                 logger.warning(
-                    "⚠️ [Cookie Quarantine] Session challenged by Meta (HTTP %d). "
-                    "Quarantining credentials and falling back to Public Mode.",
+                    "⚠️ [Cookie Quarantine] Challenge detected (HTTP %d). "
+                    "Quarantining session credentials.",
                     status_code,
                 )
                 self.cookies_quarantined = True
@@ -250,11 +255,17 @@ class ResilientSession:
                 )
                 return
 
-            if is_auth_failure and was_authenticated:
+            # Handle HTTP 429 as an incremental strike, not an instant 60s lockdown
+            if is_rate_limit:
                 self.failure_counter += 1
+                logger.warning(
+                    "Rate limit encountered (HTTP 429). Strike %d of %d.",
+                    self.failure_counter,
+                    self.circuit_config.failure_threshold,
+                )
                 if self.failure_counter >= self.circuit_config.failure_threshold:
                     self.trip_circuit_breaker(
-                        f"Auth failure threshold reached ({status_code})"
+                        f"Rate limit threshold reached (HTTP 429, strikes={self.failure_counter})"
                     )
                 return
 
