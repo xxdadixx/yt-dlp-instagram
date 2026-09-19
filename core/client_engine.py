@@ -51,7 +51,8 @@ class ResilientSession:
     ASBD_ID: str = "129477"
 
     INFRASTRUCTURE_FAILURE_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
-    CRITICAL_AUTH_FAILURE_CODES: frozenset[int] = frozenset({401, 403})
+    # HTTP 403 is frequently returned by Instagram for WAF/routing errors; only 401 indicates expired auth
+    CRITICAL_AUTH_FAILURE_CODES: frozenset[int] = frozenset({401})
 
     # Critical security signals that indicate a genuine account checkpoint or ban
     # Critical security signals that indicate a genuine account checkpoint, action block, or WAF ban
@@ -239,7 +240,7 @@ class ResilientSession:
     ) -> None:
         """Inspects failure conditions and increments failure counters toward the threshold.
 
-        Never quarantines active cookies or locks the session on transient rate-limiting signals.
+        Never quarantines active cookies on HTTP 403 routing errors or when the response indicates an active login.
         """
         with self._lock:
             lowered_text = response_text.lower()
@@ -247,9 +248,23 @@ class ResilientSession:
             is_hard_action_block = any(
                 sig in lowered_text for sig in self.HARD_ACTION_BLOCK_SIGNALS
             )
-            is_auth_expired = any(
-                sig in lowered_text for sig in self.AUTH_EXPIRED_SIGNALS
-            ) or (status_code in self.CRITICAL_AUTH_FAILURE_CODES and was_authenticated)
+
+            # Verify if response explicitly confirms an active login context
+            is_explicitly_logged_in = (
+                "logged-in" in lowered_text and "not-logged-in" not in lowered_text
+            )
+
+            is_auth_expired = not is_explicitly_logged_in and (
+                any(sig in lowered_text for sig in self.AUTH_EXPIRED_SIGNALS)
+                or (
+                    status_code in self.CRITICAL_AUTH_FAILURE_CODES
+                    and was_authenticated
+                )
+                or (
+                    "/accounts/login/" in lowered_text
+                    and status_code in (302, 401, 403)
+                )
+            )
 
             # 1. Hard Checkpoint: Fail-fast and quarantine cookies only on genuine verification walls
             if is_hard_action_block:
@@ -288,10 +303,13 @@ class ResilientSession:
                     )
                 return
 
-            # Exclude standard GraphQL execution errors from tripping infrastructure breakers
-            if status_code == 400 and "execution error" in lowered_text:
+            # Exclude GraphQL schema mismatches or 403 Page Not Found errors from infrastructure lockouts
+            if (status_code in (400, 403)) and (
+                "execution error" in lowered_text or "page not found" in lowered_text
+            ):
                 logger.debug(
-                    "GraphQL query schema mismatch (HTTP 400). Skipping infrastructure trip."
+                    "GraphQL query rejected or routed to error page (HTTP %d). Skipping infrastructure trip.",
+                    status_code,
                 )
                 return
 
@@ -324,8 +342,13 @@ class ResilientSession:
         time.sleep(delay)
 
     def ensure_csrf_token(self) -> None:
-        """Handshakes with Instagram root over HTTP/2 to bootstrap CSRF and LSD tokens."""
-        if "csrftoken" in self.cookies and self.lsd_token:
+        """Handshakes with Instagram root over HTTP/2 to bootstrap CSRF and LSD tokens.
+
+        Bypasses network round-trip if valid session credentials already exist.
+        """
+        if "csrftoken" in self.cookies and (
+            self.has_session_cookies() or self.lsd_token
+        ):
             return
 
         try:
@@ -396,13 +419,14 @@ class ResilientSession:
                 self._auth_session if effective_auth else self._anon_session
             )
 
-            # Explicitly tunnel Cookie header over HTTP/2 to eliminate curl domain mismatch
+            # Prevent duplicate Cookie header collision over HTTP/2 by letting Session manage cookies natively
+            req_cookies: dict[str, str] | None = None
             if effective_auth:
-                cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
-                if cookie_str and "Cookie" not in merged_headers:
-                    merged_headers["Cookie"] = cookie_str
+                req_cookies = self.cookies
                 if "csrftoken" in self.cookies and "X-CSRFToken" not in merged_headers:
                     merged_headers["X-CSRFToken"] = self.cookies["csrftoken"]
+                # Ensure no manual Cookie header conflicts with curl_cffi cookie jar
+                merged_headers.pop("Cookie", None)
 
             try:
                 resp = active_session.request(
@@ -411,6 +435,7 @@ class ResilientSession:
                     headers=merged_headers,
                     data=data,
                     params=params,
+                    cookies=req_cookies,
                     timeout=timeout,
                     allow_redirects=True,
                 )
@@ -591,7 +616,7 @@ class ResilientSession:
         variables: dict[str, Any],
         friendly_name: str,
     ) -> dict[str, Any]:
-        """Executes an Instagram GraphQL Persisted Document query over HTTP/2 with LSD and Claim tokens."""
+        """Executes an Instagram GraphQL Persisted Document query over HTTP/2 with session isolation."""
         self._check_circuit()
         self.ensure_csrf_token()
         self.pace_request()
@@ -600,10 +625,13 @@ class ResilientSession:
             "doc_id": doc_id,
             "variables": json.dumps(variables, separators=(",", ":")),
         }
-        if self.lsd_token:
+
+        # Guard: Only attach LSD tokens on unauthenticated queries to prevent viewer context invalidation
+        is_auth = self.has_session_cookies()
+        if not is_auth and self.lsd_token:
             payload["lsd"] = self.lsd_token
 
-        headers = {
+        headers: dict[str, str] = {
             "Content-Type": "application/x-www-form-urlencoded",
             "X-FB-Friendly-Name": friendly_name,
             "X-IG-App-ID": self.WEB_APP_ID,
@@ -613,14 +641,14 @@ class ResilientSession:
             "Referer": "https://www.instagram.com/",
             "Origin": "https://www.instagram.com",
         }
-        if self.lsd_token:
+        if not is_auth and self.lsd_token:
             headers["X-FB-LSD"] = self.lsd_token
         if "csrftoken" in self.cookies:
             headers["X-CSRFToken"] = self.cookies["csrftoken"]
 
         status_code, _, _, text = self.request(
             method="POST",
-            url="https://www.instagram.com/graphql/query",
+            url="https://www.instagram.com/graphql/query/",
             headers=headers,
             data=payload,
             timeout=15.0,

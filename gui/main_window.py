@@ -1,10 +1,11 @@
 """
 gui/main_window.py - Instagram Pro Studio Main Window with Scaled High-DPI Workspace,
-Icon-Only Controls, Chronological Sorting, and Tab Navigation Counters.
+Icon-Only Controls, Chronological Sorting, Tab Navigation Counters, Auto-Clear, and Status HUD.
 """
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import os
@@ -20,6 +21,8 @@ os.environ["QT_LOGGING_RULES"] = (
 from PyQt6.QtCore import (
     QByteArray,
     QEasingCurve,
+    QEvent,
+    QObject,
     QPropertyAnimation,
     QSize,
     Qt,
@@ -53,6 +56,7 @@ from gui.widgets.log_viewer_widget import LogViewerWidget
 from gui.widgets.media_card import MediaCard
 from gui.widgets.modern_progress_bar import ModernProgressBar
 from gui.widgets.no_scroll_combo import NoScrollComboBox
+from gui.widgets.status_overlay import StatusOverlay
 from gui.widgets.url_chip_input import URLChipInput
 from utils.file_utils import get_app_dir
 from utils.logger import QtLogHandler
@@ -134,10 +138,11 @@ class MainWindow(QMainWindow):
         self.inspect_worker: Optional[InspectWorker] = None
         self.download_worker: Optional[DownloadWorker] = None
 
-        # Defaults
+        # Workspace Defaults & Flags
         self.save_folder: str = os.path.abspath("downloads")
         self.current_lang: str = "en"
         self.auto_clipboard: bool = True
+        self.auto_clear_downloaded: bool = False
         self.profile_mode: str = "all"
         self.quality_preset: str = "best_video"
         self._last_clipboard_text: str = ""
@@ -339,6 +344,25 @@ class MainWindow(QMainWindow):
 
         queue_bar.addStretch()
 
+        # Auto-Clear Completed Toggle Checkbox
+        self.chk_auto_clear = QCheckBox(self)
+        self.chk_auto_clear.setChecked(self.auto_clear_downloaded)
+        self.chk_auto_clear.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
+        self.chk_auto_clear.setStyleSheet(
+            """
+            QCheckBox {
+                color: #94A3B8;
+                spacing: 6px;
+                margin-right: 8px;
+            }
+            QCheckBox:hover {
+                color: #E2E8F0;
+            }
+            """
+        )
+        self.chk_auto_clear.stateChanged.connect(self._on_auto_clear_toggle)
+        queue_bar.addWidget(self.chk_auto_clear)
+
         # Select All (Icon Only - Scaled)
         self.btn_select_all = QPushButton(self)
         self.btn_select_all.setObjectName("GlassActionButton")
@@ -378,6 +402,11 @@ class MainWindow(QMainWindow):
         self.media_grid_layout.addStretch()
         self.scroll_area.setWidget(self.scroll_widget)
         queue_layout.addWidget(self.scroll_area, stretch=1)
+
+        # Viewport Floating Status Overlay
+        self.status_overlay = StatusOverlay(parent=self.scroll_area.viewport())
+        self.status_overlay.cancelled.connect(self._on_overlay_cancel_requested)
+        self.scroll_area.viewport().installEventFilter(self)
 
         self.tab_widget.addTab(queue_tab, "Media Queue (0)")
 
@@ -446,6 +475,31 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, self.start_download)
         QShortcut(QKeySequence(Qt.Key.Key_Enter), self, self.start_download)
 
+    def eventFilter(self, watched: Optional[QObject], event: Optional[QEvent]) -> bool:
+        """Dynamically updates status overlay geometry to span the full viewport on resize."""
+        if (
+            hasattr(self, "scroll_area")
+            and watched is self.scroll_area.viewport()
+            and event is not None
+            and event.type() == QEvent.Type.Resize
+            and hasattr(self, "status_overlay")
+        ):
+            self.status_overlay.reposition_in_parent()
+        return super().eventFilter(watched, event)
+
+    def _on_overlay_cancel_requested(self) -> None:
+        """Cooperative cancel handler initiated via overlay HUD cancel button."""
+        if self.inspect_worker and self.inspect_worker.isRunning():
+            self.inspect_worker.cancel()
+        if self.download_worker and self.download_worker.isRunning():
+            self.download_worker.cancel()
+        self.status_overlay.hide_overlay()
+
+    def _on_auto_clear_toggle(self, state: int) -> None:
+        """Persists auto-clear preference toggling."""
+        self.auto_clear_downloaded = state == 2 or state is True
+        self.save_settings()
+
     def clear_media_grid(self) -> None:
         self.clear_all_cards()
 
@@ -469,6 +523,17 @@ class MainWindow(QMainWindow):
         )
         self.chk_clipboard.setText(self.tr_text("auto_clipboard"))
         self.lbl_profile_filter.setText(self.tr_text("profile_filter_label"))
+
+        if hasattr(self, "chk_auto_clear"):
+            auto_clear_lbl = (
+                self.tr_text("auto_clear_downloaded")
+                if "auto_clear_downloaded" in TRANSLATIONS.get(self.current_lang, {})
+                else "Auto-Clear Done"
+            )
+            self.chk_auto_clear.setText(auto_clear_lbl)
+            self.chk_auto_clear.setToolTip(
+                "Automatically remove successfully downloaded items from queue"
+            )
 
         curr_mode_idx = self.combo_profile_mode.currentIndex()
         self.combo_profile_mode.blockSignals(True)
@@ -571,6 +636,7 @@ class MainWindow(QMainWindow):
     def start_inspection(self) -> None:
         if self.inspect_worker and self.inspect_worker.isRunning():
             self.inspect_worker.cancel()
+            self.status_overlay.hide_overlay()
             self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 18)
             self.btn_inspect.setToolTip(self.tr_text("inspect_media"))
             self.lbl_status.setText(self.tr_text("status_ready"))
@@ -590,6 +656,12 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.setCurrentIndex(0)
 
+        # Trigger Minimalist Full-Viewport HUD
+        self.status_overlay.show_overlay(
+            mode="inspect",
+            title="INSPECTING...",
+        )
+
         raw_limit_data = (
             self.combo_batch_limit.currentData()
             if hasattr(self, "combo_batch_limit")
@@ -608,7 +680,9 @@ class MainWindow(QMainWindow):
         )
         self.inspect_worker.item_found.connect(self.add_card)
         self.inspect_worker.progress.connect(self.progress_bar.setValue)
+        self.inspect_worker.progress.connect(self.status_overlay.update_progress)
         self.inspect_worker.status_message.connect(self.lbl_status.setText)
+        self.inspect_worker.status_message.connect(self.status_overlay.update_status)
         self.inspect_worker.status_message.connect(
             lambda msg: logger.info(f"[Inspect] {msg}")
         )
@@ -628,8 +702,6 @@ class MainWindow(QMainWindow):
 
     def add_card(self, item_data: Dict[str, Any]) -> None:
         """Inserts media item into UI in O(log N) time and smoothly scrolls it into view."""
-        import bisect
-
         new_id = str(
             item_data.get("id")
             or item_data.get("shortcode")
@@ -722,13 +794,12 @@ class MainWindow(QMainWindow):
         viewport_h = self.scroll_area.viewport().height()
         current_scroll = v_bar.value()
 
-        # If card extends beyond bottom of viewport, scroll to reveal it
         if card_bottom > (current_scroll + viewport_h):
             target_val = min(v_bar.maximum(), card_bottom - viewport_h + 14)
         elif card_top < current_scroll:
             target_val = max(0, card_top - 14)
         else:
-            return  # Card is already fully visible
+            return
 
         if (
             self._queue_scroll_anim
@@ -788,6 +859,7 @@ class MainWindow(QMainWindow):
         self._update_action_button_states()
 
     def on_inspection_finished(self, count: int) -> None:
+        self.status_overlay.hide_overlay()
         self.progress_bar.setValue(100)
         self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 18)
         self.btn_inspect.setToolTip(self.tr_text("inspect_media"))
@@ -803,6 +875,7 @@ class MainWindow(QMainWindow):
     def start_download(self) -> None:
         if self.download_worker and self.download_worker.isRunning():
             self.download_worker.cancel()
+            self.status_overlay.hide_overlay()
             self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 18)
             self.lbl_status.setText(self.tr_text("status_download_cancelled"))
             self.show_toast(self.tr_text("toast_download_cancelled"))
@@ -844,6 +917,12 @@ class MainWindow(QMainWindow):
         self._set_button_icon(self.btn_download_all, "stop", "#FFFFFF", 18)
         self.lbl_status.setText(self.tr_text("status_downloading", count=len(items)))
 
+        # Trigger Minimalist Full-Viewport HUD
+        self.status_overlay.show_overlay(
+            mode="download",
+            title=f"DOWNLOADING {len(items)} ITEM(S)...",
+        )
+
         self.download_worker = DownloadWorker(
             items=items,
             save_folder=self.save_folder,
@@ -853,6 +932,7 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.download_worker.progress.connect(self.progress_bar.setValue)
+        self.download_worker.progress.connect(self.status_overlay.update_progress)
         self.download_worker.item_started.connect(self._on_item_started)
         self.download_worker.item_finished.connect(self._on_item_finished)
         self.download_worker.finished.connect(self._on_download_finished)
@@ -868,6 +948,12 @@ class MainWindow(QMainWindow):
             )
             if cid == str(item_id):
                 card.set_status("downloading")
+                user_handle = str(card.item_data.get("username") or "media")
+                title_snip = str(card.item_data.get("title") or item_id)[:48]
+                self.status_overlay.update_target(
+                    f"Target: @{user_handle} • #{item_id}"
+                )
+                self.status_overlay.update_status(f"Streaming: {title_snip}...")
 
     def _on_item_finished(self, item_id: str, ok: bool) -> None:
         for card in self.cards:
@@ -883,6 +969,7 @@ class MainWindow(QMainWindow):
         self.update_selection_counter()
 
     def _on_download_finished(self, success_count: int) -> None:
+        self.status_overlay.hide_overlay()
         self._set_button_icon(self.btn_download_all, "download", "#FFFFFF", 18)
         self.progress_bar.setValue(100)
 
@@ -898,6 +985,10 @@ class MainWindow(QMainWindow):
                 self.tr_text("status_download_done", count=success_count)
             )
             self.show_toast(self.tr_text("status_download_done", count=success_count))
+
+            # Auto-clear completed cards smoothly after short dwell
+            if self.auto_clear_downloaded and success_count > 0:
+                QTimer.singleShot(500, lambda: self.clear_completed_cards(silent=True))
 
         self._update_action_button_states()
 
@@ -971,9 +1062,8 @@ class MainWindow(QMainWindow):
         selected_set = set(selected_cards)
         self.scroll_widget.setUpdatesEnabled(False)
         try:
-            # Atomic batch prune from internal indices
             retained_cards: List[MediaCard] = []
-            retained_keys: List[int] = []
+            retained_keys: List[tuple[int, int, int]] = []
 
             for card, sort_key in zip(self.cards, self._card_sort_keys):
                 if card in selected_set:
@@ -1012,7 +1102,7 @@ class MainWindow(QMainWindow):
             self.lbl_cookie_status.setText(self.tr_text("cookie_disconnected"))
             self.lbl_cookie_status.setStyleSheet("color: #A0A0B2;")
 
-    def clear_completed_cards(self) -> None:
+    def clear_completed_cards(self, silent: bool = False) -> None:
         """Batches removal of finished downloads with a single layout reflow pass."""
         completed_cards = [
             c
@@ -1021,18 +1111,19 @@ class MainWindow(QMainWindow):
             or getattr(c, "is_finished", False)
         ]
         if not completed_cards:
-            self.show_toast(
-                self.tr_text("toast_no_completed")
-                if "toast_no_completed" in TRANSLATIONS.get(self.current_lang, {})
-                else "No completed items to clear."
-            )
+            if not silent:
+                self.show_toast(
+                    self.tr_text("toast_no_completed")
+                    if "toast_no_completed" in TRANSLATIONS.get(self.current_lang, {})
+                    else "No completed items to clear."
+                )
             return
 
         completed_set = set(completed_cards)
         self.scroll_widget.setUpdatesEnabled(False)
         try:
             retained_cards: List[MediaCard] = []
-            retained_keys: List[int] = []
+            retained_keys: List[tuple[int, int, int]] = []
 
             for card, sort_key in zip(self.cards, self._card_sort_keys):
                 if card in completed_set:
@@ -1119,6 +1210,9 @@ class MainWindow(QMainWindow):
                     self.auto_clipboard = bool(
                         d.get("auto_clipboard", self.auto_clipboard)
                     )
+                    self.auto_clear_downloaded = bool(
+                        d.get("auto_clear_downloaded", self.auto_clear_downloaded)
+                    )
                     self.profile_mode = d.get("profile_mode", self.profile_mode)
                     self.quality_preset = d.get("quality_preset", self.quality_preset)
                     self._saved_geometry_hex = d.get("window_geometry", "")
@@ -1135,6 +1229,7 @@ class MainWindow(QMainWindow):
                 "save_folder": self.save_folder,
                 "language": self.current_lang,
                 "auto_clipboard": self.auto_clipboard,
+                "auto_clear_downloaded": self.auto_clear_downloaded,
                 "profile_mode": self.profile_mode,
                 "quality_preset": self.quality_preset,
                 "window_geometry": geometry_hex,
