@@ -125,8 +125,6 @@ class DownloadWorker(QThread):
     ) -> None:
         super().__init__(parent)
         raw_items: list[dict[str, object]] = list(items or queue_items or [])
-
-        # Strict Queue Order: Primary = URL Input Order (0 -> N); Secondary = Monotonic Chronological Order
         raw_items.sort(key=extract_queue_sort_key)
         self.items = raw_items
 
@@ -157,17 +155,18 @@ class DownloadWorker(QThread):
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-        headers: dict[str, str] = {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "X-IG-App-ID": IG_APP_ID,
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-        }
-        if self.cookie_str:
-            headers["Cookie"] = self.cookie_str
-
-        self.session.headers.update(headers)
+        # Base transport headers without persistent user credentials
+        self.session.headers.update(
+            {
+                "User-Agent": DEFAULT_USER_AGENT,
+                "X-IG-App-ID": IG_APP_ID,
+                "Accept": "*/*",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+            }
+        )
+        # Guarantee no residual Cookie header is shared across connection pools
+        self.session.headers.pop("Cookie", None)
 
     @property
     def is_cancelled(self) -> bool:
@@ -229,14 +228,21 @@ class DownloadWorker(QThread):
         return os.path.join(self.save_folder, filename)
 
     def _get_download_headers(self, url: str) -> dict[str, str]:
+        """Constructs headers isolating authentication cookies from CDN media streams."""
         headers: dict[str, str] = {
             "User-Agent": DEFAULT_USER_AGENT,
             "Accept": "*/*",
             "Accept-Encoding": "identity",
             "Connection": "keep-alive",
         }
-        is_cdn = any(domain in url for domain in ("cdninstagram.com", "fbcdn.net"))
-        if not is_cdn and self.cookie_str:
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname.lower() if parsed.hostname else ""
+        is_cdn = any(
+            hostname.endswith(domain)
+            for domain in ("cdninstagram.com", "fbcdn.net", "akamaihd.net")
+        )
+        # Transmit credentials strictly when querying private Instagram API/web endpoints
+        if not is_cdn and self.cookie_str and hostname.endswith("instagram.com"):
             headers["Cookie"] = self.cookie_str
         return headers
 

@@ -240,8 +240,11 @@ class ResilientSession:
     ) -> None:
         """Inspects failure conditions and increments failure counters toward the threshold.
 
-        Never quarantines active cookies on HTTP 403 routing errors or when the response indicates an active login.
+        Never records failure on HTTP 2xx success codes or active login contexts.
         """
+        if 200 <= status_code < 300:
+            return
+
         with self._lock:
             lowered_text = response_text.lower()
             is_rate_limit = status_code == 429
@@ -249,7 +252,6 @@ class ResilientSession:
                 sig in lowered_text for sig in self.HARD_ACTION_BLOCK_SIGNALS
             )
 
-            # Verify if response explicitly confirms an active login context
             is_explicitly_logged_in = (
                 "logged-in" in lowered_text and "not-logged-in" not in lowered_text
             )
@@ -266,7 +268,6 @@ class ResilientSession:
                 )
             )
 
-            # 1. Hard Checkpoint: Fail-fast and quarantine cookies only on genuine verification walls
             if is_hard_action_block:
                 self.trip_circuit_breaker(
                     f"Account Checkpoint / Verification Required (status={status_code})"
@@ -275,7 +276,6 @@ class ResilientSession:
                     self.cookies_quarantined = True
                 return
 
-            # 2. Session Invalidation: Quarantine credentials only when authentication explicitly expires
             if is_auth_expired and not is_rate_limit:
                 logger.warning(
                     "⚠️ [Cookie Quarantine] Session authentication expired (HTTP %d). "
@@ -285,7 +285,6 @@ class ResilientSession:
                 self.cookies_quarantined = True
                 return
 
-            # 3. Transient Throttles: Increment failure counter without quarantining cookies
             is_transient_throttle = is_rate_limit or any(
                 sig in lowered_text for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
             )
@@ -303,7 +302,6 @@ class ResilientSession:
                     )
                 return
 
-            # Exclude GraphQL schema mismatches or 403 Page Not Found errors from infrastructure lockouts
             if (status_code in (400, 403)) and (
                 "execution error" in lowered_text or "page not found" in lowered_text
             ):
@@ -399,7 +397,7 @@ class ResilientSession:
         timeout: float = 15.0,
         require_auth: bool = True,
     ) -> tuple[int, str, dict[str, str], str]:
-        """Unified HTTP dispatcher with session isolation, header synchronization, and fail-fast tripwires."""
+        """Unified HTTP dispatcher supporting full HTTP 2xx success ranges and fail-fast tripwires."""
         self._check_circuit()
 
         is_mocked_env = hasattr(urllib.request.urlopen, "assert_called") or hasattr(
@@ -410,7 +408,6 @@ class ResilientSession:
         merged_headers = dict(headers or {})
         effective_auth = require_auth and self.has_session_cookies()
 
-        # Synchronize dynamic claim header
         merged_headers.setdefault("X-IG-WWW-Claim", self.www_claim)
 
         # Primary Branch: curl_cffi HTTP/2 Chrome Impersonation
@@ -419,13 +416,11 @@ class ResilientSession:
                 self._auth_session if effective_auth else self._anon_session
             )
 
-            # Prevent duplicate Cookie header collision over HTTP/2 by letting Session manage cookies natively
             req_cookies: dict[str, str] | None = None
             if effective_auth:
                 req_cookies = self.cookies
                 if "csrftoken" in self.cookies and "X-CSRFToken" not in merged_headers:
                     merged_headers["X-CSRFToken"] = self.cookies["csrftoken"]
-                # Ensure no manual Cookie header conflicts with curl_cffi cookie jar
                 merged_headers.pop("Cookie", None)
 
             try:
@@ -458,9 +453,7 @@ class ResilientSession:
                 self._record_failure(0, str(exc), was_authenticated=effective_auth)
                 raise ConnectionError(f"Transport network fault: {exc}") from exc
 
-            # Fail-fast check on body challenges across all HTTP status codes (200, 400, 403, 429)
             lowered = text.lower()
-            # 1. Hard Checkpoints: Immediate tripwire lockdown to protect the Instagram account
             for signal in self.HARD_ACTION_BLOCK_SIGNALS:
                 if signal in lowered:
                     self.trip_circuit_breaker(
@@ -470,31 +463,46 @@ class ResilientSession:
                         self.cookies_quarantined = True
                     raise PermissionError(f"Action block challenge triggered: {signal}")
 
-            # 2. Transient Velocity Limits: Treat as an incremental strike, allowing tier fallbacks
-            is_transient = any(
-                sig in lowered for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
-            )
-            if is_transient:
-                logger.warning(
-                    "Transient velocity throttle in response body: %s", text[:120]
+            # Only evaluate transient blocks when status code is not 2xx
+            if not (200 <= status_code < 300):
+                is_json_fail = text.strip().startswith("{") and any(
+                    f'"{k}"' in lowered
+                    for k in (
+                        "feedback_required",
+                        "rate limited",
+                        "please wait a few minutes",
+                    )
                 )
-                self._record_failure(
-                    status_code if status_code != 200 else 429,
-                    text,
-                    was_authenticated=effective_auth,
-                )
-                return (
-                    (status_code if status_code != 200 else 429),
-                    final_url,
-                    resp_headers,
-                    text,
+                is_transient = (
+                    (
+                        status_code in (400, 429, 500, 502, 503)
+                        and any(
+                            sig in lowered for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
+                        )
+                    )
+                    or (status_code == 429)
+                    or is_json_fail
                 )
 
-            if status_code == 200:
-                self._record_success()
+                if is_transient:
+                    logger.warning(
+                        "Transient velocity throttle in response body (HTTP %d): %s",
+                        status_code,
+                        text[:120],
+                    )
+                    self._record_failure(
+                        status_code,
+                        text,
+                        was_authenticated=effective_auth,
+                    )
+                    return status_code, final_url, resp_headers, text
+
+                self._record_failure(
+                    status_code, text, was_authenticated=effective_auth
+                )
                 return status_code, final_url, resp_headers, text
 
-            self._record_failure(status_code, text, was_authenticated=effective_auth)
+            self._record_success()
             return status_code, final_url, resp_headers, text
 
         # Fallback Branch: urllib.request
@@ -567,7 +575,13 @@ class ResilientSession:
                             f"Action block challenge triggered: {signal}"
                         )
 
-                self._record_success()
+                if 200 <= status_code < 300:
+                    self._record_success()
+                else:
+                    self._record_failure(
+                        status_code, text, was_authenticated=effective_auth
+                    )
+
                 return status_code, final_url, resp_headers, text
 
         except urllib.error.HTTPError as exc:

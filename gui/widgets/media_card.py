@@ -398,9 +398,11 @@ class MediaCard(QFrame):
     selection_changed = pyqtSignal(bool)
     deleted = pyqtSignal(object)
 
-    def __init__(self, media_item: dict, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self, media_item: dict[str, Any], parent: Optional[QWidget] = None
+    ) -> None:
         super().__init__(parent)
-        self.item_data: Dict[str, Any] = media_item or {}
+        self.item_data: dict[str, Any] = media_item or {}
         self._is_selected: bool = bool(self.item_data.get("selected", True))
         self.item_id: str = str(
             self.item_data.get("id")
@@ -412,25 +414,21 @@ class MediaCard(QFrame):
         self.thumb_loader: Optional[ThumbnailLoader] = None
         self._is_cleaned_up: bool = False
 
-        # Specular and Hover Motion State
         self._hover_progress: float = 0.0
         self._cursor_pos: QPointF = QPointF(-200.0, -200.0)
         self._is_hovered: bool = False
-        self._is_pressed: bool = False
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setObjectName("LiquidMediaCard")
         self.setFixedHeight(104)
 
-        # Ambient Atmospheric Occlusion Shadow
         self._tray_glow = QGraphicsDropShadowEffect(self)
         self._tray_glow.setOffset(0, 4)
         self._tray_glow.setBlurRadius(14)
         self._tray_glow.setColor(QColor(0, 0, 0, 120))
         self.setGraphicsEffect(self._tray_glow)
 
-        # Hover Interpolation Animation
         self._anim = QPropertyAnimation(self, b"hoverProgress", self)
         self._anim.setDuration(220)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -447,8 +445,6 @@ class MediaCard(QFrame):
     @hoverProgress.setter
     def hoverProgress(self, val: float) -> None:
         self._hover_progress = val
-
-        # Choreographed shadow bloom based on selection and hover progress
         if self._is_selected:
             blur = 16.0 + (8.0 * val)
             alpha = int(75 + (55 * val))
@@ -572,10 +568,10 @@ class MediaCard(QFrame):
 
         likes = self.item_data.get("like_count") or 0
         views = self.item_data.get("view_count") or 0
-        meta_parts = []
-        if likes > 0:
+        meta_parts: list[str] = []
+        if isinstance(likes, int) and likes > 0:
             meta_parts.append(f"❤️ {likes:,}")
-        if views > 0:
+        if isinstance(views, int) and views > 0:
             meta_parts.append(f"👁️ {views:,}")
         meta_str = " • ".join(meta_parts) if meta_parts else f"ID: {self.item_id[:12]}"
 
@@ -600,55 +596,143 @@ class MediaCard(QFrame):
         self.lbl_status = QLabel(self)
         self.lbl_status.setFont(self._get_app_font(size=9, bold=True))
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setMinimumWidth(80)
         self.set_status(self.status)
         action_col.addWidget(self.lbl_status)
 
-        # Minimum 36x36px touch target bound compliant with M3 guidelines
         self.btn_delete = QPushButton("✕", self)
-        self.btn_delete.setObjectName("CardDeleteButton")
-        self.btn_delete.setFixedSize(36, 36)
+        self.btn_delete.setFixedSize(28, 28)
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_delete.setFont(self._get_app_font(size=10, bold=True))
+        self.btn_delete.setToolTip("Remove from queue")
         self.btn_delete.setStyleSheet(
             """
-            QPushButton#CardDeleteButton {
-                background-color: rgba(255, 255, 255, 0.04);
-                color: #71717A;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 18px;
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.05);
+                color: #94A3B8;
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 14px;
+                font-size: 12px;
+                font-weight: bold;
                 padding: 0px;
-                font-size: 13px;
             }
-            QPushButton#CardDeleteButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #EF4444, stop:1 #DC2626);
-                color: #FFFFFF;
-                border: 1px solid #FFA5A5;
-            }
-            QPushButton#CardDeleteButton:pressed {
-                background: #991B1B;
-                color: #FECACA;
-            }
-            QPushButton#CardDeleteButton:disabled {
-                background-color: transparent !important;
-                color: #383842 !important;
-                border: 1px solid rgba(255, 255, 255, 0.02) !important;
+            QPushButton:hover {
+                background-color: rgba(239, 68, 68, 0.25);
+                color: #FF8080;
+                border-color: rgba(239, 68, 68, 0.6);
             }
             """
         )
-        self.btn_delete.clicked.connect(lambda: self.deleted.emit(self))
+        self.btn_delete.clicked.connect(self._on_delete_clicked)
         action_col.addWidget(self.btn_delete)
 
         layout.addLayout(action_col)
 
     def _set_children_transparent(self) -> None:
-        for label in (
+        """Ensures clicks on textual and decorative children propagate to the container."""
+        for child in (
             self.lbl_title,
             self.lbl_username,
             self.lbl_badge,
             self.lbl_meta,
             self.lbl_status,
         ):
-            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def _on_delete_clicked(self) -> None:
+        self.deleted.emit(self)
+
+    def set_status(self, status: str) -> None:
+        self.status = status.lower()
+        self.item_data["status"] = self.status
+        info = STATUS_STYLES.get(self.status, STATUS_STYLES["ready"])
+        self.lbl_status.setText(info["text"])
+        self.lbl_status.setStyleSheet(
+            f"""
+            QLabel {{
+                background-color: {info['bg']};
+                color: {info['color']};
+                border: 1px solid {info['border']};
+                border-radius: 6px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+            }}
+            """
+        )
+        self.update()
+
+    def set_selected(self, selected: bool) -> None:
+        if self._is_selected != selected:
+            self._is_selected = selected
+            self.item_data["selected"] = selected
+            self.hoverProgress = self._hover_progress
+            self.update_style()
+            self.selection_changed.emit(self._is_selected)
+
+    def toggle_selected(self) -> None:
+        self.set_selected(not self._is_selected)
+
+    def update_style(self) -> None:
+        self.update()
+
+    def get_item_data(self) -> dict[str, Any]:
+        return self.item_data
+
+    def _load_thumbnail(self) -> None:
+        thumb_url = str(self.item_data.get("thumbnail_url") or "")
+        if not thumb_url or not thumb_url.startswith("http"):
+            return
+        try:
+            self.thumb_loader = ThumbnailLoader(thumb_url, parent=self)
+            if hasattr(self.thumb_loader, "loaded"):
+                self.thumb_loader.loaded.connect(self._on_thumbnail_loaded)
+            elif hasattr(self.thumb_loader, "thumbnail_loaded"):
+                self.thumb_loader.thumbnail_loaded.connect(self._on_thumbnail_loaded)
+            if hasattr(self.thumb_loader, "start"):
+                self.thumb_loader.start()
+        except Exception as exc:
+            logger.debug("Failed to initialize ThumbnailLoader: %s", exc)
+
+    def _on_thumbnail_loaded(self, pixmap: QPixmap) -> None:
+        if not self._is_cleaned_up and pixmap and not pixmap.isNull():
+            self.lbl_thumb.set_thumbnail_pixmap(pixmap)
+
+    def open_image_gallery(self) -> None:
+        slides: list[dict[str, Any]] = self.item_data.get("slides") or []
+        image_urls: list[str] = []
+        if slides:
+            for s in slides:
+                url = str(s.get("download_url") or s.get("thumbnail_url") or "")
+                if url:
+                    image_urls.append(url)
+        else:
+            url = str(
+                self.item_data.get("download_url")
+                or self.item_data.get("thumbnail_url")
+                or ""
+            )
+            if url:
+                image_urls.append(url)
+
+        if image_urls:
+            title = str(self.item_data.get("title") or "Gallery Viewer")
+            dialog = ImageViewerDialog(image_urls, title=title, parent=self.window())
+            dialog.exec()
+
+    def cleanup(self) -> None:
+        self._is_cleaned_up = True
+        if self.thumb_loader:
+            try:
+                if hasattr(self.thumb_loader, "cancel"):
+                    self.thumb_loader.cancel()
+            except Exception:
+                pass
+            self.thumb_loader = None
+        if hasattr(self.lbl_thumb, "_preview_popup") and self.lbl_thumb._preview_popup:
+            self.lbl_thumb._preview_popup.hide()
+            self.lbl_thumb._preview_popup.deleteLater()
+            self.lbl_thumb._preview_popup = None
 
     def enterEvent(self, event) -> None:
         self._is_hovered = True
@@ -674,212 +758,63 @@ class MediaCard(QFrame):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._is_pressed = True
-            self.update()
             self.card_clicked.emit(self, event.modifiers())
             event.accept()
         else:
             super().mousePressEvent(event)
 
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._is_pressed:
-            self._is_pressed = False
-            self.update()
-        super().mouseReleaseEvent(event)
-
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         w, h = float(self.width()), float(self.height())
         rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
-        card_path = QPainterPath()
-        card_path.addRoundedRect(rect, 14.0, 14.0)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 14.0, 14.0)
 
-        # 1. Base Layer: Deep Frosted Acrylic Fill with dynamic elevation
+        # 1. Base Liquid Acrylic
         base_grad = QLinearGradient(0, 0, 0, h)
-        if self._is_pressed:
-            base_grad.setColorAt(0.0, QColor(18, 16, 26, 235))
-            base_grad.setColorAt(1.0, QColor(12, 11, 18, 245))
-        elif self._is_selected:
-            alpha_top = int(190 + (35 * self._hover_progress))
-            alpha_bot = int(220 + (25 * self._hover_progress))
-            base_grad.setColorAt(0.0, QColor(34, 26, 50, alpha_top))
-            base_grad.setColorAt(1.0, QColor(20, 17, 32, alpha_bot))
+        if self._is_selected:
+            base_grad.setColorAt(0.0, QColor(38, 22, 42, 230))
+            base_grad.setColorAt(1.0, QColor(22, 16, 28, 245))
         else:
-            alpha_top = int(175 + (30 * self._hover_progress))
-            alpha_bot = int(205 + (20 * self._hover_progress))
-            base_grad.setColorAt(0.0, QColor(26, 24, 38, alpha_top))
-            base_grad.setColorAt(1.0, QColor(15, 14, 22, alpha_bot))
+            base_grad.setColorAt(0.0, QColor(26, 24, 38, 200))
+            base_grad.setColorAt(1.0, QColor(15, 14, 22, 220))
+        painter.fillPath(path, base_grad)
 
-        painter.fillPath(card_path, base_grad)
-
-        # 2. Dynamic Specular Light (Interactive Cursor Tracking)
+        # 2. Specular Surface Reflection
         if self._hover_progress > 0 and self._cursor_pos.x() >= 0:
-            specular = QRadialGradient(self._cursor_pos, 180.0)
-            if self._is_selected:
-                specular.setColorAt(
-                    0.0, QColor(255, 255, 255, int(45 * self._hover_progress))
-                )
-                specular.setColorAt(
-                    0.4, QColor(225, 48, 108, int(30 * self._hover_progress))
-                )
-                specular.setColorAt(1.0, QColor(225, 48, 108, 0))
-            else:
-                specular.setColorAt(
-                    0.0, QColor(255, 255, 255, int(35 * self._hover_progress))
-                )
-                specular.setColorAt(
-                    0.5, QColor(131, 58, 180, int(20 * self._hover_progress))
-                )
-                specular.setColorAt(1.0, QColor(255, 255, 255, 0))
-
             painter.save()
-            painter.setClipPath(card_path)
-            painter.fillPath(card_path, specular)
+            painter.setClipPath(path)
+            specular = QRadialGradient(self._cursor_pos, 220.0)
+            specular.setColorAt(
+                0.0, QColor(255, 255, 255, int(22 * self._hover_progress))
+            )
+            specular.setColorAt(
+                0.5, QColor(225, 48, 108, int(15 * self._hover_progress))
+            )
+            specular.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillPath(path, specular)
             painter.restore()
 
-        # 3. Micro-Bevel Border with Top-Lit Specular Edge
+        # 3. Micro-Bevel Border / Selection Ring
         border_grad = QLinearGradient(0, 0, w, h)
         if self._is_selected:
-            alpha_edge = int(190 + (65 * self._hover_progress))
-            border_grad.setColorAt(0.0, QColor(255, 110, 160, alpha_edge))
             border_grad.setColorAt(
-                0.5, QColor(225, 48, 108, int(180 * self._hover_progress) + 60)
+                0.0, QColor(255, 117, 151, int(210 + 45 * self._hover_progress))
             )
-            border_grad.setColorAt(1.0, QColor(131, 58, 180, 100))
-            pen_width = 1.4 + (0.4 * self._hover_progress)
+            border_grad.setColorAt(0.5, QColor(225, 48, 108, 240))
+            border_grad.setColorAt(1.0, QColor(131, 58, 180, 180))
+            pen = QPen(border_grad, 1.6)
         else:
-            alpha_top = int(45 + (85 * self._hover_progress))
-            alpha_mid = int(15 + (45 * self._hover_progress))
-            alpha_bot = int(5 + (20 * self._hover_progress))
-            border_grad.setColorAt(0.0, QColor(255, 255, 255, alpha_top))
-            border_grad.setColorAt(0.6, QColor(225, 48, 108, alpha_mid))
-            border_grad.setColorAt(1.0, QColor(255, 255, 255, alpha_bot))
-            pen_width = 1.0 + (0.3 * self._hover_progress)
+            border_grad.setColorAt(
+                0.0, QColor(255, 255, 255, int(45 + 50 * self._hover_progress))
+            )
+            border_grad.setColorAt(
+                1.0, QColor(255, 255, 255, int(12 + 20 * self._hover_progress))
+            )
+            pen = QPen(border_grad, 1.0)
 
-        pen = QPen()
-        pen.setBrush(border_grad)
-        pen.setWidthF(pen_width)
         painter.setPen(pen)
-        painter.drawPath(card_path)
-
+        painter.drawPath(path)
         painter.end()
-
-    def set_selected(self, selected: bool) -> None:
-        if self._is_selected != selected:
-            self._is_selected = selected
-            self.item_data["selected"] = selected
-            self.update_style()
-            self.selection_changed.emit(self._is_selected)
-
-    def toggle_selected(self) -> None:
-        self.set_selected(not self._is_selected)
-
-    def update_style(self) -> None:
-        # Trigger hoverProgress setter to update drop shadow glow cleanly
-        self.hoverProgress = self._hover_progress
-
-    def set_status(self, status: str) -> None:
-        self.status = status
-        self.item_data["status"] = status
-        cfg = STATUS_STYLES.get(status.lower(), STATUS_STYLES["ready"])
-        self.lbl_status.setText(cfg["text"])
-        self.lbl_status.setStyleSheet(
-            f"""
-            QLabel {{
-                background-color: {cfg['bg']};
-                color: {cfg['color']};
-                border: 1px solid {cfg['border']};
-                border-radius: 6px;
-                padding: 4px 12px;
-                font-size: 11px;
-                font-weight: 700;
-            }}
-            """
-        )
-        if hasattr(self, "btn_delete"):
-            self.btn_delete.setEnabled(status.lower() != "downloading")
-
-    def _load_thumbnail(self) -> None:
-        thumb_url = self.item_data.get("thumbnail_url")
-        if not thumb_url:
-            slides = self.item_data.get("slides", [])
-            if slides and isinstance(slides[0], dict):
-                thumb_url = slides[0].get("thumbnail_url")
-
-        if not thumb_url:
-            self.lbl_thumb.setText("NO IMG")
-            return
-
-        self.thumb_loader = ThumbnailLoader(thumb_url, self)
-        self.thumb_loader.loaded.connect(self._set_thumbnail_pixmap)
-        self.thumb_loader.start()
-
-    def _set_thumbnail_pixmap(self, raw_bytes: bytes) -> None:
-        pix = QPixmap()
-        if not pix.loadFromData(QByteArray(raw_bytes)):
-            self.lbl_thumb.setText("NO IMG")
-            return
-        self.lbl_thumb.set_thumbnail_pixmap(pix)
-
-    def get_item_data(self) -> Dict[str, Any]:
-        return self.item_data
-
-    def cleanup(self) -> None:
-        self._is_cleaned_up = True
-        self._anim.stop()
-        if hasattr(self, "lbl_thumb") and getattr(
-            self.lbl_thumb, "_preview_popup", None
-        ):
-            self.lbl_thumb._preview_popup.hide()
-            self.lbl_thumb._preview_popup.deleteLater()
-            self.lbl_thumb._preview_popup = None
-
-        if self.thumb_loader is not None:
-            self.thumb_loader.cancel()
-            self.thumb_loader = None
-
-    def open_image_gallery(self) -> None:
-        slides = self.item_data.get("slides")
-        images: List[str] = []
-
-        if slides and isinstance(slides, list):
-            for s in slides:
-                if not s.get("is_video"):
-                    u = (
-                        s.get("download_url")
-                        or s.get("thumbnail_url")
-                        or s.get("display_url")
-                    )
-                    if (
-                        u
-                        and isinstance(u, str)
-                        and u.startswith("http")
-                        and u not in images
-                    ):
-                        images.append(u)
-
-        if not images:
-            single_img = (
-                self.item_data.get("thumbnail_url")
-                or self.item_data.get("download_url")
-                or self.item_data.get("display_url")
-            )
-            if (
-                single_img
-                and isinstance(single_img, str)
-                and single_img.startswith("http")
-            ):
-                images.append(single_img)
-
-        if images:
-            dlg = ImageViewerDialog(
-                image_urls=images,
-                title=str(
-                    self.item_data.get("title") or self.item_data.get("caption") or ""
-                ),
-                parent=self.window(),
-            )
-            dlg.exec()

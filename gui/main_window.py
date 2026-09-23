@@ -700,8 +700,8 @@ class MainWindow(QMainWindow):
         self.inspect_worker.start()
         self._update_action_button_states()
 
-    def add_card(self, item_data: Dict[str, Any]) -> None:
-        """Inserts media item into UI in O(log N) time and smoothly scrolls it into view."""
+    def add_card(self, item_data: dict[str, Any]) -> None:
+        """Inserts media item into UI in O(log N) time and queues a debounced layout refresh."""
         new_id = str(
             item_data.get("id")
             or item_data.get("shortcode")
@@ -717,7 +717,7 @@ class MainWindow(QMainWindow):
         card = MediaCard(item_data, parent=self)
         card.deleted.connect(lambda: self.remove_card(card))
         card.card_clicked.connect(self._on_card_clicked)
-        card.selection_changed.connect(self.update_selection_counter)
+        card.selection_changed.connect(self._schedule_ui_refresh)
 
         # Composite sort key: (target_index, -chrono_key, sub_index)
         sort_key = extract_queue_sort_key(item_data)
@@ -734,11 +734,34 @@ class MainWindow(QMainWindow):
         finally:
             self.scroll_widget.setUpdatesEnabled(True)
 
+        # Debounce O(N) card scans and smooth scroll animations to 50ms intervals
+        self._schedule_ui_refresh()
+        self._schedule_debounced_scroll(card)
+
+    def _schedule_ui_refresh(self) -> None:
+        if not hasattr(self, "_ui_refresh_timer"):
+            self._ui_refresh_timer = QTimer(self)
+            self._ui_refresh_timer.setSingleShot(True)
+            self._ui_refresh_timer.timeout.connect(self._execute_debounced_ui_refresh)
+        if not self._ui_refresh_timer.isActive():
+            self._ui_refresh_timer.start(50)
+
+    def _execute_debounced_ui_refresh(self) -> None:
         self.update_selection_counter()
         self._update_action_button_states()
 
-        # Smoothly track and scroll newly inspected media cards into view
-        QTimer.singleShot(60, lambda: self.smooth_scroll_queue_to_card(card))
+    def _schedule_debounced_scroll(self, card: MediaCard) -> None:
+        if not hasattr(self, "_scroll_debounce_timer"):
+            self._scroll_debounce_timer = QTimer(self)
+            self._scroll_debounce_timer.setSingleShot(True)
+            self._scroll_debounce_timer.timeout.connect(
+                lambda: self.smooth_scroll_queue_to_card(
+                    getattr(self, "_latest_added_card", card)
+                )
+            )
+        self._latest_added_card = card
+        if not self._scroll_debounce_timer.isActive():
+            self._scroll_debounce_timer.start(80)
 
     def _on_card_clicked(
         self, card: MediaCard, modifiers: Optional[Qt.KeyboardModifier] = None
@@ -808,7 +831,7 @@ class MainWindow(QMainWindow):
             self._queue_scroll_anim.stop()
 
         self._queue_scroll_anim = QPropertyAnimation(v_bar, b"value", self)
-        self._queue_scroll_anim.setDuration(260)
+        self._queue_scroll_anim.setDuration(220)
         self._queue_scroll_anim.setStartValue(current_scroll)
         self._queue_scroll_anim.setEndValue(target_val)
         self._queue_scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -1241,7 +1264,39 @@ class MainWindow(QMainWindow):
             logger.debug("Failed to save settings: %s", e)
 
     def closeEvent(self, event) -> None:
+        """Cooperatively signals running workers and waits for thread completion before window tear-down."""
         self.save_settings()
+
+        # 1. Halt and join InspectWorker
+        if self.inspect_worker and self.inspect_worker.isRunning():
+            logger.info(
+                "Main window closing: Cooperatively cancelling InspectWorker..."
+            )
+            self.inspect_worker.cancel()
+            if not self.inspect_worker.wait(1500):
+                logger.warning(
+                    "InspectWorker did not terminate within timeout; terminating thread."
+                )
+                self.inspect_worker.terminate()
+                self.inspect_worker.wait(500)
+
+        # 2. Halt and join DownloadWorker
+        if self.download_worker and self.download_worker.isRunning():
+            logger.info(
+                "Main window closing: Cooperatively cancelling DownloadWorker..."
+            )
+            self.download_worker.cancel()
+            if not self.download_worker.wait(1500):
+                logger.warning(
+                    "DownloadWorker did not terminate within timeout; terminating thread."
+                )
+                self.download_worker.terminate()
+                self.download_worker.wait(500)
+
+        # 3. Clean up MediaCard thumbnail loaders
+        for card in self.cards:
+            card.cleanup()
+
         super().closeEvent(event)
 
     def _update_action_button_states(self) -> None:
