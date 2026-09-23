@@ -648,7 +648,7 @@ class ResilientSession:
 
         status_code, _, _, text = self.request(
             method="POST",
-            url="https://www.instagram.com/graphql/query/",
+            url="https://www.instagram.com/graphql/query",
             headers=headers,
             data=payload,
             timeout=15.0,

@@ -108,6 +108,7 @@ from core.parser import (
 )
 
 # Instagram Web Client GraphQL Persisted Query Document IDs & Primary/Secondary Failovers
+FRIENDLY_NAME_CLIPS = "PolarisClipsTimelineProfileQuery"
 DOC_ID_USER_CLIPS = "8677440618991207"
 DOC_ID_USER_CLIPS_FALLBACKS: tuple[str, ...] = (
     "8677440618991207",
@@ -115,18 +116,18 @@ DOC_ID_USER_CLIPS_FALLBACKS: tuple[str, ...] = (
     "7659222234144632",
     "7350709088371300",
 )
-FRIENDLY_NAME_CLIPS = "PolarisClipsTimelineProfileQuery"
 
-DOC_ID_TIMELINE = "7095914977196024"
+FRIENDLY_NAME_TIMELINE = "PolarisProfilePostsTimelineQuery"
+DOC_ID_TIMELINE = "8552168934898494"
 DOC_ID_TIMELINE_FALLBACKS: tuple[str, ...] = (
+    "8552168934898494",
+    "9310860572338573",
     "7095914977196024",
     "6966144886812836",
-    "6047242945377598",
 )
-FRIENDLY_NAME_TIMELINE = "PolarisProfilePostsTimelineQuery"
 
-DOC_ID_PROFILE_INFO = "6047242945377598"
 FRIENDLY_NAME_PROFILE_INFO = "PolarisProfilePageHeaderQuery"
+DOC_ID_PROFILE_INFO = "6047242945377598"
 
 logger = logging.getLogger("InspectWorker")
 
@@ -349,6 +350,8 @@ class InstagramReelsResolver:
 
 
 class YTDLPQuietLogger:
+    """Redirects yt-dlp internal telemetry into the application log handler."""
+
     def debug(self, msg: str) -> None:
         pass
 
@@ -564,26 +567,40 @@ def _extract_nodes_from_html(html_text: str) -> list[dict[str, Any]]:
     if not html_text:
         return nodes
 
-    # 1. Parse JSON inside script tags
+    # 1. Parse JSON inside all script tags (including data-sjs and ScheduledServerJS)
     for match in re.finditer(
-        r'<script\s+type=["\']application/json["\'][^>]*>(.*?)</script>',
+        r"<script[^>]*>(.*?)</script>",
         html_text,
-        re.DOTALL,
+        re.DOTALL | re.IGNORECASE,
     ):
-        raw_json = match.group(1).strip()
-        if not raw_json or ("shortcode" not in raw_json and "code" not in raw_json):
-            continue
-        try:
-            parsed = json.loads(raw_json)
-            extracted = _find_graphql_nodes_recursive(parsed)
-            if extracted:
-                nodes.extend(extracted)
-        except Exception:
+        raw_script = match.group(1).strip()
+        if not raw_script or (
+            "shortcode" not in raw_script and "code" not in raw_script
+        ):
             continue
 
-    # 2. Extract shared data objects
+        # Direct JSON tag
+        if raw_script.startswith("{") and raw_script.endswith("}"):
+            try:
+                parsed = json.loads(raw_script)
+                extracted = _find_graphql_nodes_recursive(parsed)
+                if extracted:
+                    nodes.extend(extracted)
+            except Exception:
+                pass
+        else:
+            # Extract JSON objects inside require/ScheduledServerJS calls
+            for json_match in re.finditer(r'\{[^{}]*"shortcode"[^{}]*\}', raw_script):
+                try:
+                    obj = json.loads(json_match.group(0))
+                    if isinstance(obj, dict):
+                        nodes.append(obj)
+                except Exception:
+                    continue
+
+    # 2. Extract legacy window._sharedData and __additionalDataLoaded objects
     for pattern in (
-        r"window\._sharedData\s*=\s*(\{.+?\});</script>",
+        r"window\._sharedData\s*=\s*(\{.+?\});",
         r"window\.__additionalDataLoaded\([^,]+,\s*(\{.+?\})\s*\);",
     ):
         for m in re.finditer(pattern, html_text, re.DOTALL):
@@ -599,24 +616,27 @@ def _extract_nodes_from_html(html_text: str) -> list[dict[str, Any]]:
 
 
 def _extract_shortcodes_from_html(html_text: str) -> list[str]:
-    """Extracts post and reel shortcodes from SSR HTML markup, escaped JSON, and vanity paths."""
+    """Extracts post and reel shortcodes from SSR HTML markup, escaped JSON, and vanity paths.
+
+    Uses non-greedy bounds and explicit character classes to avoid path-separator collisions.
+    """
     if not html_text:
         return []
     candidates: list[str] = []
 
-    # 1. Universal URL paths with optional backslash escaping
+    # 1. Matches URLs like /p/C91abc-DEF/ or /reel/C91abc-DEF/ (with optional vanity prefixes)
     candidates.extend(
         re.findall(
-            r"(?:\\?/(?:[a-zA-Z0-9_\.]+\\?/)?(?:p|reel|reels)\\?/)([a-zA-Z0-9_\-]{9,15})",
+            r'(?:/|\\/)(?:p|reel|reels)(?:/|\\/)([a-zA-Z0-9_\-]{9,13})(?:[/?\\"]|$)',
             html_text,
             re.IGNORECASE,
         )
     )
 
-    # 2. JSON key-value patterns matching both standard and backslash-escaped quotes
+    # 2. JSON key-value pairs ("shortcode":"C91abc-DEF" or "code":"C91abc-DEF")
     candidates.extend(
         re.findall(
-            r'(?:\\*["\'])(?:shortcode|code)(?:\\*["\'])\s*:\s*(?:\\*["\'])([a-zA-Z0-9_\-]{9,15})(?:\\*["\'])',
+            r'["\'](?:shortcode|code)["\']\s*:\s*["\']([a-zA-Z0-9_\-]{9,13})["\']',
             html_text,
             re.IGNORECASE,
         )
@@ -635,6 +655,7 @@ def _extract_shortcodes_from_html(html_text: str) -> list[str]:
             "tagged",
             "audio",
             "direct",
+            "highlights",
         }
     )
 
@@ -644,6 +665,7 @@ def _extract_shortcodes_from_html(html_text: str) -> list[str]:
             cleaned not in seen
             and cleaned.lower() not in reserved
             and not cleaned.isdigit()
+            and len(cleaned) >= 9
         ):
             seen.add(cleaned)
             ordered_codes.append(cleaned)
@@ -1074,8 +1096,9 @@ class InspectWorker(QThread):
         referer: str = "https://www.instagram.com/",
         require_auth: bool = False,
         is_mobile: bool = False,
+        is_document: bool = False,
     ) -> Dict[str, str]:
-        """Construct browser-like or mobile HTTP headers with authenticated session propagation."""
+        """Constructs authentic browser, mobile, or document navigation HTTP headers."""
         if is_mobile:
             headers = {
                 "User-Agent": MOBILE_USER_AGENT,
@@ -1083,7 +1106,6 @@ class InspectWorker(QThread):
                 "Accept-Language": "en-US",
                 "Accept-Encoding": "gzip, deflate",
                 "X-IG-App-ID": IG_APP_ID,
-                "X-FB-HTTP-Engine": "Liger",
                 "Connection": "keep-alive",
             }
             if require_auth and self.cookie_str:
@@ -1092,20 +1114,38 @@ class InspectWorker(QThread):
                     headers["X-CSRFToken"] = self._csrf_token
             return headers
 
-        headers = {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "X-IG-App-ID": IG_APP_ID,
-            "X-ASBD-ID": "129477",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": referer,
-            "Origin": IG_BASE_URL,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
+        if is_document:
+            # Genuine browser document navigation headers (strips XMLHttpRequest and Origin)
+            headers = {
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate",
+                "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Upgrade-Insecure-Requests": "1",
+                "Referer": referer,
+            }
+        else:
+            # High-fidelity AJAX API headers
+            headers = {
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate",
+                "X-IG-App-ID": IG_APP_ID,
+                "X-ASBD-ID": "129477",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": referer,
+                "Origin": IG_BASE_URL,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            }
 
         if require_auth and self.cookie_str:
             headers["Cookie"] = self.cookie_str
@@ -1122,99 +1162,154 @@ class InspectWorker(QThread):
         return headers
 
     def _apply_tier_backoff(
-        self, tier_attempt: int, base: float = 1.5, max_delay: float = 5.0
+        self,
+        tier_attempt: int,
+        base: float = 2.0,
+        max_delay: float = 6.0,
+        is_throttled: bool = False,
     ) -> None:
-        """Applies decorrelated jitter backoff between inspection tier fallbacks to prevent velocity storming."""
+        """Applies decorrelated jitter backoff between inspection tier fallbacks.
+
+        If a prior tier encountered an HTTP 429 throttle, the cooldown ceiling
+        is doubled to allow the edge token bucket to refill.
+        """
         if self.is_cancelled:
             return
-        # Decorrelated jitter: delay = min(max_delay, uniform(base, base * 2 ** tier_attempt))
-        delay = min(
-            max_delay, random.uniform(base, base * (2.0 ** min(tier_attempt, 3)))
-        )
+
+        effective_base = base * (2.5 if is_throttled else 1.0)
+        effective_max = max_delay * (2.0 if is_throttled else 1.0)
+
+        # Full decorrelated jitter: delay = Uniform(effective_base, min(effective_max, effective_base * 2 ** tier))
+        upper_bound = min(effective_max, effective_base * (2.0 ** min(tier_attempt, 3)))
+        delay = random.uniform(effective_base, max(effective_base + 0.5, upper_bound))
+
         self._sleep_interruptible(delay, status_msg="🛡️ Pacing tier fallback transition")
 
-    def _is_safe_response(
-        self,
-        response_url: str,
-        response_text: str,
-        status_code: int,
-        fatal_429: bool = False,
-    ) -> bool:
-        """Circuit-breaker tripwire: Halts the worker thread ONLY on genuine account checkpoints.
+    def _fetch_user_clips_graphql(
+        self, username: str, user_id: str, max_items: int = 24
+    ) -> int:
+        """Paginates user Reels archive using PolarisClipsTimelineProfileQuery
 
-        Soft rate limits (feedback_required, is_spam, 429) return False to trigger the next fallback tier.
+        over HTTP/2 with persisted doc_id failover and unauthenticated safety guards.
         """
-        checkpoint_indicators = (
-            "/accounts/scraping_warning/",
-            "checkpoint_required",
-            "checkpoint_url",
-            "challenge_required",
-            "challenge_context",
-            "consent_required",
-        )
+        has_next_page = True
+        end_cursor: str | None = None
+        pages = 0
+        found_count = 0
+        max_pages = self._get_max_pages_ceiling(page_size=max_items)
 
-        final_url = response_url.lower()
-        lowered_text = response_text.lower()
+        uid_str = str(user_id).strip()
+        if not uid_str or not uid_str.isdigit():
+            logger.debug("[GraphQLClips] Non-numeric user ID provided: %s", user_id)
+            return 0
 
-        # Step 1: Detect account security checkpoints in URL redirects
-        if any(ind in final_url for ind in checkpoint_indicators):
-            logger.error("Account security checkpoint detected in URL: %s", final_url)
-            self.resilient_session.trip_circuit_breaker(
-                f"Checkpoint redirect: {final_url}"
+        # Persisted GraphQL clips queries require authenticated session cookies
+        if not self.resilient_session.has_session_cookies():
+            logger.info(
+                "[GraphQLClips] Bypassing GraphQL Clips query: Session cookies absent."
             )
+            return 0
+
+        while has_next_page and pages < max_pages and not self.is_cancelled:
+            if (
+                self.max_items_per_profile > 0
+                and len(self.seen_ids) >= self.max_items_per_profile
+            ):
+                break
+
+            # Relay Modern Spec: Pass target_user_id as numeric integer
+            numeric_uid = int(uid_str)
+            variables: dict[str, Any] = {
+                "data": {
+                    "include_feed_video": True,
+                    "page_size": max_items,
+                    "target_user_id": numeric_uid,
+                },
+                "after": end_cursor if end_cursor else None,
+                "before": None,
+                "first": max_items,
+                "last": None,
+            }
+
+            res: dict[str, Any] | None = None
+            for doc_id in DOC_ID_USER_CLIPS_FALLBACKS:
+                if self.is_cancelled or self.resilient_session.is_circuit_open:
+                    return found_count
+
+                try:
+                    res = self.resilient_session.execute_persisted_query(
+                        doc_id=doc_id,
+                        variables=variables,
+                        friendly_name=FRIENDLY_NAME_CLIPS,
+                    )
+                    if isinstance(res, dict) and res.get("data"):
+                        break
+                except PermissionError as pe:
+                    self.status_message.emit(f"🛑 [Security Alert] {pe}")
+                    self.cancel()
+                    return found_count
+                except Exception as exc:
+                    logger.debug("[GraphQLClips] doc_id=%s fault: %s", doc_id, exc)
+                    self._sleep_interruptible(random.uniform(0.8, 1.4))
+
+            if not isinstance(res, dict):
+                break
+
+            data_root = res.get("data", {}) if isinstance(res, dict) else {}
+            clips_conn = (
+                data_root.get("xdt_api__v1__clips__user__connection_v2")
+                or data_root.get("xdt_api__v1__clips__user__connection")
+                or data_root.get("user", {}).get("edge_felix_video_timeline")
+                or {}
+            )
+            edges = clips_conn.get("edges") if isinstance(clips_conn, dict) else None
+
+            if not isinstance(edges, list) or not edges:
+                break
+
+            for edge in edges:
+                if self.is_cancelled:
+                    return found_count
+                if not isinstance(edge, dict):
+                    continue
+
+                node = edge.get("node") if isinstance(edge.get("node"), dict) else edge
+                media = (
+                    node.get("media") if isinstance(node.get("media"), dict) else node
+                )
+
+                for card in self._extract_media_cards(
+                    media, fallback_username=username
+                ):
+                    card["media_type"] = "REEL"
+                    with self._lock:
+                        cid = str(card["id"])
+                        if cid not in self.seen_ids:
+                            self.seen_ids.add(cid)
+                            self.item_found.emit(card)
+                            self.media_found.emit(card)
+                            found_count += 1
+
+            page_info = (
+                clips_conn.get("page_info") if isinstance(clips_conn, dict) else {}
+            )
+            if isinstance(page_info, dict):
+                has_next_page = bool(page_info.get("has_next_page", False))
+                end_cursor = page_info.get("end_cursor")
+            else:
+                has_next_page = False
+                end_cursor = None
+
+            pages += 1
             self.status_message.emit(
-                "🛑 Account checkpoint triggered. Halting to protect account."
+                f"✓ [GraphQL Clips] Page {pages}: {len(self.seen_ids)} Reels found..."
             )
-            self.cancel()
-            return False
 
-        # Step 2: Detect hard verification blocks in payload markup
-        for ind in checkpoint_indicators:
-            if ind in lowered_text:
-                logger.error(
-                    "Hard checkpoint challenge detected in payload (%s). Halting worker.",
-                    ind,
-                )
-                self.resilient_session.trip_circuit_breaker(
-                    f"Checkpoint in payload ({ind})"
-                )
-                self.status_message.emit(
-                    "🛑 Account challenge triggered. Halting to protect your account."
-                )
-                self.cancel()
-                return False
+            if has_next_page and not self.is_cancelled:
+                self._apply_gaussian_pacing()
+                self._apply_macro_pacing(pages)
 
-        # Step 3: Handle soft velocity blocks by failing over to the next tier without aborting
-        soft_pushbacks = (
-            "feedback_required",
-            "is_spam",
-            "action_blocked",
-            "please wait a few minutes",
-        )
-        if any(ind in lowered_text for ind in soft_pushbacks):
-            logger.warning(
-                "Soft velocity throttle on endpoint %s. Failing over to subsequent tier.",
-                response_url,
-            )
-            return False
-
-        # Step 4: Rate limits (HTTP 429)
-        if status_code == 429:
-            logger.warning("HTTP 429 Rate Limit returned on endpoint %s", response_url)
-            if fatal_429:
-                self.resilient_session.trip_circuit_breaker(
-                    "HTTP 429 Rate Limit encountered"
-                )
-                self.status_message.emit(
-                    "⚠️ HTTP 429. Halting inspection to protect account."
-                )
-                self.cancel()
-            return False
-
-        if "/accounts/login/" in final_url or status_code in (401, 403):
-            return False
-
-        return True
+        return found_count
 
     def _fetch_user_clips_mobile(
         self, username: str, user_id: str, max_items: int = 24
@@ -1310,6 +1405,89 @@ class InspectWorker(QThread):
                 self._apply_macro_pacing(pages)
 
         return found_count
+
+    def _is_safe_response(
+        self,
+        response_url: str,
+        response_text: str,
+        status_code: int,
+        fatal_429: bool = False,
+    ) -> bool:
+        """Circuit-breaker tripwire: Halts the worker thread ONLY on genuine account checkpoints.
+
+        Soft rate limits (feedback_required, is_spam, 429) return False to trigger the next fallback tier.
+        """
+        checkpoint_indicators = (
+            "/accounts/scraping_warning/",
+            "checkpoint_required",
+            "checkpoint_url",
+            "challenge_required",
+            "challenge_context",
+            "consent_required",
+        )
+
+        final_url = response_url.lower()
+        lowered_text = response_text.lower()
+
+        # Step 1: Detect account security checkpoints in URL redirects
+        if any(ind in final_url for ind in checkpoint_indicators):
+            logger.error("Account security checkpoint detected in URL: %s", final_url)
+            self.resilient_session.trip_circuit_breaker(
+                f"Checkpoint redirect: {final_url}"
+            )
+            self.status_message.emit(
+                "🛑 Account checkpoint triggered. Halting to protect account."
+            )
+            self.cancel()
+            return False
+
+        # Step 2: Detect hard verification blocks in payload markup
+        for ind in checkpoint_indicators:
+            if ind in lowered_text:
+                logger.error(
+                    "Hard checkpoint challenge detected in payload (%s). Halting worker.",
+                    ind,
+                )
+                self.resilient_session.trip_circuit_breaker(
+                    f"Checkpoint in payload ({ind})"
+                )
+                self.status_message.emit(
+                    "🛑 Account challenge triggered. Halting to protect your account."
+                )
+                self.cancel()
+                return False
+
+        # Step 3: Handle soft velocity blocks by failing over to the next tier without aborting
+        soft_pushbacks = (
+            "feedback_required",
+            "is_spam",
+            "action_blocked",
+            "please wait a few minutes",
+        )
+        if any(ind in lowered_text for ind in soft_pushbacks):
+            logger.warning(
+                "Soft velocity throttle on endpoint %s. Failing over to subsequent tier.",
+                response_url,
+            )
+            return False
+
+        # Step 4: Rate limits (HTTP 429)
+        if status_code == 429:
+            logger.warning("HTTP 429 Rate Limit returned on endpoint %s", response_url)
+            if fatal_429:
+                self.resilient_session.trip_circuit_breaker(
+                    "HTTP 429 Rate Limit encountered"
+                )
+                self.status_message.emit(
+                    "⚠️ HTTP 429. Halting inspection to protect account."
+                )
+                self.cancel()
+            return False
+
+        if "/accounts/login/" in final_url or status_code in (401, 403):
+            return False
+
+        return True
 
     def _make_request(
         self,
@@ -1772,9 +1950,9 @@ class InspectWorker(QThread):
     def _fetch_all_profile_media_web(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> None:
-        """Cascading profile crawler prioritizing SSR HTML extraction, the Web Profile Info API,
+        """Cascading profile crawler prioritizing SSR HTML extraction, the Native Web Feed API,
 
-        the Native REST Feed API, GraphQL queries, and an HTML shortcode sweep.
+        the Web Profile Info API, GraphQL queries, and an HTML shortcode sweep.
         """
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return
@@ -1790,20 +1968,47 @@ class InspectWorker(QThread):
         )
 
         # -------------------------------------------------------------------------
-        # TIER 1: HTML SSR Parsing (Pre-cached during User ID lookup)
+        # TIER 1: Native Web REST Feed API (Primary & Most Resilient in 2024-2026)
         # -------------------------------------------------------------------------
         try:
             self.status_message.emit(
-                f"🚀 [Tier 1: HTML Markup] Scanning page markup for @{username}..."
+                f"🚀 [Tier 1: Native Web Feed] Paginating media archive for @{username}..."
+            )
+            feed_count = self._fetch_user_feed_web(
+                username, user_id, filter_mode=filter_mode
+            )
+            logger.info(
+                "Tier 1 Native Web Feed API extracted %d items for @%s",
+                feed_count,
+                username,
+            )
+        except Exception as exc:
+            logger.debug("Tier 1 Native Web Feed fault: %s", exc)
+
+        if (
+            self.is_cancelled
+            or self.resilient_session.is_circuit_open
+            or (
+                self.max_items_per_profile > 0
+                and len(self.seen_ids) >= self.max_items_per_profile
+            )
+            or len(self.seen_ids) > 0
+        ):
+            return
+
+        # -------------------------------------------------------------------------
+        # TIER 2: HTML SSR Parsing (Pre-cached & Live Document Probe)
+        # -------------------------------------------------------------------------
+        self._apply_tier_backoff(tier_attempt=1, base=1.5, max_delay=2.5)
+        try:
+            self.status_message.emit(
+                f"🚀 [Tier 2: HTML Markup] Scanning page markup for @{username}..."
             )
             collected_html: list[str] = []
 
             # Check if profile HTML was already cached during ID resolution
             cached_user = self._profile_cache.get(username.lower())
             if isinstance(cached_user, dict):
-                logger.info(
-                    "Hydrating media from pre-cached profile markup for @%s", username
-                )
                 edges: list[dict[str, Any]] = []
                 felix_obj = cached_user.get("edge_felix_video_timeline")
                 if isinstance(felix_obj, dict) and isinstance(
@@ -1851,7 +2056,7 @@ class InspectWorker(QThread):
                                 self.item_found.emit(card)
                                 self.media_found.emit(card)
 
-            # Probe live profile markup if cache yielded no media items
+            # Probe live profile markup with genuine navigation headers if needed
             if len(self.seen_ids) == 0:
                 urls_to_probe = (
                     [f"{IG_BASE_URL}/{username}/reels/", f"{IG_BASE_URL}/{username}/"]
@@ -1866,7 +2071,9 @@ class InspectWorker(QThread):
                             method="GET",
                             url=probe_url,
                             headers=self._build_headers(
-                                referer=IG_BASE_URL, require_auth=bool(self.cookie_str)
+                                referer=IG_BASE_URL,
+                                require_auth=bool(self.cookie_str),
+                                is_document=True,
                             ),
                             timeout=12.0,
                             require_auth=bool(self.cookie_str),
@@ -1904,15 +2111,8 @@ class InspectWorker(QThread):
                                     self.seen_ids.add(cid)
                                     self.item_found.emit(card)
                                     self.media_found.emit(card)
-
-            if len(self.seen_ids) > 0:
-                logger.info(
-                    "Tier 1 extracted %d items directly from SSR markup for @%s",
-                    len(self.seen_ids),
-                    username,
-                )
         except Exception as exc:
-            logger.debug("Tier 1 HTML Markup fault: %s", exc)
+            logger.debug("Tier 2 HTML Markup fault: %s", exc)
 
         if (
             self.is_cancelled
@@ -1921,16 +2121,17 @@ class InspectWorker(QThread):
                 self.max_items_per_profile > 0
                 and len(self.seen_ids) >= self.max_items_per_profile
             )
+            or len(self.seen_ids) > 0
         ):
             return
 
         # -------------------------------------------------------------------------
-        # TIER 2: Web Profile Info AJAX API (Works in Both Auth and Public Mode)
+        # TIER 3: Web Profile Info AJAX API
         # -------------------------------------------------------------------------
-        self._apply_tier_backoff(tier_attempt=1, base=1.5, max_delay=2.8)
+        self._apply_tier_backoff(tier_attempt=2, base=1.8, max_delay=3.0)
         try:
             self.status_message.emit(
-                f"🚀 [Tier 2: Web Profile Info] Fetching timeline for @{username}..."
+                f"🚀 [Tier 3: Web Profile Info] Fetching timeline for @{username}..."
             )
             url_info = (
                 f"{IG_BASE_URL}/api/v1/users/web_profile_info/?username={username}"
@@ -1954,7 +2155,7 @@ class InspectWorker(QThread):
                 ) or res_info.get("user")
 
                 if isinstance(user_data, dict):
-                    edges = []
+                    edges: list[dict[str, Any]] = []
                     felix_obj = user_data.get("edge_felix_video_timeline")
                     if isinstance(felix_obj, dict) and isinstance(
                         felix_obj.get("edges"), list
@@ -2002,14 +2203,8 @@ class InspectWorker(QThread):
                                     self.seen_ids.add(cid)
                                     self.item_found.emit(card)
                                     self.media_found.emit(card)
-
-                    logger.info(
-                        "Tier 2 WebProfileInfo extracted %d items for @%s",
-                        len(self.seen_ids),
-                        username,
-                    )
         except Exception as exc:
-            logger.debug("Tier 2 Web Profile Info fault: %s", exc)
+            logger.debug("Tier 3 Web Profile Info fault: %s", exc)
 
         if (
             self.is_cancelled
@@ -2018,133 +2213,70 @@ class InspectWorker(QThread):
                 self.max_items_per_profile > 0
                 and len(self.seen_ids) >= self.max_items_per_profile
             )
+            or len(self.seen_ids) > 0
         ):
             return
 
         # -------------------------------------------------------------------------
-        # TIER 3: Native Web REST Feed API (Supports Cursor-Based max_id Traversal)
+        # TIER 4: HTML Shortcode Sweep & Single-Post Resolution (Guaranteed Fallback)
         # -------------------------------------------------------------------------
-        self._apply_tier_backoff(tier_attempt=2, base=1.8, max_delay=3.2)
+        self._apply_tier_backoff(tier_attempt=3, base=1.8, max_delay=3.0)
         try:
             self.status_message.emit(
-                f"🚀 [Tier 3: Native Feed] Paginating media archive for @{username}..."
+                f"🔍 [Tier 4: Shortcode Sweep] Extracting post URLs for @{username}..."
             )
-            feed_count = self._fetch_user_feed_web(
-                username, user_id, filter_mode=filter_mode
-            )
-            logger.info(
-                "Tier 3 Native Feed API extracted %d items for @%s",
-                feed_count,
-                username,
-            )
-        except Exception as exc:
-            logger.debug("Tier 3 Native Feed fault: %s", exc)
-
-        if (
-            self.is_cancelled
-            or self.resilient_session.is_circuit_open
-            or (
-                self.max_items_per_profile > 0
-                and len(self.seen_ids) >= self.max_items_per_profile
-            )
-        ):
-            return
-
-        # -------------------------------------------------------------------------
-        # TIER 4: Authenticated GraphQL Persisted Queries
-        # -------------------------------------------------------------------------
-        if self.resilient_session.has_session_cookies():
-            self._apply_tier_backoff(tier_attempt=3, base=2.0, max_delay=3.5)
-            try:
-                if is_reels_focus:
-                    self.status_message.emit(
-                        f"🚀 [Tier 4: GraphQL Clips] Paginating reels for @{username}..."
-                    )
-                    reels_found = self._fetch_user_clips_graphql(
-                        username, user_id, max_items=24
-                    )
-                    if reels_found == 0 and not self.is_cancelled:
-                        self._fetch_timeline_graphql(
-                            username, user_id, filter_mode="reels"
-                        )
-                else:
-                    self.status_message.emit(
-                        f"🚀 [Tier 4: GraphQL Timeline] Paginating posts for @{username}..."
-                    )
-                    self._fetch_timeline_graphql(
-                        username, user_id, filter_mode=filter_mode
-                    )
-            except Exception as exc:
-                logger.debug("Tier 4 GraphQL fault: %s", exc)
-
-        if self.is_cancelled or (
-            self.max_items_per_profile > 0
-            and len(self.seen_ids) >= self.max_items_per_profile
-        ):
-            return
-
-        # -------------------------------------------------------------------------
-        # TIER 5: HTML Shortcode Sweep & Single-Post Item Resolution
-        # -------------------------------------------------------------------------
-        if len(self.seen_ids) == 0:
-            self._apply_tier_backoff(tier_attempt=4, base=1.8, max_delay=3.0)
-            try:
-                self.status_message.emit(
-                    f"🔍 [Tier 5: Shortcode Sweep] Extracting post URLs for @{username}..."
-                )
-                profile_url = f"{IG_BASE_URL}/{username}/"
-                status_code, _, _, page_markup = self.resilient_session.request(
-                    method="GET",
-                    url=profile_url,
-                    headers=self._build_headers(
-                        referer=IG_BASE_URL, require_auth=bool(self.cookie_str)
-                    ),
-                    timeout=12.0,
+            profile_url = f"{IG_BASE_URL}/{username}/"
+            status_code, _, _, page_markup = self.resilient_session.request(
+                method="GET",
+                url=profile_url,
+                headers=self._build_headers(
+                    referer=IG_BASE_URL,
                     require_auth=bool(self.cookie_str),
-                )
-                if status_code == 200 and page_markup:
-                    shortcodes = self._extract_shortcodes_from_html(page_markup)
-                    if shortcodes:
-                        limit = (
-                            (self.max_items_per_profile - len(self.seen_ids))
-                            if self.max_items_per_profile > 0
-                            else len(shortcodes)
+                    is_document=True,
+                ),
+                timeout=12.0,
+                require_auth=bool(self.cookie_str),
+            )
+            if status_code == 200 and page_markup:
+                shortcodes = self._extract_shortcodes_from_html(page_markup)
+                if shortcodes:
+                    limit = (
+                        (self.max_items_per_profile - len(self.seen_ids))
+                        if self.max_items_per_profile > 0
+                        else len(shortcodes)
+                    )
+                    logger.info(
+                        "Discovered %d shortcodes via markup sweep for @%s",
+                        len(shortcodes),
+                        username,
+                    )
+                    for sc in shortcodes[:limit]:
+                        if self.is_cancelled or self.resilient_session.is_circuit_open:
+                            break
+                        self._inspect_single_post(
+                            sc,
+                            raw_target=(
+                                f"{IG_BASE_URL}/reel/{sc}/"
+                                if is_reels_focus
+                                else f"{IG_BASE_URL}/p/{sc}/"
+                            ),
+                            filter_mode=filter_mode,
+                            fallback_username=username,
                         )
-                        logger.info(
-                            "Discovered %d shortcodes via Tier 5 markup sweep for @%s",
-                            len(shortcodes),
-                            username,
-                        )
-                        for sc in shortcodes[:limit]:
-                            if (
-                                self.is_cancelled
-                                or self.resilient_session.is_circuit_open
-                            ):
-                                break
-                            self._inspect_single_post(
-                                sc,
-                                raw_target=(
-                                    f"{IG_BASE_URL}/reel/{sc}/"
-                                    if is_reels_focus
-                                    else f"{IG_BASE_URL}/p/{sc}/"
-                                ),
-                                filter_mode=filter_mode,
-                                fallback_username=username,
-                            )
-                            self._sleep_interruptible(random.uniform(0.4, 0.8))
-            except Exception as exc:
-                logger.debug("Tier 5 Shortcode Sweep fault: %s", exc)
+                        self._sleep_interruptible(random.uniform(0.4, 0.8))
+        except Exception as exc:
+            logger.debug("Tier 4 Shortcode Sweep fault: %s", exc)
 
         if len(self.seen_ids) > 0 or self.is_cancelled:
             return
 
         # -------------------------------------------------------------------------
-        # TIER 6: Engine Fallback (yt-dlp)
+        # TIER 5: Engine Fallback (yt-dlp)
         # -------------------------------------------------------------------------
-        self._apply_tier_backoff(tier_attempt=5, base=2.2, max_delay=3.8)
+        self._apply_tier_backoff(tier_attempt=4, base=2.2, max_delay=3.8)
         try:
             self.status_message.emit(
-                "⚙️ [Tier 6: Engine Fallback] Running yt-dlp profile extractor..."
+                "⚙️ [Tier 5: Engine Fallback] Running yt-dlp profile extractor..."
             )
             self._inspect_via_ytdlp(
                 f"{IG_BASE_URL}/{username}/",
@@ -2152,154 +2284,44 @@ class InspectWorker(QThread):
                 filter_mode=filter_mode,
             )
         except Exception as exc:
-            logger.debug("Tier 6 yt-dlp fault: %s", exc)
-
-    def _fetch_user_clips_graphql(
-        self, username: str, user_id: str, max_items: int = 24
-    ) -> int:
-        """Paginates user Reels archive using PolarisClipsTimelineProfileQuery
-
-        over HTTP/2 with persisted doc_id failover and unauthenticated safety guards.
-        """
-        has_next_page = True
-        end_cursor: str | None = None
-        pages = 0
-        found_count = 0
-        max_pages = self._get_max_pages_ceiling(page_size=max_items)
-
-        try:
-            numeric_uid = int(str(user_id).strip())
-        except (ValueError, TypeError):
-            numeric_uid = 0
-
-        if numeric_uid <= 0:
-            logger.debug("[GraphQLClips] Non-numeric user ID provided: %s", user_id)
-            return 0
-
-        # Guard: Reject unauthenticated calls to prevent immediate 400 Bad Request invalidation
-        if not self.resilient_session.has_session_cookies():
-            logger.info(
-                "[GraphQLClips] Bypassing GraphQL Clips query: Session cookies absent."
-            )
-            return 0
-
-        while has_next_page and pages < max_pages and not self.is_cancelled:
-            if (
-                self.max_items_per_profile > 0
-                and len(self.seen_ids) >= self.max_items_per_profile
-            ):
-                break
-
-            variables: dict[str, Any] = {
-                "data": {
-                    "include_feed_video": True,
-                    "page_size": max_items,
-                    "target_user_id": numeric_uid,
-                },
-                "after": end_cursor if end_cursor else None,
-                "before": None,
-                "first": max_items,
-                "last": None,
-            }
-
-            res: dict[str, Any] | None = None
-            for doc_id in DOC_ID_USER_CLIPS_FALLBACKS:
-                if self.is_cancelled or self.resilient_session.is_circuit_open:
-                    return found_count
-
-                try:
-                    res = self.resilient_session.execute_persisted_query(
-                        doc_id=doc_id,
-                        variables=variables,
-                        friendly_name=FRIENDLY_NAME_CLIPS,
-                    )
-                    if isinstance(res, dict) and res.get("data"):
-                        break
-                except PermissionError as pe:
-                    self.status_message.emit(f"🛑 [Security Alert] {pe}")
-                    self.cancel()
-                    return found_count
-                except Exception as exc:
-                    logger.debug("[GraphQLClips] doc_id=%s fault: %s", doc_id, exc)
-                    self._sleep_interruptible(random.uniform(0.8, 1.4))
-
-            if not isinstance(res, dict):
-                break
-
-            data_root = res.get("data", {}) if isinstance(res, dict) else {}
-            clips_conn = (
-                data_root.get("xdt_api__v1__clips__user__connection_v2")
-                or data_root.get("xdt_api__v1__clips__user__connection")
-                or data_root.get("user", {}).get("edge_felix_video_timeline")
-                or {}
-            )
-            edges = clips_conn.get("edges") if isinstance(clips_conn, dict) else None
-
-            if not isinstance(edges, list) or not edges:
-                break
-
-            for edge in edges:
-                if self.is_cancelled:
-                    return found_count
-                if not isinstance(edge, dict):
-                    continue
-
-                node = edge.get("node") if isinstance(edge.get("node"), dict) else edge
-                media = (
-                    node.get("media") if isinstance(node.get("media"), dict) else node
-                )
-
-                for card in self._extract_media_cards(
-                    media, fallback_username=username
-                ):
-                    card["media_type"] = "REEL"
-                    with self._lock:
-                        cid = str(card["id"])
-                        if cid not in self.seen_ids:
-                            self.seen_ids.add(cid)
-                            self.item_found.emit(card)
-                            self.media_found.emit(card)
-                            found_count += 1
-
-            page_info = (
-                clips_conn.get("page_info") if isinstance(clips_conn, dict) else {}
-            )
-            if isinstance(page_info, dict):
-                has_next_page = bool(page_info.get("has_next_page", False))
-                end_cursor = page_info.get("end_cursor")
-            else:
-                has_next_page = False
-                end_cursor = None
-
-            if not end_cursor:
-                has_next_page = False
-
-            pages += 1
-            self.status_message.emit(
-                f"✓ [GraphQL Clips] Page {pages}: {len(self.seen_ids)} Reels found..."
-            )
-
-            if has_next_page and not self.is_cancelled:
-                self._apply_gaussian_pacing()
-                self._apply_macro_pacing(pages)
-
-        return found_count
+            logger.debug("Tier 5 yt-dlp fault: %s", exc)
 
     def _fetch_user_feed_web(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> int:
-        """Paginates user profile posts and reels using native web endpoints and session cookies."""
+        """Paginates user profile posts and reels using native web REST endpoints on www.instagram.com.
+
+        Tiers across:
+        1. /api/v1/feed/user/{username}/username/?count=12 (Direct username route; bypasses ID resolution rate limits)
+        2. /api/v1/feed/user/{user_id}/?count=12 (Standard numeric ID web route)
+        """
+        found_count = 0
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
+            return found_count
+
         headers = self._build_headers(
             referer=f"{IG_BASE_URL}/{username}/",
             require_auth=bool(self.cookie_str),
             is_mobile=False,
+            is_document=False,
         )
 
         has_next_page = True
-        next_max_id: Optional[str] = None
+        next_max_id: str | None = None
         pages = 0
-        found_count = 0
         max_pages = self._get_max_pages_ceiling(page_size=12)
+
+        # Build candidate URL builders: primary is feed-by-username, fallback is feed-by-user-id
+        clean_user = urllib.parse.quote(username.strip())
+        uid_str = str(user_id).strip()
+
+        url_templates: list[str] = [
+            f"{IG_BASE_URL}/api/v1/feed/user/{clean_user}/username/?count=12",
+        ]
+        if uid_str and uid_str.isdigit():
+            url_templates.append(f"{IG_BASE_URL}/api/v1/feed/user/{uid_str}/?count=12")
+
+        active_template = url_templates[0]
 
         while has_next_page and pages < max_pages and not self.is_cancelled:
             if (
@@ -2313,16 +2335,34 @@ class InspectWorker(QThread):
                 )
                 break
 
-            feed_url = f"{IG_BASE_URL}/api/v1/feed/user/{user_id}/"
+            current_url = active_template
             if next_max_id:
-                feed_url += f"?max_id={urllib.parse.quote(str(next_max_id))}"
+                sep = "&" if "?" in current_url else "?"
+                current_url = (
+                    f"{current_url}{sep}max_id={urllib.parse.quote(str(next_max_id))}"
+                )
 
             res = self._make_request(
-                feed_url,
+                current_url,
                 headers=headers,
                 caller_tag="WebUserFeed",
                 require_auth=bool(self.cookie_str),
             )
+
+            # Fallback to secondary endpoint template on first page if primary returns empty
+            if not isinstance(res, dict) and pages == 0 and len(url_templates) > 1:
+                logger.debug(
+                    "[WebUserFeed] Primary username feed route missed. Trying user_id route."
+                )
+                active_template = url_templates[1]
+                current_url = active_template
+                res = self._make_request(
+                    current_url,
+                    headers=headers,
+                    caller_tag="WebUserFeedFallback",
+                    require_auth=bool(self.cookie_str),
+                )
+
             if not isinstance(res, dict):
                 break
 
@@ -2358,7 +2398,6 @@ class InspectWorker(QThread):
                             self.media_found.emit(card)
                             found_count += 1
 
-            # Check pagination flags
             has_next_page = bool(
                 res.get("more_available", False)
                 or res.get("auto_load_more_enabled", False)
@@ -3018,15 +3057,24 @@ class InspectWorker(QThread):
     def _fetch_timeline_graphql(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> int:
-        """Paginates user timeline media using PolarisProfilePostsTimelineQuery over HTTP/2."""
+        """Paginates user timeline media using PolarisProfilePostsTimelineQuery over HTTP/2.
+
+        Uses verified document IDs and dual variable schemas to accommodate
+        both Relay Modern username schemas and classic UID node schemas.
+        """
         has_next_page = True
-        end_cursor: Optional[str] = None
+        end_cursor: str | None = None
         pages = 0
         found_count = 0
         max_pages = self._get_max_pages_ceiling(page_size=24)
 
         if not self.resilient_session.has_session_cookies():
+            logger.info(
+                "[GraphQLTimeline] Skipping GraphQL Timeline: No session cookies."
+            )
             return 0
+
+        uid_str = str(user_id).strip()
 
         while has_next_page and pages < max_pages and not self.is_cancelled:
             if (
@@ -3035,29 +3083,56 @@ class InspectWorker(QThread):
             ):
                 break
 
-            variables: Dict[str, Any] = {
-                "first": 24,
-                "id": str(user_id),
-            }
+            # Dual Variable Payloads: 1) Relay Modern Schema, 2) Classic Node Schema
+            variable_variants: list[dict[str, Any]] = [
+                {
+                    "data": {
+                        "count": 24,
+                        "include_relationship_info": True,
+                        "latest_besties_reel_media": True,
+                        "latest_reel_media": True,
+                    },
+                    "username": username,
+                    "__relay_internal__pv__PolarisIsLoggedInrelayprovider": True,
+                },
+                {
+                    "first": 24,
+                    "id": uid_str,
+                },
+            ]
             if end_cursor:
-                variables["after"] = end_cursor
+                variable_variants[0]["after"] = end_cursor
+                variable_variants[1]["after"] = end_cursor
 
-            res: Optional[Dict[str, Any]] = None
-            for doc_id in (DOC_ID_TIMELINE, DOC_ID_TIMELINE_FALLBACK):
-                try:
-                    res = self.resilient_session.execute_persisted_query(
-                        doc_id=doc_id,
-                        variables=variables,
-                        friendly_name=FRIENDLY_NAME_TIMELINE,
-                    )
-                    break
-                except PermissionError as pe:
-                    self.status_message.emit(f"🛑 [Security Alert] {pe}")
-                    self.cancel()
+            res: dict[str, Any] | None = None
+            for doc_id in DOC_ID_TIMELINE_FALLBACKS:
+                if self.is_cancelled or self.resilient_session.is_circuit_open:
                     return found_count
-                except Exception as exc:
-                    logger.debug("[GraphQLTimeline] doc_id=%s fault: %s", doc_id, exc)
-                    self._sleep_interruptible(random.uniform(0.6, 1.2))
+
+                for variables in variable_variants:
+                    try:
+                        res = self.resilient_session.execute_persisted_query(
+                            doc_id=doc_id,
+                            variables=variables,
+                            friendly_name=FRIENDLY_NAME_TIMELINE,
+                        )
+                        if isinstance(res, dict) and res.get("data"):
+                            break
+                    except PermissionError as pe:
+                        self.status_message.emit(f"🛑 [Security Alert] {pe}")
+                        self.cancel()
+                        return found_count
+                    except Exception as exc:
+                        logger.debug(
+                            "[GraphQLTimeline] doc_id=%s fault with variables %s: %s",
+                            doc_id,
+                            list(variables.keys()),
+                            exc,
+                        )
+                        self._sleep_interruptible(random.uniform(0.6, 1.2))
+
+                if isinstance(res, dict) and res.get("data"):
+                    break
 
             if not isinstance(res, dict):
                 break
@@ -3072,15 +3147,15 @@ class InspectWorker(QThread):
                 or data_obj.get("xdt_api__v1__feed__user_timeline_graphql_connection")
             )
             if not isinstance(user_data, dict):
+                # Check root user node
+                user_node = data_obj.get("user")
+                if isinstance(user_node, dict):
+                    user_data = user_node.get("edge_owner_to_timeline_media")
+
+            if not isinstance(user_data, dict):
                 break
 
-            timeline_media = (
-                user_data.get("edge_owner_to_timeline_media")
-                if isinstance(user_data.get("edge_owner_to_timeline_media"), dict)
-                else user_data
-            )
-
-            edges = timeline_media.get("edges")
+            edges = user_data.get("edges")
             if not isinstance(edges, list) or not edges:
                 break
 
@@ -3118,7 +3193,7 @@ class InspectWorker(QThread):
                             self.media_found.emit(card)
                             found_count += 1
 
-            page_info = timeline_media.get("page_info")
+            page_info = user_data.get("page_info")
             if isinstance(page_info, dict):
                 has_next_page = bool(page_info.get("has_next_page", False))
                 end_cursor = page_info.get("end_cursor")
