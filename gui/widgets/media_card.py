@@ -232,7 +232,21 @@ class Elevated3DThumbnail(QLabel):
         self._elev_shadow.setBlurRadius(blur)
         self.update()
 
-    def set_thumbnail_pixmap(self, pixmap: QPixmap) -> None:
+    def set_thumbnail_pixmap(self, pixmap: QPixmap | bytes | QByteArray) -> None:
+        """Sets and renders the thumbnail, converting raw byte streams to QPixmap if needed."""
+        if isinstance(pixmap, (bytes, bytearray, QByteArray)):
+            raw_bytes = (
+                QByteArray(pixmap) if not isinstance(pixmap, QByteArray) else pixmap
+            )
+            loaded = QPixmap()
+            if loaded.loadFromData(raw_bytes):
+                pixmap = loaded
+            else:
+                self._raw_pixmap = None
+                self._rendered_pixmap = None
+                self.update()
+                return
+
         self._raw_pixmap = pixmap
         if not pixmap or pixmap.isNull():
             self._rendered_pixmap = None
@@ -250,7 +264,6 @@ class Elevated3DThumbnail(QLabel):
         crop_y = max(0, (scaled.height() - target_size) // 2)
         cropped = scaled.copy(crop_x, crop_y, target_size, target_size)
 
-        # Mask inside a smooth rounded container
         rounded = QPixmap(target_size, target_size)
         rounded.fill(Qt.GlobalColor.transparent)
         p = QPainter(rounded)
@@ -507,7 +520,7 @@ class MediaCard(QFrame):
         self.lbl_title = QLabel(self)
         self.lbl_title.setFont(self._get_app_font(size=10, weight=QFont.Weight.Medium))
         self.lbl_title.setStyleSheet(
-            "color: #FFFFFF; background: transparent; border: none; font-size: 13.5px;"
+            "color: #FFFFFF; background: transparent; border: none; font-size: 14px;"
         )
 
         display_title = (
@@ -560,7 +573,7 @@ class MediaCard(QFrame):
                 border: 1px solid {style_info['border']};
                 border-radius: 6px;
                 padding: 2px 9px;
-                font-size: 11.5px;
+                font-size: 11px;
             }}
             """
         )
@@ -578,7 +591,7 @@ class MediaCard(QFrame):
         self.lbl_meta = QLabel(meta_str, self)
         self.lbl_meta.setFont(self._get_app_font(size=10))
         self.lbl_meta.setStyleSheet(
-            "color: #94A3B8; background: transparent; border: none; font-size: 12.5px;"
+            "color: #94A3B8; background: transparent; border: none; font-size: 12px;"
         )
         meta_row.addWidget(self.lbl_meta)
         meta_row.addStretch()
@@ -694,9 +707,31 @@ class MediaCard(QFrame):
         except Exception as exc:
             logger.debug("Failed to initialize ThumbnailLoader: %s", exc)
 
-    def _on_thumbnail_loaded(self, pixmap: QPixmap) -> None:
-        if not self._is_cleaned_up and pixmap and not pixmap.isNull():
-            self.lbl_thumb.set_thumbnail_pixmap(pixmap)
+    def _on_thumbnail_loaded(self, pixmap: QPixmap | bytes | QByteArray | str) -> None:
+        """Handles thumbnail payload by resolving QPixmap from bytes, QByteArray, or file paths."""
+        if self._is_cleaned_up or not pixmap:
+            return
+
+        final_pixmap: Optional[QPixmap] = None
+
+        if isinstance(pixmap, QPixmap):
+            final_pixmap = pixmap
+        elif isinstance(pixmap, (bytes, bytearray, QByteArray)):
+            raw_bytes = (
+                QByteArray(pixmap) if not isinstance(pixmap, QByteArray) else pixmap
+            )
+            loaded = QPixmap()
+            if loaded.loadFromData(raw_bytes):
+                final_pixmap = loaded
+            else:
+                logger.debug("Failed to decode image data for item %s", self.item_id)
+        elif isinstance(pixmap, str) and os.path.isfile(pixmap):
+            loaded = QPixmap(pixmap)
+            if not loaded.isNull():
+                final_pixmap = loaded
+
+        if final_pixmap and not final_pixmap.isNull():
+            self.lbl_thumb.set_thumbnail_pixmap(final_pixmap)
 
     def open_image_gallery(self) -> None:
         slides: list[dict[str, Any]] = self.item_data.get("slides") or []

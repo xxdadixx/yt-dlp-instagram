@@ -178,7 +178,7 @@ class ResilientSession:
             self._initialize_headers()
 
     def _initialize_headers(self) -> None:
-        # Chrome 120 Client Hints strictly aligned with curl_cffi impersonate="chrome120"
+        """Initializes clean browser baseline headers without baking transient AJAX headers into session state."""
         base_headers: dict[str, str] = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -186,24 +186,20 @@ class ResilientSession:
             ),
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://www.instagram.com",
-            "Referer": "https://www.instagram.com/",
             "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
             "X-ASBD-ID": self.ASBD_ID,
             "X-IG-App-ID": self.WEB_APP_ID,
             "X-IG-WWW-Claim": self.www_claim,
-            "X-Requested-With": "XMLHttpRequest",
         }
 
         if self._anon_session is not None:
+            self._anon_session.headers.clear()
             self._anon_session.headers.update(base_headers)
 
         if self._auth_session is not None:
+            self._auth_session.headers.clear()
             auth_headers = dict(base_headers)
             if "csrftoken" in self.cookies:
                 auth_headers["X-CSRFToken"] = self.cookies["csrftoken"]
@@ -342,11 +338,9 @@ class ResilientSession:
     def ensure_csrf_token(self) -> None:
         """Handshakes with Instagram root over HTTP/2 to bootstrap CSRF and LSD tokens.
 
-        Bypasses network round-trip if valid session credentials already exist.
+        Guarantees LSD token acquisition even when session cookies are already loaded.
         """
-        if "csrftoken" in self.cookies and (
-            self.has_session_cookies() or self.lsd_token
-        ):
+        if "csrftoken" in self.cookies and self.lsd_token:
             return
 
         try:
@@ -359,14 +353,16 @@ class ResilientSession:
             )
             if text:
                 if not self.lsd_token:
-                    m_lsd = re.search(
-                        r'["\']LSD["\'],\[\],\{["\']token["\']:\s*["\']([^"\']+)["\']\}',
-                        text,
-                    )
-                    if not m_lsd:
-                        m_lsd = re.search(
+                    m_lsd = (
+                        re.search(
+                            r'["\']LSD["\'],\[\],\{["\']token["\']:\s*["\']([^"\']+)["\']\}',
+                            text,
+                        )
+                        or re.search(
                             r'name=["\']lsd["\']\s+value=["\']([^"\']+)["\']', text
                         )
+                        or re.search(r'["\']lsd["\']\s*:\s*["\']([^"\']+)["\']', text)
+                    )
                     if m_lsd:
                         self.lsd_token = m_lsd.group(1)
                         logger.debug(
@@ -397,7 +393,10 @@ class ResilientSession:
         timeout: float = 15.0,
         require_auth: bool = True,
     ) -> tuple[int, str, dict[str, str], str]:
-        """Unified HTTP dispatcher supporting full HTTP 2xx success ranges and fail-fast tripwires."""
+        """Unified HTTP dispatcher routing desktop requests through curl_cffi Chrome impersonation
+
+        and mobile/API endpoints through clean standard OpenSSL TLS to prevent JA3 fingerprint collisions.
+        """
         self._check_circuit()
 
         is_mocked_env = hasattr(urllib.request.urlopen, "assert_called") or hasattr(
@@ -410,8 +409,29 @@ class ResilientSession:
 
         merged_headers.setdefault("X-IG-WWW-Claim", self.www_claim)
 
-        # Primary Branch: curl_cffi HTTP/2 Chrome Impersonation
-        if self._auth_session is not None and not is_mocked_env:
+        # Bypass Chrome TLS impersonation on mobile endpoints to prevent JA3/User-Agent mismatch
+        is_mobile_host = "i.instagram.com" in url
+        is_static_asset = (
+            any(
+                ext in url.lower()
+                for ext in (
+                    ".js",
+                    ".css",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".webp",
+                    ".mp4",
+                    ".woff",
+                    ".woff2",
+                )
+            )
+            or "cdninstagram.com" in url
+            or "fbcdn.net" in url
+        )
+
+        # Primary Branch: curl_cffi HTTP/2 Chrome Impersonation (Desktop www.instagram.com only)
+        if self._auth_session is not None and not is_mocked_env and not is_mobile_host:
             active_session: Any = (
                 self._auth_session if effective_auth else self._anon_session
             )
@@ -419,9 +439,11 @@ class ResilientSession:
             req_cookies: dict[str, str] | None = None
             if effective_auth:
                 req_cookies = self.cookies
+                # Keep explicit Cookie header to guarantee transmission over libcurl
+                cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+                merged_headers["Cookie"] = cookie_str
                 if "csrftoken" in self.cookies and "X-CSRFToken" not in merged_headers:
                     merged_headers["X-CSRFToken"] = self.cookies["csrftoken"]
-                merged_headers.pop("Cookie", None)
 
             try:
                 resp = active_session.request(
@@ -454,16 +476,21 @@ class ResilientSession:
                 raise ConnectionError(f"Transport network fault: {exc}") from exc
 
             lowered = text.lower()
-            for signal in self.HARD_ACTION_BLOCK_SIGNALS:
-                if signal in lowered:
-                    self.trip_circuit_breaker(
-                        f"Hard account checkpoint triggered ({signal})"
-                    )
-                    if effective_auth:
-                        self.cookies_quarantined = True
-                    raise PermissionError(f"Action block challenge triggered: {signal}")
+            # Only evaluate hard action blocks on actual API responses or error statuses (never on static scripts or 200 OK pages)
+            if not is_static_asset and (
+                not (200 <= status_code < 300) or text.strip().startswith("{")
+            ):
+                for signal in self.HARD_ACTION_BLOCK_SIGNALS:
+                    if f'"{signal}"' in lowered or f"'{signal}'" in lowered:
+                        self.trip_circuit_breaker(
+                            f"Hard account checkpoint triggered ({signal})"
+                        )
+                        if effective_auth:
+                            self.cookies_quarantined = True
+                        raise PermissionError(
+                            f"Action block challenge triggered: {signal}"
+                        )
 
-            # Only evaluate transient blocks when status code is not 2xx
             if not (200 <= status_code < 300):
                 is_json_fail = text.strip().startswith("{") and any(
                     f'"{k}"' in lowered
@@ -505,7 +532,7 @@ class ResilientSession:
             self._record_success()
             return status_code, final_url, resp_headers, text
 
-        # Fallback Branch: urllib.request
+        # Fallback & Mobile Branch: Clean standard OpenSSL TLS via urllib.request
         if params:
             query_string = urllib.parse.urlencode(params)
             url = f"{url}?{query_string}" if "?" not in url else f"{url}&{query_string}"
@@ -630,18 +657,28 @@ class ResilientSession:
         variables: dict[str, Any],
         friendly_name: str,
     ) -> dict[str, Any]:
-        """Executes an Instagram GraphQL Persisted Document query over HTTP/2 with session isolation."""
+        """Executes an Instagram GraphQL Persisted Document query over HTTP/2 with Relay Modern
+
+        body parameters, omitting anonymous LSD tokens on authenticated requests to preserve viewer context.
+        """
         self._check_circuit()
-        self.ensure_csrf_token()
         self.pace_request()
 
+        is_auth = self.has_session_cookies()
+        if not is_auth:
+            self.ensure_csrf_token()
+
+        var_json = json.dumps(variables, separators=(",", ":"))
         payload: dict[str, str] = {
             "doc_id": doc_id,
-            "variables": json.dumps(variables, separators=(",", ":")),
+            "variables": var_json,
+            "fb_api_caller_class": "RelayModern",
+            "fb_api_req_friendly_name": friendly_name,
+            "server_timestamps": "true",
         }
 
-        # Guard: Only attach LSD tokens on unauthenticated queries to prevent viewer context invalidation
-        is_auth = self.has_session_cookies()
+        # Critical: Only attach anonymous LSD tokens when unauthenticated.
+        # Transmitting an anonymous LSD token with session cookies invalidates the viewer context.
         if not is_auth and self.lsd_token:
             payload["lsd"] = self.lsd_token
 
@@ -654,9 +691,12 @@ class ResilientSession:
             "X-IG-WWW-Claim": self.www_claim,
             "Referer": "https://www.instagram.com/",
             "Origin": "https://www.instagram.com",
+            "Accept": "*/*",
         }
+
         if not is_auth and self.lsd_token:
             headers["X-FB-LSD"] = self.lsd_token
+
         if "csrftoken" in self.cookies:
             headers["X-CSRFToken"] = self.cookies["csrftoken"]
 
