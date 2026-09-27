@@ -234,9 +234,9 @@ class ResilientSession:
     def _record_failure(
         self, status_code: int, response_text: str = "", was_authenticated: bool = False
     ) -> None:
-        """Inspects failure conditions and increments failure counters toward the threshold.
+        """Evaluates upstream network and WAF challenge failures, tripping the circuit breaker
 
-        Never records failure on HTTP 2xx success codes or active login contexts.
+        immediately upon detection of anti-bot challenge signatures or HTTP 429 limits.
         """
         if 200 <= status_code < 300:
             return
@@ -246,6 +246,9 @@ class ResilientSession:
             is_rate_limit = status_code == 429
             is_hard_action_block = any(
                 sig in lowered_text for sig in self.HARD_ACTION_BLOCK_SIGNALS
+            )
+            is_soft_action_block = any(
+                sig in lowered_text for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
             )
 
             is_explicitly_logged_in = (
@@ -264,38 +267,25 @@ class ResilientSession:
                 )
             )
 
-            if is_hard_action_block:
-                self.trip_circuit_breaker(
-                    f"Account Checkpoint / Verification Required (status={status_code})"
+            # Trip breaker immediately on any challenge payload or rate limit
+            if is_hard_action_block or is_rate_limit or is_soft_action_block:
+                reason = (
+                    "HTTP 429 Rate Limit"
+                    if is_rate_limit
+                    else f"Action Block / Challenge Detected: {response_text[:80]}"
                 )
-                if was_authenticated:
+                self.trip_circuit_breaker(reason)
+                if was_authenticated and (is_hard_action_block or is_auth_expired):
                     self.cookies_quarantined = True
                 return
 
-            if is_auth_expired and not is_rate_limit:
+            if is_auth_expired:
                 logger.warning(
                     "⚠️ [Cookie Quarantine] Session authentication expired (HTTP %d). "
                     "Quarantining session credentials.",
                     status_code,
                 )
                 self.cookies_quarantined = True
-                return
-
-            is_transient_throttle = is_rate_limit or any(
-                sig in lowered_text for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
-            )
-            if is_transient_throttle:
-                self.failure_counter += 1
-                logger.warning(
-                    "Transient endpoint throttle encountered (HTTP %d). Strike %d of %d.",
-                    status_code,
-                    self.failure_counter,
-                    self.circuit_config.failure_threshold,
-                )
-                if self.failure_counter >= self.circuit_config.failure_threshold:
-                    self.trip_circuit_breaker(
-                        f"Cumulative rate limit threshold reached ({self.failure_counter} strikes)"
-                    )
                 return
 
             if (status_code in (400, 403)) and (
@@ -393,9 +383,9 @@ class ResilientSession:
         timeout: float = 15.0,
         require_auth: bool = True,
     ) -> tuple[int, str, dict[str, str], str]:
-        """Unified HTTP dispatcher routing desktop requests through curl_cffi Chrome impersonation
+        """Unified HTTP dispatcher executing requests via curl_cffi Chrome impersonation to match JA3/JA4
 
-        and mobile/API endpoints through clean standard OpenSSL TLS to prevent JA3 fingerprint collisions.
+        fingerprints, enforcing fail-fast boundaries on action blocks and rate limits.
         """
         self._check_circuit()
 
@@ -409,29 +399,8 @@ class ResilientSession:
 
         merged_headers.setdefault("X-IG-WWW-Claim", self.www_claim)
 
-        # Bypass Chrome TLS impersonation on mobile endpoints to prevent JA3/User-Agent mismatch
-        is_mobile_host = "i.instagram.com" in url
-        is_static_asset = (
-            any(
-                ext in url.lower()
-                for ext in (
-                    ".js",
-                    ".css",
-                    ".png",
-                    ".jpg",
-                    ".jpeg",
-                    ".webp",
-                    ".mp4",
-                    ".woff",
-                    ".woff2",
-                )
-            )
-            or "cdninstagram.com" in url
-            or "fbcdn.net" in url
-        )
-
-        # Primary Branch: curl_cffi HTTP/2 Chrome Impersonation (Desktop www.instagram.com only)
-        if self._auth_session is not None and not is_mocked_env and not is_mobile_host:
+        # Primary Branch: curl_cffi HTTP/2 Chrome Impersonation
+        if self._auth_session is not None and not is_mocked_env:
             active_session: Any = (
                 self._auth_session if effective_auth else self._anon_session
             )
@@ -439,7 +408,6 @@ class ResilientSession:
             req_cookies: dict[str, str] | None = None
             if effective_auth:
                 req_cookies = self.cookies
-                # Keep explicit Cookie header to guarantee transmission over libcurl
                 cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
                 merged_headers["Cookie"] = cookie_str
                 if "csrftoken" in self.cookies and "X-CSRFToken" not in merged_headers:
@@ -476,54 +444,19 @@ class ResilientSession:
                 raise ConnectionError(f"Transport network fault: {exc}") from exc
 
             lowered = text.lower()
-            # Only evaluate hard action blocks on actual API responses or error statuses (never on static scripts or 200 OK pages)
-            if not is_static_asset and (
-                not (200 <= status_code < 300) or text.strip().startswith("{")
-            ):
-                for signal in self.HARD_ACTION_BLOCK_SIGNALS:
-                    if f'"{signal}"' in lowered or f"'{signal}'" in lowered:
-                        self.trip_circuit_breaker(
-                            f"Hard account checkpoint triggered ({signal})"
-                        )
-                        if effective_auth:
-                            self.cookies_quarantined = True
-                        raise PermissionError(
-                            f"Action block challenge triggered: {signal}"
-                        )
+            is_action_block = any(
+                sig in lowered for sig in self.ACTION_BLOCK_SIGNALS
+            ) or (status_code == 429)
+
+            if is_action_block:
+                self._record_failure(
+                    status_code, text, was_authenticated=effective_auth
+                )
+                raise PermissionError(
+                    f"Instagram WAF Challenge / Action Block triggered (status={status_code}): {text[:150]}"
+                )
 
             if not (200 <= status_code < 300):
-                is_json_fail = text.strip().startswith("{") and any(
-                    f'"{k}"' in lowered
-                    for k in (
-                        "feedback_required",
-                        "rate limited",
-                        "please wait a few minutes",
-                    )
-                )
-                is_transient = (
-                    (
-                        status_code in (400, 429, 500, 502, 503)
-                        and any(
-                            sig in lowered for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
-                        )
-                    )
-                    or (status_code == 429)
-                    or is_json_fail
-                )
-
-                if is_transient:
-                    logger.warning(
-                        "Transient velocity throttle in response body (HTTP %d): %s",
-                        status_code,
-                        text[:120],
-                    )
-                    self._record_failure(
-                        status_code,
-                        text,
-                        was_authenticated=effective_auth,
-                    )
-                    return status_code, final_url, resp_headers, text
-
                 self._record_failure(
                     status_code, text, was_authenticated=effective_auth
                 )
@@ -532,7 +465,16 @@ class ResilientSession:
             self._record_success()
             return status_code, final_url, resp_headers, text
 
-        # Fallback & Mobile Branch: Clean standard OpenSSL TLS via urllib.request
+        # Fallback Branch: Clean OpenSSL TLS via urllib.request (Strip Chrome Client Hints to prevent JA3 mismatch)
+        fallback_headers = {
+            k: v
+            for k, v in merged_headers.items()
+            if not k.lower().startswith("sec-ch-ua")
+        }
+        fallback_headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
+        )
+
         if params:
             query_string = urllib.parse.urlencode(params)
             url = f"{url}?{query_string}" if "?" not in url else f"{url}&{query_string}"
@@ -541,7 +483,7 @@ class ResilientSession:
         if data is not None:
             if isinstance(data, dict):
                 encoded_data = urllib.parse.urlencode(data).encode("utf-8")
-                merged_headers.setdefault(
+                fallback_headers.setdefault(
                     "Content-Type", "application/x-www-form-urlencoded"
                 )
             elif isinstance(data, str):
@@ -551,15 +493,15 @@ class ResilientSession:
 
         if effective_auth:
             cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
-            if cookie_str and "Cookie" not in merged_headers:
-                merged_headers["Cookie"] = cookie_str
-            if "csrftoken" in self.cookies and "X-CSRFToken" not in merged_headers:
-                merged_headers["X-CSRFToken"] = self.cookies["csrftoken"]
+            if cookie_str and "Cookie" not in fallback_headers:
+                fallback_headers["Cookie"] = cookie_str
+            if "csrftoken" in self.cookies and "X-CSRFToken" not in fallback_headers:
+                fallback_headers["X-CSRFToken"] = self.cookies["csrftoken"]
 
         req = urllib.request.Request(
             url=url,
             data=encoded_data,
-            headers=merged_headers,
+            headers=fallback_headers,
             method=req_method,
         )
 
@@ -593,14 +535,16 @@ class ResilientSession:
                 text = raw_bytes.decode(charset, errors="replace").strip()
 
                 lowered = text.lower()
-                for signal in self.HARD_ACTION_BLOCK_SIGNALS:
-                    if signal in lowered:
-                        self.trip_circuit_breaker(f"Action block in payload ({signal})")
-                        if effective_auth:
-                            self.cookies_quarantined = True
-                        raise PermissionError(
-                            f"Action block challenge triggered: {signal}"
-                        )
+                is_action_block = any(
+                    sig in lowered for sig in self.ACTION_BLOCK_SIGNALS
+                )
+                if is_action_block:
+                    self._record_failure(
+                        status_code, text, was_authenticated=effective_auth
+                    )
+                    raise PermissionError(
+                        f"Action block challenge in response: {text[:150]}"
+                    )
 
                 if 200 <= status_code < 300:
                     self._record_success()
@@ -626,26 +570,10 @@ class ResilientSession:
             except Exception:
                 pass
 
-            lowered = err_body.lower()
-            for signal in self.HARD_ACTION_BLOCK_SIGNALS:
-                if signal in lowered:
-                    self.trip_circuit_breaker(
-                        f"Action block challenge in HTTP {exc.code} body: {signal}"
-                    )
-                    if effective_auth:
-                        self.cookies_quarantined = True
-                    raise PermissionError(
-                        f"Action block challenge triggered: {signal}"
-                    ) from exc
-
             self._record_failure(exc.code, err_body, was_authenticated=effective_auth)
-            if exc.code == 429:
-                self.trip_circuit_breaker("HTTP 429 Rate Limit encountered")
-                raise PermissionError(
-                    "Rate limit / HTTP 429 Tripwire triggered."
-                ) from exc
-
-            return exc.code, exc.url or url, dict(exc.headers or {}), err_body
+            raise PermissionError(
+                f"HTTP {exc.code} WAF / Transport tripwire triggered: {err_body[:120]}"
+            ) from exc
 
         except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError) as net_err:
             self._record_failure(0, str(net_err), was_authenticated=effective_auth)
@@ -657,9 +585,9 @@ class ResilientSession:
         variables: dict[str, Any],
         friendly_name: str,
     ) -> dict[str, Any]:
-        """Executes an Instagram GraphQL Persisted Document query over HTTP/2 with Relay Modern
+        """Executes an Instagram GraphQL Persisted Document query over HTTP/2, enforcing viewer context
 
-        body parameters, omitting anonymous LSD tokens on authenticated requests to preserve viewer context.
+        and fail-fast tripwires on execution faults or action challenge payloads.
         """
         self._check_circuit()
         self.pace_request()
@@ -677,8 +605,6 @@ class ResilientSession:
             "server_timestamps": "true",
         }
 
-        # Critical: Only attach anonymous LSD tokens when unauthenticated.
-        # Transmitting an anonymous LSD token with session cookies invalidates the viewer context.
         if not is_auth and self.lsd_token:
             payload["lsd"] = self.lsd_token
 
@@ -710,16 +636,8 @@ class ResilientSession:
         )
 
         if status_code != 200:
-            lowered = text.lower()
-            if any(sig in lowered for sig in self.HARD_ACTION_BLOCK_SIGNALS):
-                self.trip_circuit_breaker(
-                    f"Action block in GraphQL response ({friendly_name})"
-                )
-                raise PermissionError(
-                    f"Action block in GraphQL response ({friendly_name}): {text[:200]}"
-                )
             raise RuntimeError(
-                f"GraphQL execution ({friendly_name}) failed with HTTP {status_code}: {text[:300]}"
+                f"GraphQL execution ({friendly_name}) failed with HTTP {status_code}: {text[:200]}"
             )
 
         try:

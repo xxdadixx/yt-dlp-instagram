@@ -107,6 +107,20 @@ SVG_ICONS: Dict[str, str] = {
         <polyline points="7 10 12 15 17 10"/>
         <line x1="12" y1="15" x2="12" y2="3"/>
     </svg>""",
+    "grid": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="7" height="7"/>
+        <rect x="14" y="3" width="7" height="7"/>
+        <rect x="14" y="14" width="7" height="7"/>
+        <rect x="3" y="14" width="7" height="7"/>
+    </svg>""",
+    "list": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="8" y1="6" x2="21" y2="6"/>
+        <line x1="8" y1="12" x2="21" y2="12"/>
+        <line x1="8" y1="18" x2="21" y2="18"/>
+        <line x1="3" y1="6" x2="3.01" y2="6"/>
+        <line x1="3" y1="12" x2="3.01" y2="12"/>
+        <line x1="3" y1="18" x2="3.01" y2="18"/>
+    </svg>""",
 }
 
 _ICON_CACHE: Dict[str, QIcon] = {}
@@ -174,6 +188,17 @@ def get_icon(name: str, color: str = "#ffffff", size: int = 18) -> QIcon:
                 painter.drawRect(2, 2, size - 4, size - 4)
                 painter.drawLine(4, size // 2, size // 2, size - 4)
                 painter.drawLine(size // 2, size - 4, size - 4, 4)
+            elif name in ("grid",):
+                painter.drawRect(3, 3, size // 2 - 4, size // 2 - 4)
+                painter.drawRect(size // 2 + 1, 3, size // 2 - 4, size // 2 - 4)
+                painter.drawRect(3, size // 2 + 1, size // 2 - 4, size // 2 - 4)
+                painter.drawRect(
+                    size // 2 + 1, size // 2 + 1, size // 2 - 4, size // 2 - 4
+                )
+            elif name in ("list",):
+                painter.drawLine(4, 5, size - 4, 5)
+                painter.drawLine(4, size // 2, size - 4, size // 2)
+                painter.drawLine(4, size - 5, size - 4, size - 5)
             elif name in ("key", "cookie"):
                 painter.drawEllipse(3, 3, size - 8, size - 8)
                 painter.drawLine(size - 6, size - 6, size - 2, size - 2)

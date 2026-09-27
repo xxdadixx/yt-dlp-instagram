@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 from typing import cast, override
 
 import requests
@@ -257,11 +258,11 @@ class DownloadWorker(QThread):
     ) -> str:
         """Streams media chunk-by-chunk with Content-Type extension validation and normalized progress pacing."""
         chunk_size = 256 * 1024  # 256 KB streaming chunks
-        req_headers = self._get_download_headers(url)
         completed_successfully = False
         actual_target_path = target_path
 
         try:
+            req_headers = self._get_download_headers(url)
             with self.session.get(
                 url,
                 headers=req_headers,
@@ -346,6 +347,15 @@ class DownloadWorker(QThread):
             if not self._is_cancelled:
                 logger.warning(
                     "Stream failed for target %s: %s", actual_target_path, exc
+                )
+            return ""
+        except Exception as unhandled_err:
+            if not self._is_cancelled:
+                logger.error(
+                    "Unexpected streaming error on %s: %s",
+                    actual_target_path,
+                    unhandled_err,
+                    exc_info=True,
                 )
             return ""
 
@@ -571,15 +581,23 @@ class DownloadWorker(QThread):
                         shortcode=shortcode,
                         ext="jpg",
                     )
-                    streamed_img = self._download_direct_stream(
-                        thumb, fallback_img_path, index, total_items
-                    )
-                    if (
-                        streamed_img
-                        and os.path.isfile(streamed_img)
-                        and os.path.getsize(streamed_img) > 0
-                    ):
-                        return streamed_img
+                    try:
+                        streamed_img = self._download_direct_stream(
+                            thumb, fallback_img_path, index, total_items
+                        )
+                        if (
+                            streamed_img
+                            and os.path.isfile(streamed_img)
+                            and os.path.getsize(streamed_img) > 0
+                        ):
+                            return streamed_img
+                    except Exception as recovery_exc:
+                        logger.error(
+                            "Photo recovery failed for %s: %s",
+                            shortcode,
+                            recovery_exc,
+                            exc_info=True,
+                        )
 
             if not self._is_cancelled:
                 logger.warning("yt-dlp download failed for %s: %s", url, exc)

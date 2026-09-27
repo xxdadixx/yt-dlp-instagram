@@ -93,6 +93,8 @@ MAX_DIRECT_INSPECT_DELAY = 1.25
 DIRECT_MACRO_DWELL_INTERVAL = 36
 DIRECT_MICRO_REST_MIN = 3.0
 DIRECT_MICRO_REST_MAX = 5.0
+DIRECT_MACRO_DWELL_MIN = DIRECT_MICRO_REST_MIN
+DIRECT_MACRO_DWELL_MAX = DIRECT_MICRO_REST_MAX
 
 # 3. Inter-Profile Cooldown
 INTER_PROFILE_COOLDOWN_MIN = 10.0
@@ -472,12 +474,11 @@ class InspectWorker(QThread):
             )
 
     def _apply_direct_item_pacing(self, item_index: int) -> None:
+        """Applies adaptive Gaussian delay or periodic micro-rest during multi-link point lookups."""
         if self.is_cancelled:
             return
         if item_index > 0 and item_index % DIRECT_MACRO_DWELL_INTERVAL == 0:
-            rest_duration = random.uniform(
-                DIRECT_MACRO_DWELL_MIN, DIRECT_MACRO_DWELL_MAX
-            )
+            rest_duration = random.uniform(DIRECT_MICRO_REST_MIN, DIRECT_MICRO_REST_MAX)
             self._sleep_interruptible(
                 rest_duration,
                 status_msg=f"⏳ Direct lookup micro-rest (item {item_index})",
@@ -576,8 +577,12 @@ class InspectWorker(QThread):
         response_url: str,
         response_text: str,
         status_code: int,
-        fatal_429: bool = False,
+        fatal_429: bool = True,
     ) -> bool:
+        """Inspects response status and content for WAF challenges or rate limits, immediately halting
+
+        worker execution and engaging the circuit breaker upon tripwire detection.
+        """
         checkpoint_indicators = (
             "/accounts/scraping_warning/",
             "checkpoint_required",
@@ -588,7 +593,6 @@ class InspectWorker(QThread):
         )
 
         final_url = response_url.lower()
-
         if any(ind in final_url for ind in checkpoint_indicators):
             logger.error("Account security checkpoint detected in URL: %s", final_url)
             self.resilient_session.trip_circuit_breaker(
@@ -600,41 +604,49 @@ class InspectWorker(QThread):
             self.cancel()
             return False
 
-        # Only check payload strings if status indicates an error or an explicit JSON response
-        if not (200 <= status_code < 300) or response_text.strip().startswith("{"):
-            lowered_text = response_text.lower()
-            for ind in checkpoint_indicators:
-                if f'"{ind}"' in lowered_text or f"'{ind}'" in lowered_text:
-                    logger.error("Hard checkpoint challenge in payload: %s", ind)
-                    self.resilient_session.trip_circuit_breaker(
-                        f"Checkpoint in payload ({ind})"
-                    )
-                    self.status_message.emit(
-                        "🛑 Account challenge triggered. Halting to protect your account."
-                    )
-                    self.cancel()
-                    return False
-
-            soft_pushbacks = (
-                "feedback_required",
-                "is_spam",
-                "action_blocked",
-                "please wait a few minutes",
-            )
-            if any(ind in lowered_text for ind in soft_pushbacks):
-                logger.warning("Soft velocity throttle on endpoint %s.", response_url)
-                return False
-
-        if status_code == 429:
-            logger.warning("HTTP 429 Rate Limit on endpoint %s", response_url)
-            if fatal_429:
+        lowered_text = response_text.lower()
+        for ind in checkpoint_indicators:
+            if f'"{ind}"' in lowered_text or f"'{ind}'" in lowered_text:
+                logger.error("Hard checkpoint challenge in payload: %s", ind)
                 self.resilient_session.trip_circuit_breaker(
-                    "HTTP 429 Rate Limit encountered"
+                    f"Checkpoint in payload ({ind})"
                 )
                 self.status_message.emit(
-                    "⚠️ HTTP 429. Halting inspection to protect account."
+                    "🛑 Account challenge triggered. Halting to protect your account."
                 )
                 self.cancel()
+                return False
+
+        soft_pushbacks = (
+            "feedback_required",
+            "is_spam",
+            "action_blocked",
+            "please wait a few minutes",
+        )
+        if any(ind in lowered_text for ind in soft_pushbacks):
+            logger.error(
+                "WAF action block challenge triggered on endpoint: %s", response_url
+            )
+            self.resilient_session.trip_circuit_breaker(
+                f"WAF action block in body ({response_url})"
+            )
+            self.status_message.emit(
+                "🛑 WAF action block triggered. Halting to protect session."
+            )
+            self.cancel()
+            return False
+
+        if status_code == 429:
+            logger.error(
+                "HTTP 429 Rate Limit encountered on endpoint: %s", response_url
+            )
+            self.resilient_session.trip_circuit_breaker(
+                "HTTP 429 Rate Limit encountered"
+            )
+            self.status_message.emit(
+                "⚠️ HTTP 429 Rate Limit. Halting inspection to protect account."
+            )
+            self.cancel()
             return False
 
         if "/accounts/login/" in final_url or status_code in (401, 403):
@@ -651,8 +663,12 @@ class InspectWorker(QThread):
         timeout: int = DEFAULT_REQUEST_TIMEOUT,
         caller_tag: str = "",
         require_auth: bool = False,
-        fatal_429: bool = False,
+        fatal_429: bool = True,
     ) -> Optional[dict[str, Any]]:
+        """Executes paced network requests through ResilientSession, enforcing fail-fast circuit-breaker
+
+        boundaries and returning parsed JSON structures.
+        """
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return None
 
@@ -702,6 +718,7 @@ class InspectWorker(QThread):
 
         except PermissionError as pe:
             logger.error("🛑 [%s] Security Tripwire: %s", caller_tag or "API", pe)
+            self.resilient_session.trip_circuit_breaker(str(pe))
             self.status_message.emit(f"🛑 [Security Alert] {pe}")
             self.cancel()
             return None
@@ -1112,20 +1129,23 @@ class InspectWorker(QThread):
     def _fetch_user_clips_graphql(
         self, username: str, user_id: str, max_items: int = 24
     ) -> int:
-        """Paginates user Reels archive using PolarisClipsTimelineProfileQuery."""
-        has_next_page = True
-        end_cursor: Optional[str] = None
-        pages = 0
-        found_count = 0
-        max_pages = self._get_max_pages_ceiling(page_size=max_items)
+        """Paginates user Reels archive using PolarisClipsTimelineProfileQuery with defensive fallbacks."""
+        if (
+            self.is_cancelled
+            or self.resilient_session.is_circuit_open
+            or not self.resilient_session.has_session_cookies()
+        ):
+            return 0
 
         uid_str = str(user_id).strip()
         if not uid_str or not uid_str.isdigit():
             return 0
 
-        if not self.resilient_session.has_session_cookies():
-            return 0
-
+        has_next_page = True
+        end_cursor: Optional[str] = None
+        pages = 0
+        found_count = 0
+        max_pages = self._get_max_pages_ceiling(page_size=max_items)
         numeric_uid = int(uid_str)
 
         while has_next_page and pages < max_pages and not self.is_cancelled:
@@ -1137,20 +1157,23 @@ class InspectWorker(QThread):
                     break
 
             variables: dict[str, Any] = {
-                "data": {
-                    "include_feed_video": True,
-                    "page_size": max_items,
-                    "target_user_id": numeric_uid,
-                }
+                "target_user_id": str(numeric_uid),
+                "page_size": max_items,
+                "include_feed_video": True,
             }
             if end_cursor:
-                variables["data"]["max_id"] = end_cursor
-                variables["after"] = end_cursor
+                variables["max_id"] = end_cursor
 
             res: Optional[dict[str, Any]] = None
-            for doc_id in DOC_ID_USER_CLIPS_FALLBACKS:
+            # Limit fallback cycling to 2 consecutive doc_id probes to prevent velocity storming
+            for attempt, doc_id in enumerate(DOC_ID_USER_CLIPS_FALLBACKS[:2], start=1):
                 if self.is_cancelled or self.resilient_session.is_circuit_open:
                     return found_count
+
+                if attempt > 1:
+                    self._apply_tier_backoff(
+                        tier_attempt=attempt, base=1.5, max_delay=3.0
+                    )
 
                 try:
                     res = self.resilient_session.execute_persisted_query(
@@ -1165,7 +1188,7 @@ class InspectWorker(QThread):
                     self.cancel()
                     return found_count
                 except Exception as exc:
-                    logger.debug("[GraphQLClips] doc_id=%s fault: %s", doc_id, exc)
+                    logger.debug("[GraphQLClips] doc_id=%s failed: %s", doc_id, exc)
 
             if not isinstance(res, dict):
                 break
@@ -1234,17 +1257,23 @@ class InspectWorker(QThread):
     def _fetch_timeline_graphql(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> int:
-        """Paginates user timeline media using PolarisProfilePostsTimelineQuery."""
+        """Paginates user timeline media using PolarisProfilePostsTimelineQuery with strict fail-fast bounds."""
+        if (
+            self.is_cancelled
+            or self.resilient_session.is_circuit_open
+            or not self.resilient_session.has_session_cookies()
+        ):
+            return 0
+
+        uid_str = str(user_id).strip()
+        if not uid_str:
+            return 0
+
         has_next_page = True
         end_cursor: str | None = None
         pages = 0
         found_count = 0
         max_pages = self._get_max_pages_ceiling(page_size=24)
-
-        if not self.resilient_session.has_session_cookies():
-            return 0
-
-        uid_str = str(user_id).strip()
 
         while has_next_page and pages < max_pages and not self.is_cancelled:
             with self._lock:
@@ -1255,22 +1284,22 @@ class InspectWorker(QThread):
                     break
 
             variables: dict[str, Any] = {
-                "data": {
-                    "count": 24,
-                    "include_relationship_info": True,
-                    "latest_besties_reel_media": True,
-                    "latest_reel_media": True,
-                },
-                "username": username,
-                "__relay_internal__pv__PolarisIsLoggedInrelayprovider": True,
+                "id": uid_str,
+                "first": 24,
             }
             if end_cursor:
                 variables["after"] = end_cursor
 
             res: dict[str, Any] | None = None
-            for doc_id in DOC_ID_TIMELINE_FALLBACKS:
+            # Limit fallback cycling to 2 consecutive doc_id probes to prevent velocity storming
+            for attempt, doc_id in enumerate(DOC_ID_TIMELINE_FALLBACKS[:2], start=1):
                 if self.is_cancelled or self.resilient_session.is_circuit_open:
                     return found_count
+
+                if attempt > 1:
+                    self._apply_tier_backoff(
+                        tier_attempt=attempt, base=1.5, max_delay=3.0
+                    )
 
                 try:
                     res = self.resilient_session.execute_persisted_query(
@@ -1285,7 +1314,7 @@ class InspectWorker(QThread):
                     self.cancel()
                     return found_count
                 except Exception as exc:
-                    logger.debug("[GraphQLTimeline] doc_id=%s fault: %s", doc_id, exc)
+                    logger.debug("[GraphQLTimeline] doc_id=%s failed: %s", doc_id, exc)
 
             if not isinstance(res, dict):
                 break
@@ -1369,7 +1398,7 @@ class InspectWorker(QThread):
     def _fetch_all_profile_media_web(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> None:
-        """Cascading profile crawler prioritizing SSR HTML extraction, Web REST APIs, and fallbacks."""
+        """Cascading profile crawler enforcing inter-tier backoffs to eliminate velocity storming."""
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return
 
@@ -1469,11 +1498,16 @@ class InspectWorker(QThread):
                                 filter_mode=filter_mode,
                                 fallback_username=username,
                             )
-                            self._sleep_interruptible(random.uniform(0.2, 0.5))
+                            self._sleep_interruptible(random.uniform(0.3, 0.6))
         except Exception as exc:
             logger.debug("Tier 1 HTML markup fault: %s", exc)
 
         if _is_limit_reached():
+            return
+
+        # Tier 1 -> Tier 2 Inter-Tier Transition Backoff
+        self._apply_tier_backoff(tier_attempt=1, base=1.5, max_delay=3.0)
+        if self.resilient_session.is_circuit_open:
             return
 
         # =========================================================================
@@ -1500,6 +1534,7 @@ class InspectWorker(QThread):
                 )
 
                 if filter_mode == "all" and not _is_limit_reached():
+                    self._apply_tier_backoff(tier_attempt=1, base=1.2, max_delay=2.2)
                     self._fetch_user_clips_web(username, user_id, max_items=24)
         except Exception as exc:
             logger.debug("Tier 2 Web REST API fault: %s", exc)
@@ -1509,11 +1544,15 @@ class InspectWorker(QThread):
         ):
             return
 
+        # Tier 2 -> Tier 3 Inter-Tier Transition Backoff
+        self._apply_tier_backoff(tier_attempt=2, base=2.0, max_delay=4.0)
+        if self.resilient_session.is_circuit_open:
+            return
+
         # =========================================================================
         # TIER 3: GraphQL Persisted Query Fallback
         # =========================================================================
         if self.resilient_session.has_session_cookies():
-            self._apply_tier_backoff(tier_attempt=1, base=1.2, max_delay=2.0)
             try:
                 if is_reels_focus:
                     self.status_message.emit(
@@ -1533,10 +1572,14 @@ class InspectWorker(QThread):
         if len(self.seen_ids) > initial_count or self.is_cancelled:
             return
 
+        # Tier 3 -> Tier 4 Inter-Tier Transition Backoff
+        self._apply_tier_backoff(tier_attempt=3, base=2.5, max_delay=5.0)
+        if self.resilient_session.is_circuit_open:
+            return
+
         # =========================================================================
         # TIER 4: Engine Fallback (yt-dlp)
         # =========================================================================
-        self._apply_tier_backoff(tier_attempt=2, base=2.0, max_delay=3.5)
         try:
             self.status_message.emit("⚙️ [Tier 4: Engine Fallback] Running yt-dlp...")
             self._inspect_via_ytdlp(

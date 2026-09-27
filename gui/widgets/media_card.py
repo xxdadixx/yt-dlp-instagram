@@ -6,6 +6,7 @@ specular mouse illumination, and robust QThreadPool thumbnail lifecycle manageme
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import (
@@ -156,25 +157,44 @@ class ThumbnailHoverPopup(QWidget):
     def set_preview_pixmap(self, pixmap: QPixmap) -> None:
         if pixmap and not pixmap.isNull():
             target_w, target_h = 260, 340
-            scaled = pixmap.scaled(
-                target_w,
-                target_h,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            crop_x = max(0, (scaled.width() - target_w) // 2)
-            crop_y = max(0, (scaled.height() - target_h) // 2)
-            cropped = scaled.copy(crop_x, crop_y, target_w, target_h)
+
+            # Prevent blurriness if the source image is low-resolution by limiting upscale stretching
+            if pixmap.width() < target_w or pixmap.height() < target_h:
+                max_scale_w = int(pixmap.width() * 1.5)
+                max_scale_h = int(pixmap.height() * 1.5)
+                scaled = pixmap.scaled(
+                    min(target_w, max_scale_w),
+                    min(target_h, max_scale_h),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                crop_x, crop_y = 0, 0
+                final_draw_w, final_draw_h = scaled.width(), scaled.height()
+                draw_x = (target_w - final_draw_w) // 2
+                draw_y = (target_h - final_draw_h) // 2
+                cropped = scaled
+            else:
+                scaled = pixmap.scaled(
+                    target_w,
+                    target_h,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                crop_x = max(0, (scaled.width() - target_w) // 2)
+                crop_y = max(0, (scaled.height() - target_h) // 2)
+                cropped = scaled.copy(crop_x, crop_y, target_w, target_h)
+                final_draw_w, final_draw_h = target_w, target_h
+                draw_x, draw_y = 0, 0
 
             rounded = QPixmap(target_w, target_h)
             rounded.fill(Qt.GlobalColor.transparent)
             painter = QPainter(rounded)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             path = QPainterPath()
             path.addRoundedRect(QRectF(0, 0, target_w, target_h), 10.0, 10.0)
             painter.setClipPath(path)
-            painter.drawPixmap(0, 0, cropped)
+            painter.drawPixmap(draw_x, draw_y, final_draw_w, final_draw_h, cropped)
             painter.end()
 
             self.lbl_image.setPixmap(rounded)
@@ -853,3 +873,13 @@ class MediaCard(QFrame):
         painter.setPen(pen)
         painter.drawPath(path)
         painter.end()
+
+    def set_view_mode(self, mode: str) -> None:
+        """Toggles the card's footprint between full thumbnail (grid) and compact metadata (list)."""
+        if mode == "list":
+            self.lbl_thumb.hide()
+            self.setFixedHeight(68)
+        else:
+            self.lbl_thumb.show()
+            self.setFixedHeight(104)
+        self.update()

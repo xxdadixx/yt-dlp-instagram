@@ -1,7 +1,9 @@
 {
-    "venvPath": ".",
-    "venv": "venv",
-    "typeCheckingMode": "off",
-    "reportMissingImports": "warning",
-    "reportMissingTypeStubs": false
-  }
+  "venvPath": ".",
+  "venv": "venv",
+  "typeCheckingMode": "off",
+  "reportUndefinedVariable": "error",
+  "reportUnboundVariable": "error",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": false
+}

@@ -145,20 +145,24 @@ class MainWindow(QMainWindow):
         self.auto_clear_downloaded: bool = False
         self.profile_mode: str = "all"
         self.quality_preset: str = "best_video"
+        self.url_view_mode: str = "grid"
         self._last_clipboard_text: str = ""
         self._queue_scroll_anim: Optional[QPropertyAnimation] = None
         self._saved_geometry_hex: str = ""
         self._is_maximized: bool = False
 
+        # Load persisted settings before building UI
         self.load_settings()
         os.makedirs(self.save_folder, exist_ok=True)
 
         self._setup_logging()
-        self.init_ui()
 
+        # Initialize CookieManager and credential strings BEFORE init_ui()
         self.cookie_manager = CookieManager()
         self.cookie_str: str = self.cookie_manager.get_cookie_string()
         self.cookie_file: str = self.cookie_manager.get_cookie_file_path() or ""
+
+        self.init_ui()
 
         self.apply_translations()
         self.setup_clipboard_monitor()
@@ -258,7 +262,10 @@ class MainWindow(QMainWindow):
 
         # 2. URL Input Bar
         self.url_container = URLChipInput(self)
+        self.url_container.set_cookie_str(self.cookie_str)
+        self.url_container.set_view_mode(getattr(self, "url_view_mode", "grid"))
         self.url_container.urls_changed.connect(self._on_urls_list_updated)
+        self.url_container.view_mode_changed.connect(self._on_url_view_mode_changed)
         main_layout.addWidget(self.url_container.input_widget)
 
         # 3. Action Strip: Auto-Paste + Profile Mode + Crawl Limit + Inspect
@@ -362,6 +369,19 @@ class MainWindow(QMainWindow):
         )
         self.chk_auto_clear.stateChanged.connect(self._on_auto_clear_toggle)
         queue_bar.addWidget(self.chk_auto_clear)
+
+        # Toggle View Mode (Icon Only - Scaled)
+        self.btn_view_mode = QPushButton(self)
+        self.btn_view_mode.setObjectName("GlassActionButton")
+        self.btn_view_mode.setFixedSize(36, 32)
+        self.btn_view_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_mode.setToolTip("Toggle Grid/List View")
+        current_icon = (
+            "list" if getattr(self, "view_mode", "grid") == "grid" else "grid"
+        )
+        self._set_button_icon(self.btn_view_mode, current_icon, "#A0A0B2", 16)
+        self.btn_view_mode.clicked.connect(self.toggle_view_mode)
+        queue_bar.addWidget(self.btn_view_mode)
 
         # Select All (Icon Only - Scaled)
         self.btn_select_all = QPushButton(self)
@@ -619,7 +639,9 @@ class MainWindow(QMainWindow):
                 # Resynchronize scroll viewport after tab switch
                 QTimer.singleShot(80, self.url_container.smooth_scroll_to_bottom)
         except Exception as exc:
-            logger.debug("Clipboard processing error: %s", exc)
+            logger.error(
+                "Clipboard processing encountered an error: %s", exc, exc_info=True
+            )
 
     def _on_urls_list_updated(self) -> None:
         count = self.url_container.count()
@@ -715,6 +737,7 @@ class MainWindow(QMainWindow):
             return
 
         card = MediaCard(item_data, parent=self)
+        card.set_view_mode(getattr(self, "view_mode", "grid"))
         card.deleted.connect(lambda: self.remove_card(card))
         card.card_clicked.connect(self._on_card_clicked)
         card.selection_changed.connect(self._schedule_ui_refresh)
@@ -1121,9 +1144,15 @@ class MainWindow(QMainWindow):
                 self.tr_text("cookie_connected", user=user_id or "Active")
             )
             self.lbl_cookie_status.setStyleSheet("color: #10B981;")
+            if hasattr(self, "url_container"):
+                self.url_container.set_cookie_str(
+                    self.cookie_manager.get_cookie_string()
+                )
         else:
             self.lbl_cookie_status.setText(self.tr_text("cookie_disconnected"))
             self.lbl_cookie_status.setStyleSheet("color: #A0A0B2;")
+            if hasattr(self, "url_container"):
+                self.url_container.set_cookie_str("")
 
     def clear_completed_cards(self, silent: bool = False) -> None:
         """Batches removal of finished downloads with a single layout reflow pass."""
@@ -1196,6 +1225,35 @@ class MainWindow(QMainWindow):
             self.save_settings()
             self.show_toast(f"Save folder: {self.save_folder}")
 
+    def _on_url_view_mode_changed(self, mode: str) -> None:
+        self.url_view_mode = mode
+        self.save_settings()
+
+    def load_settings(self) -> None:
+        settings_path = self._resolve_settings_file()
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if isinstance(d, dict):
+                    self.save_folder = d.get("save_folder", self.save_folder)
+                    self.current_lang = d.get("language", self.current_lang)
+                    self.auto_clipboard = bool(
+                        d.get("auto_clipboard", self.auto_clipboard)
+                    )
+                    self.auto_clear_downloaded = bool(
+                        d.get("auto_clear_downloaded", self.auto_clear_downloaded)
+                    )
+                    self.profile_mode = d.get("profile_mode", self.profile_mode)
+                    self.quality_preset = d.get("quality_preset", self.quality_preset)
+                    self.url_view_mode = d.get("url_view_mode", "grid")
+                    if hasattr(self, "url_container"):
+                        self.url_container.set_view_mode(self.url_view_mode)
+                    self._saved_geometry_hex = d.get("window_geometry", "")
+                    self._is_maximized = bool(d.get("window_maximized", False))
+            except Exception as e:
+                logger.debug("Failed to load settings: %s", e)
+
     def open_save_folder(self) -> None:
         if os.path.exists(self.save_folder):
             if sys.platform == "win32":
@@ -1238,6 +1296,10 @@ class MainWindow(QMainWindow):
                     )
                     self.profile_mode = d.get("profile_mode", self.profile_mode)
                     self.quality_preset = d.get("quality_preset", self.quality_preset)
+                    url_mode = d.get("url_view_mode", "list")
+                    if hasattr(self, "url_container"):
+                        self.url_container.set_view_mode(url_mode)
+                    self.view_mode = d.get("view_mode", "grid")
                     self._saved_geometry_hex = d.get("window_geometry", "")
                     self._is_maximized = bool(d.get("window_maximized", False))
             except Exception as e:
@@ -1255,6 +1317,7 @@ class MainWindow(QMainWindow):
                 "auto_clear_downloaded": self.auto_clear_downloaded,
                 "profile_mode": self.profile_mode,
                 "quality_preset": self.quality_preset,
+                "url_view_mode": getattr(self.url_container, "view_mode", "grid"),
                 "window_geometry": geometry_hex,
                 "window_maximized": self.isMaximized(),
             }
@@ -1293,7 +1356,13 @@ class MainWindow(QMainWindow):
                 self.download_worker.terminate()
                 self.download_worker.wait(500)
 
-        # 3. Clean up MediaCard thumbnail loaders
+        # 3. Clean up URL deck event filters and popups
+        if hasattr(self, "url_container") and self.url_container:
+            cleanup_fn = getattr(self.url_container, "cleanup", None)
+            if callable(cleanup_fn):
+                cleanup_fn()
+
+        # 4. Clean up MediaCard thumbnail loaders
         for card in self.cards:
             card.cleanup()
 
@@ -1370,3 +1439,21 @@ class MainWindow(QMainWindow):
             )
             input_has_text = bool(self.url_container.input_edit.text().strip())
             self.url_container.btn_add.setEnabled(input_has_text and not is_inspecting)
+
+    def toggle_view_mode(self) -> None:
+        """Flips the active presentation mode and dynamically reflows all cards in the queue."""
+        self.view_mode = (
+            "list" if getattr(self, "view_mode", "grid") == "grid" else "grid"
+        )
+        # The icon shows the action you CAN take (i.e., if in grid, show list icon)
+        next_icon = "list" if self.view_mode == "grid" else "grid"
+        self._set_button_icon(self.btn_view_mode, next_icon, "#A0A0B2", 16)
+
+        self.scroll_widget.setUpdatesEnabled(False)
+        try:
+            for card in self.cards:
+                card.set_view_mode(self.view_mode)
+        finally:
+            self.scroll_widget.setUpdatesEnabled(True)
+
+        self.save_settings()
