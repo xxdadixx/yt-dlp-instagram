@@ -1230,29 +1230,32 @@ class MainWindow(QMainWindow):
         self.save_settings()
 
     def load_settings(self) -> None:
+        """Loads and applies persistent workspace preferences and window geometry."""
         settings_path = self._resolve_settings_file()
-        if os.path.exists(settings_path):
-            try:
-                with open(settings_path, "r", encoding="utf-8") as f:
-                    d = json.load(f)
-                if isinstance(d, dict):
-                    self.save_folder = d.get("save_folder", self.save_folder)
-                    self.current_lang = d.get("language", self.current_lang)
-                    self.auto_clipboard = bool(
-                        d.get("auto_clipboard", self.auto_clipboard)
-                    )
-                    self.auto_clear_downloaded = bool(
-                        d.get("auto_clear_downloaded", self.auto_clear_downloaded)
-                    )
-                    self.profile_mode = d.get("profile_mode", self.profile_mode)
-                    self.quality_preset = d.get("quality_preset", self.quality_preset)
-                    self.url_view_mode = d.get("url_view_mode", "grid")
-                    if hasattr(self, "url_container"):
-                        self.url_container.set_view_mode(self.url_view_mode)
-                    self._saved_geometry_hex = d.get("window_geometry", "")
-                    self._is_maximized = bool(d.get("window_maximized", False))
-            except Exception as e:
-                logger.debug("Failed to load settings: %s", e)
+        if not os.path.exists(settings_path):
+            return
+
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                self.save_folder = str(d.get("save_folder", self.save_folder))
+                self.current_lang = str(d.get("language", self.current_lang))
+                self.auto_clipboard = bool(d.get("auto_clipboard", self.auto_clipboard))
+                self.auto_clear_downloaded = bool(
+                    d.get("auto_clear_downloaded", self.auto_clear_downloaded)
+                )
+                self.profile_mode = str(d.get("profile_mode", self.profile_mode))
+                self.quality_preset = str(d.get("quality_preset", self.quality_preset))
+                self.url_view_mode = str(d.get("url_view_mode", "grid"))
+                self.view_mode = str(d.get("view_mode", "grid"))
+                self._saved_geometry_hex = str(d.get("window_geometry", ""))
+                self._is_maximized = bool(d.get("window_maximized", False))
+
+                if hasattr(self, "url_container"):
+                    self.url_container.set_view_mode(self.url_view_mode)
+        except Exception as e:
+            logger.debug("Failed to load settings from %s: %s", settings_path, e)
 
     def open_save_folder(self) -> None:
         if os.path.exists(self.save_folder):
@@ -1306,6 +1309,7 @@ class MainWindow(QMainWindow):
                 logger.debug("Failed to load settings: %s", e)
 
     def save_settings(self) -> None:
+        """Serializes workspace configuration, view layout, and geometry to AppData."""
         settings_path = self._resolve_settings_file()
         try:
             os.makedirs(os.path.dirname(settings_path), exist_ok=True)
@@ -1317,14 +1321,15 @@ class MainWindow(QMainWindow):
                 "auto_clear_downloaded": self.auto_clear_downloaded,
                 "profile_mode": self.profile_mode,
                 "quality_preset": self.quality_preset,
-                "url_view_mode": getattr(self.url_container, "view_mode", "grid"),
+                "url_view_mode": getattr(self, "url_view_mode", "grid"),
+                "view_mode": getattr(self, "view_mode", "grid"),
                 "window_geometry": geometry_hex,
                 "window_maximized": self.isMaximized(),
             }
             with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
         except Exception as e:
-            logger.debug("Failed to save settings: %s", e)
+            logger.debug("Failed to save settings to %s: %s", settings_path, e)
 
     def closeEvent(self, event) -> None:
         """Cooperatively signals running workers and waits for thread completion before window tear-down."""

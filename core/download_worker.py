@@ -606,46 +606,26 @@ class DownloadWorker(QThread):
     def _process_single_item(
         self, item: dict[str, object], index: int, total_items: int
     ) -> str:
+        """Executes fast-path direct CDN chunk streaming for pre-hydrated profile media,
+        bypassing heavyweight yt-dlp processes unless direct streaming encounters a transport fault.
+        """
         if self._is_cancelled or self.isInterruptionRequested():
             return ""
 
-        raw_user = str(item.get("username") or "").strip()
+        raw_user = str(item.get("username") or "instagram").strip()
         shortcode = str(
             item.get("shortcode") or item.get("id") or f"media_{index}"
         ).strip()
-
-        # Sanitize and resolve handle
-        is_numeric_id = raw_user.isdigit()
-        is_generic = raw_user.lower() in ("instagram", "instagram_user", "")
-        has_invalid_chars = bool(re.search(r"[^\w\.]", raw_user))
-
-        if is_numeric_id or is_generic or has_invalid_chars:
-            raw_url = str(item.get("url") or item.get("webpage_url") or "")
-            m_user = re.search(
-                r"instagram\.com/([a-zA-Z0-9_\.]+)/(?:p|reel|reels|tv)/",
-                raw_url,
-                re.IGNORECASE,
-            )
-            if m_user and m_user.group(1).lower() not in ("p", "reel", "reels", "tv"):
-                raw_user = m_user.group(1)
-            else:
-                caption = str(item.get("caption") or item.get("title") or "")
-                cap_match = re.match(r"^([a-zA-Z0-9_\.]{3,30})", caption)
-                if cap_match and cap_match.group(1).lower() != "instagram":
-                    raw_user = cap_match.group(1)
-                elif is_numeric_id or is_generic:
-                    raw_user = "instagram"
-
-        clean_user = re.sub(r"[^a-zA-Z0-9_\.]+", "_", raw_user).strip("_")
+        clean_user = sanitize_filename(raw_user, fallback="instagram")
         username = clean_user if clean_user else "instagram"
 
-        # 1. Multi-Item Carousel -> Direct Stream Each Slide
-        raw_slides: object = item.get("slides")
+        # -------------------------------------------------------------------------
+        # Case 1: Multi-Item Carousel -> Direct Stream All Slides Sequentially
+        # -------------------------------------------------------------------------
+        raw_slides = item.get("slides")
         if isinstance(raw_slides, list) and len(raw_slides) > 0:
             slides_list: list[dict[str, object]] = [
-                cast(dict[str, object], s)
-                for s in cast(list[object], raw_slides)
-                if isinstance(s, dict)
+                cast(dict[str, object], s) for s in raw_slides if isinstance(s, dict)
             ]
             total_slides = len(slides_list)
             saved_any = False
@@ -660,7 +640,8 @@ class DownloadWorker(QThread):
                     or slide.get("video_url")
                     or slide.get("thumbnail_url")
                     or ""
-                )
+                ).strip()
+
                 is_vid = bool(slide.get("is_video"))
                 ext = "mp4" if is_vid else "jpg"
                 slide_path = self._build_filepath(
@@ -686,49 +667,35 @@ class DownloadWorker(QThread):
                     except Exception as s_err:
                         if self._is_cancelled or self.isInterruptionRequested():
                             return ""
-                        logger.debug("Slide %d direct stream failed: %s", s_idx, s_err)
+                        logger.debug("Slide %d streaming fault: %s", s_idx, s_err)
 
-            if self._is_cancelled or self.isInterruptionRequested():
-                return ""
             if saved_any:
                 return last_path
             return self._download_via_ytdlp(
                 item, username, shortcode, index, total_items
             )
 
-        # 2. Single Post / Reel / Image / Story -> Direct Stream
+        # -------------------------------------------------------------------------
+        # Case 2: Standalone Video, Reel, or Photograph
+        # -------------------------------------------------------------------------
         direct_url = str(
             item.get("download_url")
-            or item.get("media_url")
             or item.get("video_url")
+            or item.get("thumbnail_url")
             or ""
-        )
-        thumb_url = str(item.get("thumbnail_url") or "")
+        ).strip()
 
-        # Reconcile media type
-        if "is_video" in item:
-            is_video = bool(item["is_video"])
-        elif bool(item.get("video_url")):
-            is_video = True
-        else:
-            media_type = str(item.get("type") or item.get("media_type") or "").upper()
-            is_video = "VIDEO" in media_type or "REEL" in media_type
-
-        # If direct_url is a webpage URL and this item is a photo, use thumbnail_url as CDN target
-        is_web_url = any(
-            x in direct_url for x in ("/p/", "/reel/", "/reels/", "/tv/", "/stories/")
+        is_vid = bool(
+            item.get("is_video")
+            or bool(item.get("video_url"))
+            or "VIDEO" in str(item.get("media_type", "")).upper()
+            or "REEL" in str(item.get("media_type", "")).upper()
         )
-        if (
-            (not direct_url or is_web_url)
-            and not is_video
-            and thumb_url.startswith("http")
-        ):
-            direct_url = thumb_url
 
         ext = (
             "mp3"
             if self.quality_preset == "audio_only"
-            else ("mp4" if is_video else "jpg")
+            else ("mp4" if is_vid else "jpg")
         )
         target_path = self._build_filepath(
             item_or_username=username,
@@ -736,32 +703,32 @@ class DownloadWorker(QThread):
             ext=ext,
         )
 
-        is_direct_cdn = bool(
+        # Fast-Path: Validate direct CDN URL presence
+        is_cdn_candidate = (
             self.quality_preset != "audio_only"
-            and direct_url
-            and direct_url.startswith("http")
+            and direct_url.startswith(("http://", "https://"))
             and not any(
                 x in direct_url
                 for x in ("/p/", "/reel/", "/reels/", "/tv/", "/stories/")
             )
         )
 
-        if is_direct_cdn:
+        if is_cdn_candidate:
             try:
-                stream_res = self._download_direct_stream(
+                streamed_target = self._download_direct_stream(
                     direct_url, target_path, index, total_items
                 )
                 if (
-                    stream_res
-                    and os.path.isfile(stream_res)
-                    and os.path.getsize(stream_res) > 0
+                    streamed_target
+                    and os.path.isfile(streamed_target)
+                    and os.path.getsize(streamed_target) > 0
                 ):
-                    return stream_res
+                    return streamed_target
             except Exception as stream_err:
                 if self._is_cancelled or self.isInterruptionRequested():
                     return ""
                 logger.warning(
-                    "Direct stream exception for %s_%s: %s",
+                    "Fast-path CDN stream failed for %s_%s: %s",
                     username,
                     shortcode,
                     stream_err,
@@ -770,7 +737,9 @@ class DownloadWorker(QThread):
         if self._is_cancelled or self.isInterruptionRequested():
             return ""
 
-        # 3. yt-dlp Scrape Fallback
+        # -------------------------------------------------------------------------
+        # Case 3: Secondary Extractor Fallback (yt-dlp)
+        # -------------------------------------------------------------------------
         return self._download_via_ytdlp(item, username, shortcode, index, total_items)
 
     @override
