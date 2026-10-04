@@ -492,19 +492,30 @@ class InspectWorker(QThread):
     def _apply_tier_backoff(
         self,
         tier_attempt: int,
-        base: float = 2.0,
-        max_delay: float = 6.0,
+        base: float = 2.5,
+        max_delay: float = 8.0,
         is_throttled: bool = False,
     ) -> None:
-        if self.is_cancelled:
+        """Applies adaptive exponential backoff with Gaussian jitter before cascading to a secondary tier.
+        Enforces defensive cooldowns if previous requests encountered throttles or action blocks.
+        """
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
             return
 
-        effective_base = base * (2.5 if is_throttled else 1.0)
+        effective_base = base * (3.0 if is_throttled else 1.0)
         effective_max = max_delay * (2.0 if is_throttled else 1.0)
-        upper_bound = min(effective_max, effective_base * (2.0 ** min(tier_attempt, 3)))
-        delay = random.uniform(effective_base, max(effective_base + 0.5, upper_bound))
+        calculated_delay = min(
+            effective_max, effective_base * (1.8 ** min(tier_attempt, 3))
+        )
+        jitter = random.gauss(0.0, 0.4)
+        delay = max(effective_base, calculated_delay + jitter)
 
-        self._sleep_interruptible(delay, status_msg="🛡️ Pacing tier fallback transition")
+        msg = (
+            "⏳ Rate limit cooldown before fallback"
+            if is_throttled
+            else "🛡️ Pacing tier fallback transition"
+        )
+        self._sleep_interruptible(delay, status_msg=msg)
 
     def _build_headers(
         self,
@@ -579,8 +590,8 @@ class InspectWorker(QThread):
         status_code: int,
         fatal_429: bool = False,
     ) -> bool:
-        """Inspects response status and content for WAF challenges. Halts worker execution strictly
-        upon unrecoverable account checkpoints, gracefully reporting transient rate limits without cancelling.
+        """Inspects response status and content for WAF challenges. Halts worker execution immediately
+        upon unrecoverable account checkpoints or velocity action blocks to protect the session.
         """
         checkpoint_indicators = (
             "/accounts/scraping_warning/",
@@ -611,30 +622,37 @@ class InspectWorker(QThread):
                     f"Checkpoint in payload ({ind})"
                 )
                 self.status_message.emit(
-                    "🛑 Account challenge triggered. Halting to protect your account."
+                    "🛑 Account challenge triggered. Halting to protect account."
                 )
                 self.cancel()
                 return False
 
-        # Soft pushbacks on specific endpoints must fail the endpoint, not cancel the worker
+        # Soft pushbacks indicating velocity or spam flagging must halt the session
         soft_pushbacks = (
             "feedback_required",
             "is_spam",
             "action_blocked",
             "please wait a few minutes",
         )
-        if any(ind in lowered_text for ind in soft_pushbacks):
-            logger.warning(
-                "Endpoint velocity limit / soft pushback on %s: %s",
-                response_url,
-                response_text[:80],
-            )
-            return False
+        for ind in soft_pushbacks:
+            if ind in lowered_text:
+                logger.warning(
+                    "Endpoint velocity limit / action block encountered: %s", ind
+                )
+                self.resilient_session.trip_circuit_breaker(f"Action block: {ind}")
+                self.status_message.emit(
+                    "🛑 Action limit encountered. Halting to protect account."
+                )
+                self.cancel()
+                return False
 
         if status_code == 429:
-            logger.warning("HTTP 429 Rate Limit on %s", response_url)
+            logger.warning("HTTP 429 Rate Limit encountered on %s", response_url)
             if fatal_429:
                 self.resilient_session.trip_circuit_breaker("HTTP 429 Rate Limit")
+                self.status_message.emit(
+                    "🛑 Rate limit encountered (HTTP 429). Halting."
+                )
                 self.cancel()
             return False
 
@@ -1470,11 +1488,11 @@ class InspectWorker(QThread):
     def _fetch_all_profile_media_web(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> None:
-        """High-throughput profile stream engine with seamless fallback failover.
+        """High-throughput profile stream engine with defensive fallback failover.
         Ingests Page 0 via HTML hydration, traverses cursor streams across dual REST/GraphQL
-        channels, and fails over to yt-dlp if pagination stalls before meeting crawl limits.
+        channels, and fails over to yt-dlp only if pagination stalls without tripping circuit breakers.
         """
-        if self.is_cancelled:
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
             return
 
         is_reels_only = filter_mode == "reels"
@@ -1489,7 +1507,7 @@ class InspectWorker(QThread):
         )
 
         def _is_budget_exhausted() -> bool:
-            if self.is_cancelled:
+            if self.is_cancelled or self.resilient_session.is_circuit_open:
                 return True
             with self._lock:
                 return (
@@ -1501,6 +1519,9 @@ class InspectWorker(QThread):
         # STAGE 1: Single-Pass Document Hydration & Page 0 Ingestion
         # -------------------------------------------------------------------------
         resolved_uid, initial_nodes, _ = self._hydrate_profile_via_html(username)
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
+            return
+
         active_user_id = resolved_uid or user_id
 
         if not active_user_id:
@@ -1508,6 +1529,7 @@ class InspectWorker(QThread):
                 "Could not resolve numeric User ID for @%s; delegating to engine fallback.",
                 username,
             )
+            self._apply_tier_backoff(tier_attempt=1, base=3.0, max_delay=6.0)
             self._inspect_via_ytdlp(
                 f"{IG_BASE_URL}/{username}/",
                 default_username=username,
@@ -1515,7 +1537,7 @@ class InspectWorker(QThread):
             )
             return
 
-        # Emit Page 0 items discovered directly in the initial HTML response
+        # Emit Page 0 items discovered directly in the initial HTML markup
         if initial_nodes and not is_reels_only:
             for node in initial_nodes:
                 if _is_budget_exhausted():
@@ -1561,7 +1583,7 @@ class InspectWorker(QThread):
                 and self.resilient_session.has_session_cookies()
                 and not _is_budget_exhausted()
             ):
-                self._apply_tier_backoff(tier_attempt=1, base=1.5, max_delay=3.0)
+                self._apply_tier_backoff(tier_attempt=1, base=2.0, max_delay=4.0)
                 paginated_items += self._fetch_user_clips_graphql(
                     username, active_user_id, max_items=24
                 )
@@ -1580,14 +1602,14 @@ class InspectWorker(QThread):
                 and self.resilient_session.has_session_cookies()
                 and not _is_budget_exhausted()
             ):
-                self._apply_tier_backoff(tier_attempt=1, base=1.5, max_delay=3.0)
+                self._apply_tier_backoff(tier_attempt=1, base=2.0, max_delay=4.0)
                 paginated_items += self._fetch_timeline_graphql(
                     username, active_user_id, filter_mode=filter_mode
                 )
 
             # In 'all' mode, harvest clips from the dedicated Reels endpoint
             if filter_mode == "all" and not _is_budget_exhausted():
-                self._apply_tier_backoff(tier_attempt=1, base=1.5, max_delay=2.5)
+                self._apply_tier_backoff(tier_attempt=1, base=2.0, max_delay=3.5)
                 self.status_message.emit(
                     f"🎬 [Stream Engine] Harvesting dedicated Reels tab for @{username}..."
                 )
@@ -1598,19 +1620,21 @@ class InspectWorker(QThread):
         # -------------------------------------------------------------------------
         # STAGE 3: Failover Engine Fallback (yt-dlp)
         # -------------------------------------------------------------------------
+        if self.is_cancelled or self.resilient_session.is_circuit_open:
+            return
+
         with self._lock:
             current_total = len(self.seen_ids)
 
-        # Trigger yt-dlp if API pagination stalled and the requested budget is unfulfilled
-        needs_more_items = not self.is_cancelled and (
+        needs_more_items = (
             self.max_items_per_profile == 0
             or current_total < self.max_items_per_profile
         )
 
         if needs_more_items and paginated_items == 0:
-            self._apply_tier_backoff(tier_attempt=2, base=2.0, max_delay=4.0)
+            self._apply_tier_backoff(tier_attempt=2, base=3.5, max_delay=7.0)
             self.status_message.emit(
-                f"⚙️️ [Stream Engine] API pagination stalled; executing engine fallback (yt-dlp) for @{username}..."
+                f"⚙ [Stream Engine] API pagination stalled; executing engine fallback (yt-dlp) for @{username}..."
             )
             target_profile_url = (
                 f"{IG_BASE_URL}/{username}/reels/"
@@ -1623,7 +1647,6 @@ class InspectWorker(QThread):
                 filter_mode=filter_mode,
             )
 
-            # For 'all' mode, also crawl the reels path with yt-dlp if more items are required
             if filter_mode == "all" and not self.is_cancelled:
                 with self._lock:
                     after_main = len(self.seen_ids)
@@ -1631,6 +1654,7 @@ class InspectWorker(QThread):
                     self.max_items_per_profile == 0
                     or after_main < self.max_items_per_profile
                 ):
+                    self._apply_tier_backoff(tier_attempt=1, base=2.0, max_delay=4.0)
                     self._inspect_via_ytdlp(
                         f"{IG_BASE_URL}/{username}/reels/",
                         default_username=username,

@@ -231,7 +231,7 @@ class ResilientSession:
         self, status_code: int, response_text: str = "", was_authenticated: bool = False
     ) -> None:
         """Evaluates upstream network and WAF challenge failures. Trips the circuit breaker
-        and quarantines cookies strictly upon genuine account checkpoints or challenge tripwires.
+        immediately upon genuine account checkpoints, challenge tripwires, or action blocks.
         """
         if 200 <= status_code < 300:
             return
@@ -239,9 +239,13 @@ class ResilientSession:
         with self._lock:
             lowered_text = response_text.lower()
             is_rate_limit = status_code == 429
+
+            # Immediate hard blocks that require account checkpoint or re-authentication
             is_hard_action_block = any(
                 sig in lowered_text for sig in self.HARD_ACTION_BLOCK_SIGNALS
             )
+
+            # Soft pushbacks indicating velocity or scraping flags
             is_soft_action_block = any(
                 sig in lowered_text for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
             )
@@ -262,16 +266,23 @@ class ResilientSession:
                 )
             )
 
-            # Strict tripwire: Only quarantine cookies and hard-lock circuit for genuine checkpoints
+            # Strict tripwire: Hard checkpoints and expired sessions trip the breaker and quarantine credentials
             if is_hard_action_block or (was_authenticated and is_auth_expired):
                 self.trip_circuit_breaker(
-                    f"Hard Action Block / Checkpoint: {response_text[:80]}"
+                    f"Hard Action Block / Checkpoint (HTTP {status_code}): {response_text[:100]}"
                 )
                 self.cookies_quarantined = True
                 return
 
-            # Transient pushbacks and endpoint 429s increment the failure counter without killing session
-            if is_rate_limit or is_soft_action_block:
+            # Soft action blocks (feedback_required, is_spam) must trip the breaker to halt velocity storms
+            if is_soft_action_block:
+                self.trip_circuit_breaker(
+                    f"WAF Action Block Triggered (HTTP {status_code}): {response_text[:100]}"
+                )
+                return
+
+            # Pure HTTP 429 rate limits increment failure count and trip on consecutive encounters
+            if is_rate_limit:
                 self.failure_counter += 1
                 if self.failure_counter >= self.circuit_config.failure_threshold:
                     self.trip_circuit_breaker(
@@ -279,11 +290,12 @@ class ResilientSession:
                     )
                 return
 
-            if (status_code in (400, 403)) and (
+            # Allow benign GraphQL schema mismatches or 404s to pass without tripping the breaker
+            if (status_code in (400, 404)) and (
                 "execution error" in lowered_text or "page not found" in lowered_text
             ):
                 logger.debug(
-                    "GraphQL query rejected or routed to error page (HTTP %d). Skipping trip.",
+                    "GraphQL query rejected or not found (HTTP %d). Skipping tripwire.",
                     status_code,
                 )
                 return
@@ -373,7 +385,7 @@ class ResilientSession:
         require_auth: bool = True,
     ) -> tuple[int, str, dict[str, str], str]:
         """Unified HTTP dispatcher executing requests via curl_cffi Chrome impersonation.
-        Enforces fail-fast boundaries on hard checkpoints while allowing graceful handling of 429s.
+        Enforces fail-fast boundaries on hard checkpoints and soft action blocks.
         """
         self._check_circuit()
 
@@ -427,16 +439,17 @@ class ResilientSession:
                 raise ConnectionError(f"Transport network fault: {exc}") from exc
 
             lowered = text.lower()
-            is_hard_block = any(
-                sig in lowered for sig in self.HARD_ACTION_BLOCK_SIGNALS
+            is_challenge = any(sig in lowered for sig in self.HARD_ACTION_BLOCK_SIGNALS)
+            is_action_block = any(
+                sig in lowered for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
             )
 
-            if is_hard_block:
+            if is_challenge or is_action_block:
                 self._record_failure(
                     status_code, text, was_authenticated=effective_auth
                 )
                 raise PermissionError(
-                    f"Instagram Account Challenge triggered (status={status_code}): {text[:150]}"
+                    f"Instagram WAF / Account Challenge triggered (HTTP {status_code}): {text[:150]}"
                 )
 
             if not (200 <= status_code < 300):
@@ -448,7 +461,7 @@ class ResilientSession:
             self._record_success()
             return status_code, final_url, resp_headers, text
 
-        # Fallback Branch: Standard Library urllib.request (Firefox User-Agent)
+        # Fallback Branch: Standard Library urllib.request (Firefox User-Agent to match OpenSSL TLS)
         fallback_headers = {
             k: v
             for k, v in merged_headers.items()
@@ -517,15 +530,12 @@ class ResilientSession:
                 text = raw_bytes.decode(charset, errors="replace").strip()
 
                 lowered = text.lower()
-                is_hard_block = any(
-                    sig in lowered for sig in self.HARD_ACTION_BLOCK_SIGNALS
-                )
-                if is_hard_block:
+                if any(sig in lowered for sig in self.ACTION_BLOCK_SIGNALS):
                     self._record_failure(
                         status_code, text, was_authenticated=effective_auth
                     )
                     raise PermissionError(
-                        f"Account challenge in response: {text[:150]}"
+                        f"Account challenge/action block in response: {text[:150]}"
                     )
 
                 if 200 <= status_code < 300:
@@ -554,9 +564,9 @@ class ResilientSession:
 
             self._record_failure(exc.code, err_body, was_authenticated=effective_auth)
             lowered_err = err_body.lower()
-            if any(sig in lowered_err for sig in self.HARD_ACTION_BLOCK_SIGNALS):
+            if any(sig in lowered_err for sig in self.ACTION_BLOCK_SIGNALS):
                 raise PermissionError(
-                    f"HTTP {exc.code} Account Challenge triggered: {err_body[:120]}"
+                    f"HTTP {exc.code} Account Challenge / Action Block triggered: {err_body[:120]}"
                 ) from exc
             return exc.code, exc.url or url, dict(exc.headers or {}), err_body
 
@@ -571,8 +581,8 @@ class ResilientSession:
         friendly_name: str,
         query_hash: str | None = None,
     ) -> dict[str, Any]:
-        """Executes an Instagram GraphQL query over HTTP/2. Automatically cascades from
-        Relay POST doc_id execution to query-string GET execution with fallback query hashes.
+        """Executes an Instagram GraphQL query over HTTP/2. Routes doc_id execution via RelayModern POST,
+        and automatically handles query_hash dispatch via query-string GET execution.
         """
         self._check_circuit()
         self.pace_request()
@@ -583,7 +593,6 @@ class ResilientSession:
 
         var_json = json.dumps(variables, separators=(",", ":"))
         headers: dict[str, str] = {
-            "Content-Type": "application/x-www-form-urlencoded",
             "X-FB-Friendly-Name": friendly_name,
             "X-IG-App-ID": self.WEB_APP_ID,
             "X-ASBD-ID": self.ASBD_ID,
@@ -600,52 +609,67 @@ class ResilientSession:
         if "csrftoken" in self.cookies:
             headers["X-CSRFToken"] = self.cookies["csrftoken"]
 
-        # Strategy A: Relay Modern POST Execution
-        payload: dict[str, str] = {
-            "doc_id": doc_id,
-            "variables": var_json,
-            "fb_api_caller_class": "RelayModern",
-            "fb_api_req_friendly_name": friendly_name,
-            "server_timestamps": "true",
-        }
-        if not is_auth and self.lsd_token:
-            payload["lsd"] = self.lsd_token
+        status_code: int = 0
+        text: str = ""
 
-        status_code, _, _, text = self.request(
-            method="POST",
-            url="https://www.instagram.com/graphql/query",
-            headers=headers,
-            data=payload,
-            timeout=15.0,
-            require_auth=is_auth,
-        )
-
-        # Strategy B: Query-String GET Dispatch (for doc_ids rejecting POST or query_hash fallbacks)
-        if status_code in (400, 404, 405):
-            target_identifier = query_hash or doc_id
-            param_key = "query_hash" if query_hash else "doc_id"
-            logger.debug(
-                "[%s] POST failed (HTTP %d). Attempting GET via %s...",
-                friendly_name,
-                status_code,
-                param_key,
-            )
-
+        # Strategy A: Query-Hash Execution (Mandatory GET Dispatch)
+        if query_hash:
             get_params = {
-                param_key: target_identifier,
+                "query_hash": query_hash,
                 "variables": var_json,
             }
-            get_headers = dict(headers)
-            get_headers.pop("Content-Type", None)
-
             status_code, _, _, text = self.request(
                 method="GET",
                 url="https://www.instagram.com/graphql/query",
-                headers=get_headers,
+                headers=headers,
                 params=get_params,
                 timeout=15.0,
                 require_auth=is_auth,
             )
+
+        # Strategy B: Modern Relay Persisted Document ID (POST Dispatch)
+        else:
+            post_headers = dict(headers)
+            post_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            payload: dict[str, str] = {
+                "doc_id": doc_id,
+                "variables": var_json,
+                "fb_api_caller_class": "RelayModern",
+                "fb_api_req_friendly_name": friendly_name,
+                "server_timestamps": "true",
+            }
+            if not is_auth and self.lsd_token:
+                payload["lsd"] = self.lsd_token
+
+            status_code, _, _, text = self.request(
+                method="POST",
+                url="https://www.instagram.com/graphql/query",
+                headers=post_headers,
+                data=payload,
+                timeout=15.0,
+                require_auth=is_auth,
+            )
+
+            # Strategy C: GET Fallback for doc_id if POST execution is rejected
+            if status_code in (400, 404, 405):
+                logger.debug(
+                    "[%s] POST doc_id %s rejected (HTTP %d). Attempting GET dispatch...",
+                    friendly_name,
+                    doc_id,
+                    status_code,
+                )
+                get_params = {
+                    "doc_id": doc_id,
+                    "variables": var_json,
+                }
+                status_code, _, _, text = self.request(
+                    method="GET",
+                    url="https://www.instagram.com/graphql/query",
+                    headers=headers,
+                    params=get_params,
+                    timeout=15.0,
+                    require_auth=is_auth,
+                )
 
         if status_code != 200:
             raise RuntimeError(
@@ -665,11 +689,9 @@ class ResilientSession:
                     if isinstance(first_err, dict)
                     else "GraphQL execution error"
                 )
-                if any(
-                    sig in err_msg.lower() for sig in self.HARD_ACTION_BLOCK_SIGNALS
-                ):
+                if any(sig in err_msg.lower() for sig in self.ACTION_BLOCK_SIGNALS):
                     self.trip_circuit_breaker(
-                        f"Action block in GraphQL ({friendly_name})"
+                        f"Action block in GraphQL ({friendly_name}): {err_msg}"
                     )
                     raise PermissionError(
                         f"Action block challenge in GraphQL errors: {err_msg}"
