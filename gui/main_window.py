@@ -229,11 +229,20 @@ class MainWindow(QMainWindow):
         # 1. Top Bar: App Brand + Cookie Status + Language
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(2, 0, 2, 0)
-        top_bar.setSpacing(12)
+        top_bar.setSpacing(10)
 
-        self.lbl_app_brand = QLabel("✨ Instagram Pro Studio", self)
+        self.lbl_brand_icon = QLabel(self)
+        sparkles_icon = get_icon("sparkles", color="#E1306C", size=20)
+        if sparkles_icon:
+            self.lbl_brand_icon.setPixmap(sparkles_icon.pixmap(20, 20))
+        self.lbl_brand_icon.setStyleSheet("background: transparent;")
+        top_bar.addWidget(self.lbl_brand_icon)
+
+        self.lbl_app_brand = QLabel("Instagram Pro Studio", self)
         self.lbl_app_brand.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        self.lbl_app_brand.setStyleSheet("color: #FFFFFF; letter-spacing: 0.3px;")
+        self.lbl_app_brand.setStyleSheet(
+            "color: #FFFFFF; letter-spacing: 0.3px; background: transparent;"
+        )
         top_bar.addWidget(self.lbl_app_brand)
 
         top_bar.addStretch()
@@ -242,18 +251,19 @@ class MainWindow(QMainWindow):
         self.lbl_cookie_status.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
         top_bar.addWidget(self.lbl_cookie_status)
 
-        # Import Cookie Button (Icon Only - Scaled)
+        # Import Cookie Button
         self.btn_import_cookie = QPushButton(self)
         self.btn_import_cookie.setObjectName("GlassActionButton")
-        self._set_button_icon(self.btn_import_cookie, "key", "#FCAF45", 16)
-        self.btn_import_cookie.setFixedSize(38, 34)
+        self._set_button_icon(self.btn_import_cookie, "key", "#FCAF45", 15)
+        self.btn_import_cookie.setFixedSize(36, 32)
         self.btn_import_cookie.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_import_cookie.clicked.connect(self.import_cookie)
         top_bar.addWidget(self.btn_import_cookie)
 
         self.combo_lang = NoScrollComboBox(self)
         self.combo_lang.addItems(["English (EN)", "ภาษาไทย (TH)"])
-        self.combo_lang.setFixedHeight(34)
+        self.combo_lang.setFixedHeight(32)
+        self.combo_lang.setMinimumWidth(130)
         self.combo_lang.setCurrentIndex(1 if self.current_lang == "th" else 0)
         self.combo_lang.currentIndexChanged.connect(self._on_lang_changed)
         top_bar.addWidget(self.combo_lang)
@@ -268,7 +278,7 @@ class MainWindow(QMainWindow):
         self.url_container.view_mode_changed.connect(self._on_url_view_mode_changed)
         main_layout.addWidget(self.url_container.input_widget)
 
-        # 3. Action Strip: Auto-Paste + Profile Mode + Crawl Limit + Inspect
+        # 3. Action Strip: Responsive Dropdowns Without Truncation
         action_strip = QHBoxLayout()
         action_strip.setContentsMargins(2, 0, 2, 0)
         action_strip.setSpacing(12)
@@ -282,14 +292,14 @@ class MainWindow(QMainWindow):
 
         action_strip.addStretch()
 
-        self.lbl_profile_filter = QLabel(self)
+        self.lbl_profile_filter = QLabel("Profile Mode:", self)
         self.lbl_profile_filter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
-        self.lbl_profile_filter.setStyleSheet("color: #A0A0B2;")
+        self.lbl_profile_filter.setStyleSheet("color: #8E8EA0;")
         action_strip.addWidget(self.lbl_profile_filter)
 
         self.combo_profile_mode = NoScrollComboBox(self)
-        self.combo_profile_mode.setFixedHeight(38)
-        self.combo_profile_mode.setMinimumWidth(160)
+        self.combo_profile_mode.setFixedHeight(36)
+        self.combo_profile_mode.setMinimumWidth(210)
         self.combo_profile_mode.setSizeAdjustPolicy(
             NoScrollComboBox.SizeAdjustPolicy.AdjustToContents
         )
@@ -299,7 +309,9 @@ class MainWindow(QMainWindow):
             if self.profile_mode == "all"
             else (1 if self.profile_mode == "reels" else 2)
         )
-        self.combo_profile_mode.addItems(["All Media", "Reels Only", "Photos Only"])
+        self.combo_profile_mode.addItems(
+            ["All Media (Reels + Photos)", "Reels Only", "Photos Only"]
+        )
         self.combo_profile_mode.setCurrentIndex(mode_idx)
         self.combo_profile_mode.currentIndexChanged.connect(
             self._on_profile_mode_changed
@@ -308,19 +320,19 @@ class MainWindow(QMainWindow):
 
         self.lbl_batch_limit = QLabel("Crawl Limit:", self)
         self.lbl_batch_limit.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
-        self.lbl_batch_limit.setStyleSheet("color: #A0A0B2;")
+        self.lbl_batch_limit.setStyleSheet("color: #8E8EA0;")
         action_strip.addWidget(self.lbl_batch_limit)
 
         self.combo_batch_limit = NoScrollComboBox(self)
-        self.combo_batch_limit.setFixedHeight(38)
+        self.combo_batch_limit.setFixedHeight(36)
+        self.combo_batch_limit.setMinimumWidth(185)
         self._setup_crawl_limit_selector()
         action_strip.addWidget(self.combo_batch_limit)
 
-        # Inspect Button (Icon Only - Scaled)
         self.btn_inspect = QPushButton(self)
         self.btn_inspect.setObjectName("PrimaryActionButton")
-        self.btn_inspect.setFixedSize(44, 38)
-        self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 18)
+        self.btn_inspect.setFixedSize(42, 36)
+        self._set_button_icon(self.btn_inspect, "search", "#FFFFFF", 16)
         self.btn_inspect.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_inspect.clicked.connect(self.start_inspection)
         action_strip.addWidget(self.btn_inspect)
@@ -351,26 +363,13 @@ class MainWindow(QMainWindow):
 
         queue_bar.addStretch()
 
-        # Auto-Clear Completed Toggle Checkbox
         self.chk_auto_clear = QCheckBox(self)
         self.chk_auto_clear.setChecked(self.auto_clear_downloaded)
         self.chk_auto_clear.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
-        self.chk_auto_clear.setStyleSheet(
-            """
-            QCheckBox {
-                color: #94A3B8;
-                spacing: 6px;
-                margin-right: 8px;
-            }
-            QCheckBox:hover {
-                color: #E2E8F0;
-            }
-            """
-        )
         self.chk_auto_clear.stateChanged.connect(self._on_auto_clear_toggle)
         queue_bar.addWidget(self.chk_auto_clear)
 
-        # Toggle View Mode (Icon Only - Scaled)
+        # Toggle View Mode
         self.btn_view_mode = QPushButton(self)
         self.btn_view_mode.setObjectName("GlassActionButton")
         self.btn_view_mode.setFixedSize(36, 32)
@@ -383,7 +382,7 @@ class MainWindow(QMainWindow):
         self.btn_view_mode.clicked.connect(self.toggle_view_mode)
         queue_bar.addWidget(self.btn_view_mode)
 
-        # Select All (Icon Only - Scaled)
+        # Select All
         self.btn_select_all = QPushButton(self)
         self.btn_select_all.setObjectName("GlassActionButton")
         self.btn_select_all.setFixedSize(36, 32)
@@ -392,7 +391,7 @@ class MainWindow(QMainWindow):
         self.btn_select_all.clicked.connect(self.toggle_select_all)
         queue_bar.addWidget(self.btn_select_all)
 
-        # Delete Selected (Icon Only - Scaled)
+        # Delete Selected
         self.btn_delete_selected = QPushButton(self)
         self.btn_delete_selected.setObjectName("DestructiveButton")
         self.btn_delete_selected.setFixedSize(36, 32)
@@ -401,7 +400,7 @@ class MainWindow(QMainWindow):
         self.btn_delete_selected.clicked.connect(self.delete_selected_cards)
         queue_bar.addWidget(self.btn_delete_selected)
 
-        # Clear Completed (Icon Only - Scaled)
+        # Clear Completed
         self.btn_clear_completed = QPushButton(self)
         self.btn_clear_completed.setObjectName("GlassActionButton")
         self.btn_clear_completed.setFixedSize(36, 32)
@@ -419,7 +418,12 @@ class MainWindow(QMainWindow):
         self.media_grid_layout = QVBoxLayout(self.scroll_widget)
         self.media_grid_layout.setContentsMargins(4, 4, 4, 4)
         self.media_grid_layout.setSpacing(8)
+
+        # Integrated Empty State Placeholder
+        self.empty_placeholder = EmptyQueuePlaceholder(self.scroll_widget)
+        self.media_grid_layout.addWidget(self.empty_placeholder)
         self.media_grid_layout.addStretch()
+
         self.scroll_area.setWidget(self.scroll_widget)
         queue_layout.addWidget(self.scroll_area, stretch=1)
 
@@ -443,12 +447,11 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.tab_widget, stretch=1)
 
-        # 6. Bottom Bento Bar: Folder Controls + Status + Download Action
+        # 6. Bottom Bar: Folder Controls + Status + Download Action
         bot_bar = QHBoxLayout()
         bot_bar.setContentsMargins(2, 0, 2, 0)
         bot_bar.setSpacing(10)
 
-        # Change Folder Button (Icon Only - Scaled)
         self.btn_change_folder = QPushButton(self)
         self.btn_change_folder.setObjectName("GlassActionButton")
         self.btn_change_folder.setFixedSize(38, 34)
@@ -457,7 +460,6 @@ class MainWindow(QMainWindow):
         self.btn_change_folder.clicked.connect(self.browse_save_folder)
         bot_bar.addWidget(self.btn_change_folder)
 
-        # Open Folder Button (Icon Only - Scaled)
         self.btn_open_folder = QPushButton(self)
         self.btn_open_folder.setObjectName("GlassActionButton")
         self.btn_open_folder.setFixedSize(38, 34)
@@ -475,7 +477,6 @@ class MainWindow(QMainWindow):
         self.lbl_toast.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         bot_bar.addWidget(self.lbl_toast)
 
-        # Download Action Button (Icon Only - Scaled)
         self.btn_download_all = QPushButton(self)
         self.btn_download_all.setObjectName("DownloadAllButton")
         self.btn_download_all.setFixedSize(48, 38)
@@ -486,7 +487,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(bot_bar)
 
-        # Global Selection & Action Shortcuts
+        # Global Shortcuts
         QShortcut(QKeySequence("Ctrl+A"), self, self.select_all_cards)
         QShortcut(QKeySequence("Ctrl+D"), self, self.deselect_all_cards)
         QShortcut(QKeySequence("Ctrl+I"), self, self.invert_selection)
@@ -1063,6 +1064,10 @@ class MainWindow(QMainWindow):
         total = len(cards)
         selected = sum(1 for c in cards if c.is_selected)
 
+        # Dynamically toggle empty state placeholder
+        if hasattr(self, "empty_placeholder"):
+            self.empty_placeholder.setVisible(total == 0)
+
         self.lbl_queue_count.setText(f"Media Queue ({selected}/{total} Selected)")
         self.tab_widget.setTabText(0, f"Media Queue ({selected}/{total})")
 
@@ -1139,18 +1144,38 @@ class MainWindow(QMainWindow):
 
     def update_cookie_status(self) -> None:
         if self.cookie_manager.has_cookies():
-            user_id = self.cookie_manager.get_user_id()
-            self.lbl_cookie_status.setText(
-                self.tr_text("cookie_connected", user=user_id or "Active")
+            user_id = self.cookie_manager.get_user_id() or "Active"
+            self.lbl_cookie_status.setText(f"● Connected ({user_id})")
+            self.lbl_cookie_status.setStyleSheet(
+                """
+                QLabel {
+                    color: #34D399;
+                    background: rgba(16, 185, 129, 0.08);
+                    border: 1px solid rgba(16, 185, 129, 0.22);
+                    border-radius: 6px;
+                    padding: 3px 8px;
+                    font-size: 11.5px;
+                }
+                """
             )
-            self.lbl_cookie_status.setStyleSheet("color: #10B981;")
             if hasattr(self, "url_container"):
                 self.url_container.set_cookie_str(
                     self.cookie_manager.get_cookie_string()
                 )
         else:
-            self.lbl_cookie_status.setText(self.tr_text("cookie_disconnected"))
-            self.lbl_cookie_status.setStyleSheet("color: #A0A0B2;")
+            self.lbl_cookie_status.setText("● Public Mode")
+            self.lbl_cookie_status.setStyleSheet(
+                """
+                QLabel {
+                    color: #8E8EA0;
+                    background: rgba(255, 255, 255, 0.04);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 6px;
+                    padding: 3px 8px;
+                    font-size: 11.5px;
+                }
+                """
+            )
             if hasattr(self, "url_container"):
                 self.url_container.set_cookie_str("")
 
@@ -1334,10 +1359,19 @@ class MainWindow(QMainWindow):
             logger.debug("Failed to save settings to %s: %s", settings_path, e)
 
     def closeEvent(self, event) -> None:
-        """Cooperatively signals running workers and waits for thread completion before window tear-down."""
+        """Cooperatively signals running workers, unregisters log handlers, and
+
+        waits for background threads before window tear-down.
+        """
         self.save_settings()
 
-        # 1. Halt and join InspectWorker
+        # 1. Unregister and close Qt log handler from global root logger immediately
+        if hasattr(self, "log_handler") and self.log_handler:
+            root_logger = logging.getLogger()
+            root_logger.removeHandler(self.log_handler)
+            self.log_handler.close()
+
+        # 2. Halt and join InspectWorker
         if self.inspect_worker and self.inspect_worker.isRunning():
             logger.info(
                 "Main window closing: Cooperatively cancelling InspectWorker..."
@@ -1350,7 +1384,7 @@ class MainWindow(QMainWindow):
                 self.inspect_worker.terminate()
                 self.inspect_worker.wait(500)
 
-        # 2. Halt and join DownloadWorker
+        # 3. Halt and join DownloadWorker
         if self.download_worker and self.download_worker.isRunning():
             logger.info(
                 "Main window closing: Cooperatively cancelling DownloadWorker..."
@@ -1363,13 +1397,13 @@ class MainWindow(QMainWindow):
                 self.download_worker.terminate()
                 self.download_worker.wait(500)
 
-        # 3. Clean up URL deck event filters and popups
+        # 4. Clean up URL deck event filters, popups, and preview workers
         if hasattr(self, "url_container") and self.url_container:
             cleanup_fn = getattr(self.url_container, "cleanup", None)
             if callable(cleanup_fn):
                 cleanup_fn()
 
-        # 4. Clean up MediaCard thumbnail loaders
+        # 5. Clean up MediaCard thumbnail loaders
         for card in self.cards:
             card.cleanup()
 
@@ -1464,3 +1498,68 @@ class MainWindow(QMainWindow):
             self.scroll_widget.setUpdatesEnabled(True)
 
         self.save_settings()
+
+
+class EmptyQueuePlaceholder(QFrame):
+    """Liquid Glass Empty State Placeholder with workflow cues."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setStyleSheet(
+            """
+            QFrame {
+                background: rgba(255, 255, 255, 0.015);
+                border: 1.5px dashed rgba(255, 255, 255, 0.08);
+                border-radius: 16px;
+            }
+            """
+        )
+        self.setMinimumHeight(280)
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(10)
+
+        # Centered Icon Badge
+        self.icon_badge = QLabel(self)
+        icon = get_icon("sparkles", color="#E1306C", size=32)
+        if icon:
+            self.icon_badge.setPixmap(icon.pixmap(32, 32))
+        self.icon_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.icon_badge.setStyleSheet("background: transparent; border: none;")
+        layout.addWidget(self.icon_badge)
+
+        self.lbl_title = QLabel("Media Queue is Empty", self)
+        self.lbl_title.setFont(
+            QFont("Segoe UI Variable Display", 13, QFont.Weight.Bold)
+        )
+        self.lbl_title.setStyleSheet(
+            "color: #FFFFFF; background: transparent; border: none;"
+        )
+        self.lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_title)
+
+        self.lbl_subtitle = QLabel(
+            "Paste Instagram links above or enter a profile to inspect and batch download.",
+            self,
+        )
+        self.lbl_subtitle.setFont(QFont("Segoe UI", 10))
+        self.lbl_subtitle.setStyleSheet(
+            "color: #8E8EA0; background: transparent; border: none;"
+        )
+        self.lbl_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_subtitle)
+
+        # Keyboard Shortcut Pill
+        self.lbl_hint = QLabel("Ctrl+V to Paste  •  Enter to Inspect", self)
+        self.lbl_hint.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        self.lbl_hint.setStyleSheet(
+            """
+            color: #CBD5E1;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            border-radius: 6px;
+            padding: 4px 12px;
+            """
+        )
+        self.lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_hint, alignment=Qt.AlignmentFlag.AlignCenter)

@@ -97,6 +97,31 @@ def extract_queue_sort_key(item_data: object) -> tuple[int, int, int]:
     return (target_idx, -chrono_key, sub_idx)
 
 
+class YTDLPQuietLogger:
+    """Redirects yt-dlp internal telemetry away from raw terminal stderr."""
+
+    def debug(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        logger.debug("[yt-dlp warning] %s", msg)
+
+    def error(self, msg: str) -> None:
+        # Demote audience-gated messages to warning logs
+        if (
+            "This content isn't available to everyone" in msg
+            or "certain audiences" in msg
+        ):
+            logger.warning(
+                "[yt-dlp] Age-restricted / audience-gated content encountered: %s", msg
+            )
+        else:
+            logger.warning("[yt-dlp error] %s", msg)
+
+    def info(self, msg: str) -> None:
+        pass
+
+
 class DownloadWorker(QThread):
     progress: pyqtSignal = pyqtSignal(int)
     item_started: pyqtSignal = pyqtSignal(str)
@@ -442,6 +467,8 @@ class DownloadWorker(QThread):
             "outtmpl": out_template,
             "quiet": True,
             "no_warnings": True,
+            "no_color": True,
+            "logger": YTDLPQuietLogger(),
             "progress_hooks": [ytdlp_hook],
             "nocheckcertificate": False,
             "buffersize": 256 * 1024,

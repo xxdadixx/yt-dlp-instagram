@@ -18,6 +18,7 @@ from PyQt6.QtCore import (
     QPointF,
     QPropertyAnimation,
     QRunnable,
+    QSize,
     QThreadPool,
     Qt,
     pyqtSignal,
@@ -34,6 +35,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from gui.icons import get_icon
 
 logger = logging.getLogger(__name__)
 
@@ -363,10 +366,14 @@ class ImageViewerDialog(QDialog):
         self.lbl_title.setStyleSheet("color: #E0E0E6;")
         top_bar.addWidget(self.lbl_title, 1)
 
-        self.btn_close = QPushButton("✕", self)
+        self.btn_close = QPushButton(self)
         self.btn_close.setObjectName("CloseButton")
         self.btn_close.setFixedSize(28, 28)
         self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_icon = get_icon("close", color="#FFFFFF", size=14)
+        if close_icon:
+            self.btn_close.setIcon(close_icon)
+            self.btn_close.setIconSize(QSize(14, 14))
         self.btn_close.clicked.connect(self.close)
         top_bar.addWidget(self.btn_close)
 
@@ -376,10 +383,15 @@ class ImageViewerDialog(QDialog):
         view_area.setContentsMargins(0, 0, 0, 0)
         view_area.setSpacing(10)
 
-        self.btn_prev = QPushButton("❮", self)
+        # Nav Previous vector replacement
+        self.btn_prev = QPushButton(self)
         self.btn_prev.setObjectName("NavButton")
         self.btn_prev.setFixedSize(44, 44)
         self.btn_prev.setCursor(Qt.CursorShape.PointingHandCursor)
+        prev_icon = get_icon("chevron_left", color="#FFFFFF", size=20)
+        if prev_icon:
+            self.btn_prev.setIcon(prev_icon)
+            self.btn_prev.setIconSize(QSize(20, 20))
         self.btn_prev.clicked.connect(self.prev_image)
         view_area.addWidget(self.btn_prev, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -388,10 +400,15 @@ class ImageViewerDialog(QDialog):
         self.viewport.swipe_right.connect(self.prev_image)
         view_area.addWidget(self.viewport, 1)
 
-        self.btn_next = QPushButton("❯", self)
+        # Nav Next vector replacement
+        self.btn_next = QPushButton(self)
         self.btn_next.setObjectName("NavButton")
         self.btn_next.setFixedSize(44, 44)
         self.btn_next.setCursor(Qt.CursorShape.PointingHandCursor)
+        next_icon = get_icon("chevron_right", color="#FFFFFF", size=20)
+        if next_icon:
+            self.btn_next.setIcon(next_icon)
+            self.btn_next.setIconSize(QSize(20, 20))
         self.btn_next.clicked.connect(self.next_image)
         view_area.addWidget(self.btn_next, 0, Qt.AlignmentFlag.AlignVCenter)
 

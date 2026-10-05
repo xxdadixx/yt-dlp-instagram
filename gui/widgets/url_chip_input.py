@@ -6,10 +6,10 @@ author username extraction, and resilient asynchronous CDN thumbnail previewing.
 from __future__ import annotations
 
 import html as html_lib
-import importlib
 import json
 import logging
 import re
+import ssl
 from typing import Any, Dict, List, Optional
 import urllib.parse
 import urllib.request
@@ -59,9 +59,24 @@ from gui.widgets.media_card import ThumbnailHoverPopup
 from gui.widgets.thumbnail_loader import GLOBAL_THUMB_CACHE
 
 try:
-    cffi_requests: Any = importlib.import_module("curl_cffi.requests")
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
+try:
+    import curl_cffi
+    import curl_cffi.curl
+    import curl_cffi.requests
+    import curl_cffi.requests.exceptions
+
+    cffi_requests: Any = curl_cffi.requests
+    CffiTimeout: type[BaseException] = curl_cffi.requests.exceptions.Timeout
+    CffiCurlError: type[BaseException] = curl_cffi.curl.CurlError
 except Exception:
+    curl_cffi = None  # pyright: ignore[reportConstantRedefinition]
     cffi_requests = None
+    CffiTimeout = TimeoutError
+    CffiCurlError = TimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +85,8 @@ GLOBAL_URL_USER_CACHE: Dict[str, str] = {}
 
 
 class PreviewSignals(QObject):
-    loaded = pyqtSignal(str, bytes, str)
+    # Use object instead of bytes to prevent PyQt6 C++ const char* null-byte truncation
+    loaded = pyqtSignal(str, object, str)
 
 
 def _find_user_dict_recursive(obj: Any, target_user: str) -> Optional[dict[str, Any]]:
@@ -105,7 +121,7 @@ def _find_user_dict_recursive(obj: Any, target_user: str) -> Optional[dict[str, 
 class URLPreviewTask(QRunnable):
     """Background task to fetch media thumbnail preview and author handle using
 
-    TLS impersonation, authenticated API resolution, and resilient embed/profile markup extraction.
+    Mobile Media Info API, IPv4-pinned curl_cffi requests, and yt-dlp metadata fallbacks.
     """
 
     def __init__(
@@ -124,24 +140,37 @@ class URLPreviewTask(QRunnable):
         self.target_type = target_type
         self.cookie_str = cookie_str
         self.signals = signals
+        self._is_cancelled: bool = False
         self.setAutoDelete(True)
 
-    def _parse_cookie_dict(self) -> Dict[str, str]:
-        """Converts raw semicolon-separated cookie strings into structured dictionaries."""
-        cookie_dict: Dict[str, str] = {}
-        if self.cookie_str:
-            for pair in self.cookie_str.split(";"):
-                if "=" in pair:
-                    k, v = pair.strip().split("=", 1)
-                    cookie_dict[k.strip()] = v.strip()
-        return cookie_dict
+    def cancel(self) -> None:
+        self._is_cancelled = True
+
+    def requestInterruption(self) -> None:
+        self._is_cancelled = True
+
+    def isInterruptionRequested(self) -> bool:
+        return self._is_cancelled
+
+    def _get_ssl_context(self) -> ssl.SSLContext:
+        try:
+            import certifi
+
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            return ssl._create_unverified_context()
 
     def _download_image_bytes(self, cdn_url: str) -> Optional[bytes]:
         """Streams preview image bytes safely across TLS boundaries."""
-        # 1. Primary fast stream via urllib
+        if not cdn_url or self._is_cancelled:
+            return None
+
+        clean_url = cdn_url.replace("&amp;", "&")
+
+        # 1. Primary fast stream via native urllib
         try:
             req = urllib.request.Request(
-                cdn_url,
+                clean_url,
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -153,106 +182,44 @@ class URLPreviewTask(QRunnable):
                     "Connection": "keep-alive",
                 },
             )
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
+            with urllib.request.urlopen(
+                req, context=self._get_ssl_context(), timeout=8.0
+            ) as resp:
                 data = resp.read()
-                if data:
+                if data and len(data) > 64:
                     return data
         except Exception as exc:
             logger.debug("urllib CDN stream error: %s", exc)
+
+        if self._is_cancelled:
+            return None
 
         # 2. Fallback stream via curl_cffi Chrome impersonation
         try:
             if cffi_requests is not None:
                 resp = cffi_requests.get(
-                    cdn_url,
+                    clean_url,
                     impersonate="chrome120",
-                    timeout=6.0,
+                    timeout=8.0,
                 )
-                if resp.status_code == 200 and resp.content:
+                if resp.status_code == 200 and resp.content and len(resp.content) > 64:
                     return bytes(resp.content)
         except Exception as exc:
             logger.debug("cffi CDN stream error: %s", exc)
 
         return None
 
-    def _resolve_profile_picture(self, clean_user: str) -> Optional[str]:
-        """Resolves the uncompressed HD profile avatar CDN URL strictly for clean_user."""
-        target = clean_user.lower().strip().lstrip("@")
-        cookie_dict = self._parse_cookie_dict()
-        csrf_token = cookie_dict.get("csrftoken", "")
+    def _fetch_mobile_media_info(self, shortcode: str) -> tuple[str, str]:
+        """Fetches high-resolution media thumbnail and creator username using
 
-        # -------------------------------------------------------------------------
-        # TIER 1: Native Web Profile Info REST API (Identity-Validated)
-        # -------------------------------------------------------------------------
-        web_api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={target}"
-        web_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "X-ASBD-ID": "129477",
-            "X-IG-App-ID": "936619743392459",
-            "X-IG-WWW-Claim": "0",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"https://www.instagram.com/{target}/",
-            "Origin": "https://www.instagram.com",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty",
-        }
-        if csrf_token:
-            web_headers["X-CSRFToken"] = csrf_token
+        Instagram's native Mobile Media Info endpoint (i.instagram.com).
+        """
+        media_id = shortcode_to_id(shortcode)
+        if not media_id:
+            return "", ""
 
-        try:
-            if cffi_requests is not None:
-                resp = cffi_requests.get(
-                    web_api_url,
-                    impersonate="chrome120",
-                    headers=web_headers,
-                    cookies=cookie_dict,
-                    timeout=5.0,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    user = _find_user_dict_recursive(data, target)
-                    if user:
-                        hd_info = user.get("hd_profile_pic_url_info")
-                        if isinstance(hd_info, dict) and hd_info.get("url"):
-                            return str(hd_info["url"])
-                        hd = user.get("profile_pic_url_hd") or user.get(
-                            "profile_pic_url"
-                        )
-                        if hd:
-                            return str(hd)
-            else:
-                if self.cookie_str:
-                    web_headers["Cookie"] = self.cookie_str
-                req = urllib.request.Request(web_api_url, headers=web_headers)
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    user = _find_user_dict_recursive(data, target)
-                    if user:
-                        hd_info = user.get("hd_profile_pic_url_info")
-                        if isinstance(hd_info, dict) and hd_info.get("url"):
-                            return str(hd_info["url"])
-                        hd = user.get("profile_pic_url_hd") or user.get(
-                            "profile_pic_url"
-                        )
-                        if hd:
-                            return str(hd)
-        except Exception as exc:
-            logger.debug("Tier 1 Web profile info error for @%s: %s", target, exc)
-
-        # -------------------------------------------------------------------------
-        # TIER 2: Native Mobile API (i.instagram.com usernameinfo, Identity-Validated)
-        # -------------------------------------------------------------------------
-        mobile_url = f"https://i.instagram.com/api/v1/users/{target}/usernameinfo/"
-        mobile_headers = {
+        url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
+        headers = {
             "User-Agent": (
                 "Instagram 315.0.0.38.109 Android (33/13; 420dpi; 1080x2400; "
                 "samsung; SM-G991N; o1s; exynos2100; en_US; 564998762)"
@@ -261,297 +228,452 @@ class URLPreviewTask(QRunnable):
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
         }
+        if self.cookie_str:
+            headers["Cookie"] = self.cookie_str
 
+        raw_json_text = ""
+        # 1. Primary attempt via curl_cffi with forced IPv4
         try:
             if cffi_requests is not None:
-                resp = cffi_requests.get(
-                    mobile_url,
-                    headers=mobile_headers,
-                    cookies=cookie_dict,
-                    timeout=5.0,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    user = _find_user_dict_recursive(data, target)
-                    if user:
-                        hd_info = user.get("hd_profile_pic_url_info")
-                        if isinstance(hd_info, dict) and hd_info.get("url"):
-                            return str(hd_info["url"])
-                        hd = user.get("profile_pic_url_hd") or user.get(
-                            "profile_pic_url"
+                curl_opts = {}
+                if curl_cffi and hasattr(curl_cffi, "curl"):
+                    if hasattr(curl_cffi.curl, "CURLOPT_IPRESOLVE") and hasattr(
+                        curl_cffi.curl, "CURL_IPRESOLVE_V4"
+                    ):
+                        curl_opts[curl_cffi.curl.CURLOPT_IPRESOLVE] = (
+                            curl_cffi.curl.CURL_IPRESOLVE_V4
                         )
-                        if hd:
-                            return str(hd)
-            else:
-                if self.cookie_str:
-                    mobile_headers["Cookie"] = self.cookie_str
-                req = urllib.request.Request(mobile_url, headers=mobile_headers)
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    user = _find_user_dict_recursive(data, target)
-                    if user:
-                        hd_info = user.get("hd_profile_pic_url_info")
-                        if isinstance(hd_info, dict) and hd_info.get("url"):
-                            return str(hd_info["url"])
-                        hd = user.get("profile_pic_url_hd") or user.get(
-                            "profile_pic_url"
-                        )
-                        if hd:
-                            return str(hd)
-        except Exception as exc:
-            logger.debug("Tier 2 Mobile usernameinfo error for @%s: %s", target, exc)
 
-        # -------------------------------------------------------------------------
-        # TIER 3: Anonymous Public Page Request (NO COOKIES - Eliminates Viewer Leak)
-        # -------------------------------------------------------------------------
-        try:
-            page_url = f"https://www.instagram.com/{target}/"
-            anon_headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Referer": "https://www.instagram.com/",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-
-            html_text = ""
-            if cffi_requests is not None:
                 resp = cffi_requests.get(
-                    page_url,
+                    url,
+                    headers=headers,
                     impersonate="chrome120",
-                    headers=anon_headers,
-                    timeout=5.0,
+                    timeout=7.0,
+                    curl_options=curl_opts if curl_opts else None,
                 )
-                if resp.status_code == 200:
-                    html_text = resp.text
-            else:
-                req = urllib.request.Request(page_url, headers=anon_headers)
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    html_text = resp.read().decode("utf-8", errors="replace")
-
-            if html_text:
-                clean_html = html_text.replace(r"\/", "/").replace(r"\u0026", "&")
-                clean_html = html_lib.unescape(clean_html)
-
-                # 1. Look for target user's JSON block
-                user_patterns = [
-                    rf'\{{[^{{}}]*?"username"\s*:\s*"{re.escape(target)}"[^{{}}]*?"profile_pic_url_hd"\s*:\s*"(https://[^"]+)"',
-                    rf'\{{[^{{}}]*?"profile_pic_url_hd"\s*:\s*"(https://[^"]+)"[^{{}}]*?"username"\s*:\s*"{re.escape(target)}"',
-                    rf'\{{[^{{}}]*?"username"\s*:\s*"{re.escape(target)}"[^{{}}]*?"profile_pic_url"\s*:\s*"(https://[^"]+)"',
-                ]
-                for pat in user_patterns:
-                    m = re.search(pat, clean_html, re.IGNORECASE)
-                    if m:
-                        cand = m.group(1).replace("&amp;", "&")
-                        if cand.startswith("http") and "150x150" not in cand:
-                            return cand
-
-                # 2. Parse JSON script nodes
-                for script_m in re.finditer(
-                    r"<script[^>]*>(.*?)</script>", clean_html, re.DOTALL
-                ):
-                    content = script_m.group(1).strip()
-                    if target in content.lower() and "profile_pic_url" in content:
-                        try:
-                            if content.startswith(("{", "[")):
-                                parsed = json.loads(content)
-                                user = _find_user_dict_recursive(parsed, target)
-                                if user:
-                                    hd = user.get("profile_pic_url_hd") or user.get(
-                                        "profile_pic_url"
-                                    )
-                                    if hd:
-                                        return str(hd)
-                        except Exception:
-                            pass
-
-                # 3. OpenGraph og:image fallback
-                m_og = re.search(
-                    r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-                    clean_html,
-                    re.IGNORECASE,
-                )
-                if m_og:
-                    cand = m_og.group(1).replace("&amp;", "&")
-                    if cand.startswith("http"):
-                        return cand
+                if resp.status_code == 200 and resp.text:
+                    raw_json_text = resp.text
         except Exception as exc:
-            logger.debug("Tier 3 Anonymous SSR avatar error for @%s: %s", target, exc)
+            logger.debug("Mobile Media Info curl_cffi error for %s: %s", shortcode, exc)
+
+        # 2. Fallback attempt via native urllib
+        if not raw_json_text and not self._is_cancelled:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(
+                    req, context=self._get_ssl_context(), timeout=7.0
+                ) as resp:
+                    raw_bytes = resp.read()
+                    content_encoding = resp.headers.get("Content-Encoding", "").lower()
+                    if "gzip" in content_encoding or (
+                        len(raw_bytes) >= 2 and raw_bytes[:2] == b"\x1f\x8b"
+                    ):
+                        import gzip
+
+                        raw_bytes = gzip.decompress(raw_bytes)
+                    elif "deflate" in content_encoding:
+                        import zlib
+
+                        try:
+                            raw_bytes = zlib.decompress(raw_bytes)
+                        except Exception:
+                            raw_bytes = zlib.decompress(raw_bytes, -zlib.MAX_WBITS)
+                    charset = resp.headers.get_content_charset() or "utf-8"
+                    raw_json_text = raw_bytes.decode(charset, errors="replace")
+            except Exception as exc:
+                logger.debug(
+                    "Mobile Media Info urllib error for %s: %s", shortcode, exc
+                )
+
+        if not raw_json_text:
+            return "", ""
+
+        try:
+            data = json.loads(raw_json_text)
+            if not isinstance(data, dict):
+                return "", ""
+            items = data.get("items")
+            if (
+                not isinstance(items, list)
+                or not items
+                or not isinstance(items[0], dict)
+            ):
+                return "", ""
+            item = items[0]
+
+            author = ""
+            user = item.get("user")
+            if isinstance(user, dict) and user.get("username"):
+                author = str(user["username"]).strip()
+
+            thumb_url = ""
+            img_v2 = item.get("image_versions2")
+            if isinstance(img_v2, dict) and isinstance(img_v2.get("candidates"), list):
+                cands = [
+                    c
+                    for c in img_v2["candidates"]
+                    if isinstance(c, dict) and c.get("url")
+                ]
+                if cands:
+                    best = max(
+                        cands,
+                        key=lambda c: int(c.get("width", 0)) * int(c.get("height", 0)),
+                    )
+                    thumb_url = str(best.get("url") or "")
+
+            return thumb_url, author
+        except Exception as exc:
+            logger.debug("Failed to parse Mobile Media Info JSON: %s", exc)
+            return "", ""
+
+    def _fetch_html(self, url: str) -> Optional[str]:
+        """Fetches page markup with IPv4-pinned curl_cffi and automatic decompression."""
+        if self._is_cancelled:
+            return None
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.instagram.com/",
+        }
+
+        # 1. Primary Engine: curl_cffi with forced IPv4
+        try:
+            if cffi_requests is not None:
+                curl_opts = {}
+                if curl_cffi and hasattr(curl_cffi, "curl"):
+                    if hasattr(curl_cffi.curl, "CURLOPT_IPRESOLVE") and hasattr(
+                        curl_cffi.curl, "CURL_IPRESOLVE_V4"
+                    ):
+                        curl_opts[curl_cffi.curl.CURLOPT_IPRESOLVE] = (
+                            curl_cffi.curl.CURL_IPRESOLVE_V4
+                        )
+
+                resp = cffi_requests.get(
+                    url,
+                    headers=headers,
+                    impersonate="chrome120",
+                    timeout=8.0,
+                    curl_options=curl_opts if curl_opts else None,
+                )
+                if resp.status_code == 200 and resp.text:
+                    return resp.text
+        except Exception as exc:
+            logger.debug("curl_cffi HTML fetch error for %s: %s", url, exc)
+
+        if self._is_cancelled:
+            return None
+
+        # 2. Secondary Engine: urllib fallback
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Referer": "https://www.instagram.com/",
+                },
+            )
+            with urllib.request.urlopen(
+                req, context=self._get_ssl_context(), timeout=8.0
+            ) as resp:
+                raw_bytes = resp.read()
+                content_encoding = resp.headers.get("Content-Encoding", "").lower()
+                if "gzip" in content_encoding or (
+                    len(raw_bytes) >= 2 and raw_bytes[:2] == b"\x1f\x8b"
+                ):
+                    import gzip
+
+                    raw_bytes = gzip.decompress(raw_bytes)
+                elif "deflate" in content_encoding:
+                    import zlib
+
+                    try:
+                        raw_bytes = zlib.decompress(raw_bytes)
+                    except Exception:
+                        raw_bytes = zlib.decompress(raw_bytes, -zlib.MAX_WBITS)
+
+                charset = resp.headers.get_content_charset() or "utf-8"
+                return raw_bytes.decode(charset, errors="replace")
+        except Exception as exc:
+            logger.debug("urllib HTML fetch error for %s: %s", url, exc)
 
         return None
 
-    @pyqtSlot()
-    def run(self) -> None:
-        cached_bytes = GLOBAL_THUMB_CACHE.get(self.raw_url)
-        cached_user = GLOBAL_URL_USER_CACHE.get(self.raw_url, "") or (
-            self.username or ""
+    def _extract_preview_from_html(
+        self, html_text: str, shortcode: str
+    ) -> tuple[str, str]:
+        """Extracts thumbnail CDN URL and author handle from Instagram markup."""
+        if not html_text:
+            return "", ""
+
+        clean_html = html_text.replace(r"\/", "/").replace(r"\u0026", "&")
+        clean_html = html_lib.unescape(clean_html)
+
+        thumb_url = ""
+        username = ""
+
+        # Strategy A: window.__additionalDataLoaded state payload
+        match_add = re.search(
+            r"window\.__additionalDataLoaded\([^,]+,\s*(\{.+?\})\s*\);",
+            clean_html,
+            re.DOTALL,
         )
+        if match_add:
+            try:
+                data = json.loads(match_add.group(1))
+                media = (
+                    data.get("graphql", {}).get("shortcode_media")
+                    or data.get("data", {}).get("xdt_shortcode_media")
+                    or data.get("shortcode_media")
+                )
+                if isinstance(media, dict):
+                    thumb_url = str(
+                        media.get("display_url")
+                        or media.get("display_src")
+                        or media.get("thumbnail_src")
+                        or ""
+                    )
+                    owner = media.get("owner")
+                    if isinstance(owner, dict):
+                        username = str(owner.get("username") or "")
+            except Exception:
+                pass
 
-        # Invalidate low-resolution / thumbnail caches (e.g. 150x150)
-        if cached_bytes:
-            qimg = QImage()
-            if qimg.loadFromData(cached_bytes):
-                if qimg.width() >= 300 and qimg.height() >= 300:
-                    self.signals.loaded.emit(self.raw_url, cached_bytes, cached_user)
-                    return
-                else:
-                    cached_bytes = None
+        # Strategy B: EmbeddedMediaImage and fallback img tags
+        if not thumb_url:
+            img_match = (
+                re.search(
+                    r'<img[^>]+class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\'][^>]+src=["\']([^"\']+)["\']',
+                    clean_html,
+                    re.IGNORECASE,
+                )
+                or re.search(
+                    r'<img[^>]+src=["\']([^"\']+)["\'][^>]+class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\']',
+                    clean_html,
+                    re.IGNORECASE,
+                )
+                or re.search(
+                    r'<img[^>]+src=["\'](https?://[^"\']*(?:cdninstagram\.com|fbcdn\.net)[^"\']*)["\']',
+                    clean_html,
+                    re.IGNORECASE,
+                )
+            )
+            if img_match:
+                thumb_url = img_match.group(1).replace("&amp;", "&")
+
+        # Strategy C: OpenGraph og:image fallback
+        if not thumb_url:
+            m_og = re.search(
+                r'<meta\s+property=["\']og:image["\']\s+content=["\'](https?://[^"\']+)["\']',
+                clean_html,
+                re.IGNORECASE,
+            )
+            if m_og:
+                thumb_url = m_og.group(1).replace("&amp;", "&")
+
+        # Author handle resolution
+        if not username:
+            cap_m = re.search(
+                r'<a[^>]+class=["\'][^"\']*CaptionUsername[^"\']*["\'][^>]*>\s*@?([a-zA-Z0-9_\.]+)\s*</a>',
+                clean_html,
+                re.IGNORECASE,
+            )
+            if cap_m:
+                username = cap_m.group(1).strip()
             else:
-                cached_bytes = None
-
-        cdn_url: Optional[str] = None
-        detected_username: str = cached_user
-        cookie_dict = self._parse_cookie_dict()
-
-        # 1. Profile Target Resolution
-        if not self.shortcode and self.username:
-            clean_user = self.username.strip().lstrip("@")
-            detected_username = clean_user
-            cdn_url = self._resolve_profile_picture(clean_user)
-
-        # 2. Post / Reel / Carousel Resolution
-        elif self.shortcode:
-            if self.cookie_str and "sessionid=" in self.cookie_str:
-                media_id = shortcode_to_id(self.shortcode)
-                if media_id:
-                    api_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
-                    headers = {
-                        "User-Agent": "Instagram 315.0.0.38.109 Android",
-                        "X-IG-App-ID": "936619743392459",
-                    }
-                    try:
-                        if cffi_requests is not None:
-                            resp = cffi_requests.get(
-                                api_url,
-                                headers=headers,
-                                cookies=cookie_dict,
-                                timeout=5.0,
-                            )
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                items = data.get("items", [])
-                                if items:
-                                    first_item = items[0]
-                                    u_info = first_item.get("user") or first_item.get(
-                                        "owner"
-                                    )
-                                    if isinstance(u_info, dict) and u_info.get(
-                                        "username"
-                                    ):
-                                        detected_username = str(
-                                            u_info["username"]
-                                        ).strip()
-
-                                    candidates = first_item.get(
-                                        "image_versions2", {}
-                                    ).get("candidates", [])
-                                    if candidates:
-                                        best_cand = max(
-                                            [
-                                                c
-                                                for c in candidates
-                                                if isinstance(c, dict)
-                                            ],
-                                            key=lambda c: int(c.get("width", 0))
-                                            * int(c.get("height", 0)),
-                                            default=candidates[0],
-                                        )
-                                        cdn_url = best_cand.get("url")
-                    except Exception as exc:
-                        logger.debug("Mobile API media info error: %s", exc)
-
-            if not cdn_url or not detected_username:
-                embed_url = (
-                    f"https://www.instagram.com/p/{self.shortcode}/embed/captioned/"
+                hdr_m = re.search(
+                    r'<a[^>]+href=["\'](?:https?://(?:www\.)?instagram\.com)?/([a-zA-Z0-9_\.]+)/?(?:\?[^"\']*)?["\'][^>]*class=["\'][^"\']*(?:Username|Avatar|Header|CaptionUsername)[^"\']*["\']',
+                    clean_html,
+                    re.IGNORECASE,
                 )
-                html_text = ""
-                try:
-                    headers = {
-                        "Referer": "https://www.instagram.com/",
-                        "Accept-Language": "en-US,en;q=0.9",
-                    }
-                    if cffi_requests is not None:
-                        resp = cffi_requests.get(
-                            embed_url,
-                            impersonate="chrome120",
-                            headers=headers,
-                            cookies=cookie_dict,
-                            timeout=5.0,
+                if hdr_m:
+                    cand = hdr_m.group(1).strip()
+                    if cand.lower() not in (
+                        "p",
+                        "reel",
+                        "reels",
+                        "tv",
+                        "stories",
+                        "explore",
+                    ):
+                        username = cand
+
+        return thumb_url, username
+
+    def _resolve_profile_picture(self, clean_user: str) -> Optional[str]:
+        """Resolves the uncompressed HD profile avatar CDN URL strictly for clean_user."""
+        target = clean_user.lower().strip().lstrip("@")
+
+        # 1. Native Mobile API
+        url = f"https://i.instagram.com/api/v1/users/{target}/usernameinfo/"
+        headers = {
+            "User-Agent": (
+                "Instagram 315.0.0.38.109 Android (33/13; 420dpi; 1080x2400; "
+                "samsung; SM-G991N; o1s; exynos2100; en_US; 564998762)"
+            ),
+            "X-IG-App-ID": "936619743392459",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if self.cookie_str:
+            headers["Cookie"] = self.cookie_str
+
+        try:
+            if cffi_requests is not None:
+                resp = cffi_requests.get(
+                    url,
+                    headers=headers,
+                    impersonate="chrome120",
+                    timeout=6.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    user = data.get("user")
+                    if isinstance(user, dict):
+                        hd_info = user.get("hd_profile_pic_url_info")
+                        if isinstance(hd_info, dict) and hd_info.get("url"):
+                            return str(hd_info["url"])
+                        hd = user.get("profile_pic_url_hd") or user.get(
+                            "profile_pic_url"
                         )
-                        if resp.status_code == 200:
-                            html_text = resp.text
-                    else:
-                        if self.cookie_str:
-                            headers["Cookie"] = self.cookie_str
-                        req = urllib.request.Request(embed_url, headers=headers)
-                        with urllib.request.urlopen(req, timeout=5.0) as resp:
-                            html_text = resp.read().decode("utf-8", errors="replace")
+                        if hd:
+                            return str(hd)
+        except Exception as exc:
+            logger.debug("Mobile usernameinfo avatar error for @%s: %s", target, exc)
 
-                    if html_text:
-                        clean_html = html_text.replace(r"\/", "/").replace(
-                            r"\u0026", "&"
-                        )
-                        clean_html = html_lib.unescape(clean_html)
+        # 2. SSR HTML Fallback
+        page_url = f"https://www.instagram.com/{target}/"
+        html_text = self._fetch_html(page_url)
+        if html_text:
+            clean_html = html_text.replace(r"\/", "/").replace(r"\u0026", "&")
+            clean_html = html_lib.unescape(clean_html)
 
-                        if not detected_username:
-                            user_patterns = [
-                                r'<a[^>]+class=["\'][^"\']*CaptionUsername[^"\']*["\'][^>]*>\s*@?([a-zA-Z0-9_\.]+)\s*</a>',
-                                r'<a[^>]+class=["\'][^"\']*(?:Username|Avatar|Header)[^"\']*["\'][^>]*href=["\'](?:https?://(?:www\.)?instagram\.com)?/([a-zA-Z0-9_\.]+)/?',
-                                r'<header[^>]*>.*?<a[^>]+href=["\'](?:https?://(?:www\.)?instagram\.com)?/([a-zA-Z0-9_\.]+)/?',
-                                r'["\']owner["\']\s*:\s*\{[^}]*["\']username["\']\s*:\s*["\']([a-zA-Z0-9_\.]+)["\']',
-                                r'\\?"username\\?"\s*:\s*\\?"([a-zA-Z0-9_\.]+)\\?"',
-                            ]
-                            for u_pat in user_patterns:
-                                um = re.search(
-                                    u_pat, clean_html, re.DOTALL | re.IGNORECASE
-                                )
-                                if um:
-                                    cand_user = um.group(1).strip()
-                                    if cand_user.lower() not in (
-                                        "p",
-                                        "reel",
-                                        "reels",
-                                        "stories",
-                                        "explore",
-                                        "developer",
-                                        "about",
-                                        "legal",
-                                        "instagram",
-                                    ):
-                                        detected_username = cand_user
-                                        break
+            m_og = re.search(
+                r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+                clean_html,
+                re.IGNORECASE,
+            )
+            if m_og:
+                cand = m_og.group(1).replace("&amp;", "&")
+                if cand.startswith("http"):
+                    return cand
 
-                        if not cdn_url:
-                            img_patterns = [
-                                r'["\']display_url["\']\s*:\s*["\'](https://[^"\']+(?:cdninstagram\.com|fbcdn\.net)[^"\']+)["\']',
-                                r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-                                r'<img[^>]+class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\'][^>]+src=["\']([^"\']+)["\']',
-                                r'<img[^>]+src=["\']([^"\']+)["\'][^>]+class=["\'][^"\']*EmbeddedMediaImage[^"\']*["\']',
-                            ]
-                            for pat in img_patterns:
-                                m = re.search(pat, clean_html, re.IGNORECASE)
-                                if m:
-                                    cand_img = m.group(1).replace("&amp;", "&")
-                                    if "150x150" not in cand_img:
-                                        cdn_url = cand_img
-                                        break
-                except Exception as exc:
-                    logger.debug("Embed preview lookup error: %s", exc)
+        return None
 
-        if detected_username:
-            GLOBAL_URL_USER_CACHE[self.raw_url] = detected_username
+    def run(self) -> None:
+        """Executes thumbnail and username resolution across multi-tiered backends."""
+        if self.isInterruptionRequested() or self._is_cancelled:
+            return
 
-        if cdn_url:
-            img_bytes = self._download_image_bytes(cdn_url)
-            if img_bytes:
+        # ---------------------------------------------------------------------
+        # Case 1: Profile Targets (@username or /username/)
+        # ---------------------------------------------------------------------
+        clean_user = (self.username or "").strip().lstrip("@")
+        if self.target_type in ("PROFILE", "PROFILE_REELS") or (
+            not self.shortcode and clean_user
+        ):
+            if clean_user:
+                avatar_url = self._resolve_profile_picture(clean_user)
+                if avatar_url and not (
+                    self.isInterruptionRequested() or self._is_cancelled
+                ):
+                    img_bytes = self._download_image_bytes(avatar_url)
+                    if img_bytes and not (
+                        self.isInterruptionRequested() or self._is_cancelled
+                    ):
+                        GLOBAL_THUMB_CACHE.set(self.raw_url, img_bytes)
+                        GLOBAL_URL_USER_CACHE[self.raw_url] = clean_user
+                        self.signals.loaded.emit(self.raw_url, img_bytes, clean_user)
+            return
+
+        # ---------------------------------------------------------------------
+        # Case 2: Media Targets (Posts, Reels, Carousels)
+        # ---------------------------------------------------------------------
+        if not self.shortcode:
+            return
+
+        thumb_url = ""
+        detected_user = self.username or ""
+
+        # Tier 1: Fast Native Mobile API (Exact Image + Exact Handle)
+        t1_thumb, t1_user = self._fetch_mobile_media_info(self.shortcode)
+        if t1_thumb:
+            thumb_url = t1_thumb
+            if t1_user:
+                detected_user = t1_user
+
+        # Tier 2: Public Web Embed Scraper
+        if not thumb_url and not (self.isInterruptionRequested() or self._is_cancelled):
+            embed_urls = [
+                f"https://www.instagram.com/p/{self.shortcode}/embed/captioned/",
+                f"https://www.instagram.com/reel/{self.shortcode}/embed/captioned/",
+            ]
+            for e_url in embed_urls:
+                if self.isInterruptionRequested() or self._is_cancelled:
+                    return
+
+                html_text = self._fetch_html(e_url)
+                if html_text:
+                    t_url, u_name = self._extract_preview_from_html(
+                        html_text, self.shortcode
+                    )
+                    if t_url:
+                        thumb_url = t_url
+                        if u_name:
+                            detected_user = u_name
+                        break
+
+        # Tier 3: yt-dlp Flat Metadata Fallback
+        if (
+            not thumb_url
+            and yt_dlp is not None
+            and not (self.isInterruptionRequested() or self._is_cancelled)
+        ):
+            try:
+                ydl_opts = {
+                    "extract_flat": True,
+                    "skip_download": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "socket_timeout": 6,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(self.raw_url, download=False)
+                    if isinstance(info, dict):
+                        thumb_url = str(info.get("thumbnail") or "")
+                        if not detected_user:
+                            detected_user = str(info.get("uploader") or "")
+            except Exception:
+                pass
+
+        if self.isInterruptionRequested() or self._is_cancelled:
+            return
+
+        # ---------------------------------------------------------------------
+        # Emit Payload to Main Window URL Card
+        # ---------------------------------------------------------------------
+        if thumb_url:
+            img_bytes = self._download_image_bytes(thumb_url)
+            if img_bytes and not (
+                self.isInterruptionRequested() or self._is_cancelled
+            ):
                 GLOBAL_THUMB_CACHE.set(self.raw_url, img_bytes)
-                self.signals.loaded.emit(
-                    self.raw_url, img_bytes, detected_username or ""
-                )
-        elif detected_username:
-            self.signals.loaded.emit(self.raw_url, b"", detected_username)
+                if detected_user:
+                    GLOBAL_URL_USER_CACHE[self.raw_url] = detected_user
+                self.signals.loaded.emit(self.raw_url, img_bytes, detected_user)
+        elif detected_user and not (
+            self.isInterruptionRequested() or self._is_cancelled
+        ):
+            self.signals.loaded.emit(self.raw_url, None, detected_user)
 
 
 class URLGlassThumbnailPod(QFrame):
@@ -569,7 +691,7 @@ class URLGlassThumbnailPod(QFrame):
         self._preview_popup: Optional[ThumbnailHoverPopup] = None
 
         self.setMouseTracking(True)
-        self.setFixedSize(40, 40)
+        self.set_view_mode("grid")
 
     def set_view_mode(self, mode: str) -> None:
         self.view_mode = mode
@@ -681,7 +803,6 @@ class URLGlassThumbnailPod(QFrame):
             self._preview_popup.hide()
 
     def cleanup(self) -> None:
-        """Dismisses and cleans up attached hover preview popup."""
         self.hide_preview()
         if self._preview_popup:
             self._preview_popup.deleteLater()
@@ -707,6 +828,15 @@ class URLGlassThumbnailPod(QFrame):
         else:
             rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
             path.addRoundedRect(rect, 9.0, 9.0)
+
+        # Self-healing pixmap rebuild if pod geometry changed since initialization
+        if self._pixmap and not self._pixmap.isNull():
+            if (
+                not self._rendered_pixmap
+                or self._rendered_pixmap.width() != self.width()
+                or self._rendered_pixmap.height() != self.height()
+            ):
+                self._rebuild_rendered_pixmap()
 
         # 1. Image Content or Acrylic Backing
         if self._rendered_pixmap:
@@ -910,10 +1040,8 @@ class URLItemCard(QFrame):
             layout.setContentsMargins(0, 0, 0, 10)
             layout.setSpacing(6)
 
-            # 1. Full-width preview image banner
             layout.addWidget(self.thumb_pod)
 
-            # 2. Meta row: badge on left, trash on right
             meta_row = QHBoxLayout()
             meta_row.setContentsMargins(10, 0, 10, 0)
             meta_row.setSpacing(6)
@@ -923,12 +1051,10 @@ class URLItemCard(QFrame):
             meta_row.addWidget(self.btn_delete)
             layout.addLayout(meta_row)
 
-            # 3. Instagram username handle
             self.lbl_username.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             self.lbl_username.setContentsMargins(10, 0, 10, 0)
             layout.addWidget(self.lbl_username)
 
-            # 4. URL description
             self.lbl_url.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
             self.lbl_url.setContentsMargins(10, 0, 10, 0)
             self.lbl_url.setStyleSheet("color: #94A3B8; background: transparent;")
@@ -967,7 +1093,6 @@ class URLItemCard(QFrame):
             self._apply_mode_layout()
 
     def set_preview_pixmap(self, pixmap: QPixmap) -> None:
-        """Delegates preview pixmap updates directly to the internal thumbnail pod."""
         self.thumb_pod.set_preview_pixmap(pixmap)
 
     def set_username(self, uname: str) -> None:
@@ -979,7 +1104,6 @@ class URLItemCard(QFrame):
             self.update()
 
     def cleanup(self) -> None:
-        """Cleans up internal thumbnail pod and dismisses active hover popups."""
         if hasattr(self, "thumb_pod") and self.thumb_pod:
             self.thumb_pod.cleanup()
 
@@ -994,6 +1118,7 @@ class URLChipInput(QObject):
         super().__init__(parent)
         self.urls: List[str] = []
         self._cards: Dict[str, URLItemCard] = {}
+        self._preview_workers: set[URLPreviewTask] = set()
         self.view_mode: str = "grid"
         self.cookie_str: str = ""
 
@@ -1086,7 +1211,6 @@ class URLChipInput(QObject):
 
         self.list_scroll.setWidget(self.list_content_widget)
 
-        # Cache viewport reference and attach event filter
         self._viewport = self.list_scroll.viewport()
         if self._viewport is not None:
             self._viewport.installEventFilter(self)
@@ -1204,31 +1328,25 @@ class URLChipInput(QObject):
         cached_bytes = GLOBAL_THUMB_CACHE.get(clean)
         cached_user = GLOBAL_URL_USER_CACHE.get(clean, "") or initial_user
 
-        # Invalidate low-resolution cache entries on link insertion
-        is_high_res = False
         if cached_bytes:
-            qimg = QImage()
-            if qimg.loadFromData(cached_bytes):
-                is_high_res = qimg.width() >= 300 and qimg.height() >= 300
-
-        if cached_bytes and is_high_res:
             self._on_preview_loaded(clean, cached_bytes, cached_user)
-        else:
-            task = URLPreviewTask(
-                raw_url=clean,
-                shortcode=shortcode,
-                cookie_str=self.cookie_str,
-                signals=self.preview_signals,
-                username=initial_user,
-                target_type=ttype,
-            )
-            QThreadPool.globalInstance().start(task)
 
-    @pyqtSlot(str, bytes, str)
-    def _on_preview_loaded(self, url: str, data: bytes, username: str) -> None:
+        task = URLPreviewTask(
+            raw_url=clean,
+            shortcode=shortcode,
+            cookie_str=self.cookie_str,
+            signals=self.preview_signals,
+            username=initial_user,
+            target_type=ttype,
+        )
+        self._preview_workers.add(task)
+        QThreadPool.globalInstance().start(task)
+
+    @pyqtSlot(str, object, str)
+    def _on_preview_loaded(self, url: str, data: object, username: str) -> None:
         card = self._cards.get(url)
         if card:
-            if data:
+            if isinstance(data, (bytes, bytearray)) and len(data) > 0:
                 pix = QPixmap()
                 if pix.loadFromData(data):
                     card.set_preview_pixmap(pix)
@@ -1236,16 +1354,13 @@ class URLChipInput(QObject):
                 card.set_username(username)
 
     def cleanup(self) -> None:
-        """Detaches viewport event filters and clears child card popups on widget teardown."""
-        try:
-            if hasattr(self, "list_scroll") and self.list_scroll is not None:
-                vp = self.list_scroll.viewport()
-                if vp is not None:
-                    vp.removeEventFilter(self)
-        except (RuntimeError, AttributeError, TypeError):
-            pass
-
-        self.clear()
+        if hasattr(self, "_preview_workers"):
+            for worker in list(self._preview_workers):
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+            self._preview_workers.clear()
 
     def remove_url(self, url: str) -> None:
         if url in self.urls:

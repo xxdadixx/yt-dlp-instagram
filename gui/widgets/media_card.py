@@ -11,14 +11,15 @@ from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import (
     QByteArray,
+    QEasingCurve,
     QPoint,
     QPointF,
-    QRectF,
-    Qt,
-    pyqtSignal,
     QPropertyAnimation,
+    QRectF,
+    QSize,
+    Qt,
     pyqtProperty,
-    QEasingCurve,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QColor,
@@ -42,6 +43,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from gui.icons import get_icon
 from gui.widgets.image_viewer_dialog import ImageViewerDialog
 from gui.widgets.thumbnail_loader import ThumbnailLoader
 
@@ -599,21 +601,36 @@ class MediaCard(QFrame):
         )
         meta_row.addWidget(self.lbl_badge)
 
+        # Micro-Metrics: Replace text emojis with high-DPI vector badges
         likes = self.item_data.get("like_count") or 0
         views = self.item_data.get("view_count") or 0
-        meta_parts: list[str] = []
-        if isinstance(likes, int) and likes > 0:
-            meta_parts.append(f"❤️ {likes:,}")
-        if isinstance(views, int) and views > 0:
-            meta_parts.append(f"👁️ {views:,}")
-        meta_str = " • ".join(meta_parts) if meta_parts else f"ID: {self.item_id[:12]}"
 
-        self.lbl_meta = QLabel(meta_str, self)
-        self.lbl_meta.setFont(self._get_app_font(size=10))
-        self.lbl_meta.setStyleSheet(
-            "color: #94A3B8; background: transparent; border: none; font-size: 12px;"
-        )
-        meta_row.addWidget(self.lbl_meta)
+        if isinstance(likes, int) and likes > 0:
+            lbl_like_icon = QLabel(self)
+            like_icon = get_icon("heart", color="#FF7597", size=13)
+            if like_icon:
+                lbl_like_icon.setPixmap(like_icon.pixmap(13, 13))
+            lbl_like_icon.setStyleSheet("background: transparent; border: none;")
+            meta_row.addWidget(lbl_like_icon)
+
+            lbl_likes = QLabel(f"{likes:,}", self)
+            lbl_likes.setFont(self._get_app_font(size=9, weight=QFont.Weight.Medium))
+            lbl_likes.setStyleSheet("color: #E2E8F0; background: transparent; border: none; font-size: 11.5px;")
+            meta_row.addWidget(lbl_likes)
+
+        if isinstance(views, int) and views > 0:
+            lbl_view_icon = QLabel(self)
+            view_icon = get_icon("eye", color="#38BDF8", size=13)
+            if view_icon:
+                lbl_view_icon.setPixmap(view_icon.pixmap(13, 13))
+            lbl_view_icon.setStyleSheet("background: transparent; border: none;")
+            meta_row.addWidget(lbl_view_icon)
+
+            lbl_views = QLabel(f"{views:,}", self)
+            lbl_views.setFont(self._get_app_font(size=9, weight=QFont.Weight.Medium))
+            lbl_views.setStyleSheet("color: #E2E8F0; background: transparent; border: none; font-size: 11.5px;")
+            meta_row.addWidget(lbl_views)
+
         meta_row.addStretch()
 
         details_layout.addLayout(meta_row)
@@ -633,24 +650,25 @@ class MediaCard(QFrame):
         self.set_status(self.status)
         action_col.addWidget(self.lbl_status)
 
-        self.btn_delete = QPushButton("✕", self)
+        # Replace text '✕' with Liquid Glass Vector Button
+        self.btn_delete = QPushButton(self)
+        self.btn_delete.setObjectName("GlassActionButton")
         self.btn_delete.setFixedSize(28, 28)
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_delete.setToolTip("Remove from queue")
+        del_icon = get_icon("close", color="#94A3B8", size=13)
+        if del_icon:
+            self.btn_delete.setIcon(del_icon)
+            self.btn_delete.setIconSize(QSize(13, 13))
         self.btn_delete.setStyleSheet(
             """
             QPushButton {
                 background-color: rgba(255, 255, 255, 0.05);
-                color: #94A3B8;
                 border: 1px solid rgba(255, 255, 255, 0.10);
                 border-radius: 14px;
-                font-size: 12px;
-                font-weight: bold;
-                padding: 0px;
             }
             QPushButton:hover {
                 background-color: rgba(239, 68, 68, 0.25);
-                color: #FF8080;
                 border-color: rgba(239, 68, 68, 0.6);
             }
             """

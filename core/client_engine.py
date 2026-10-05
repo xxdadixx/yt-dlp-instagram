@@ -230,8 +230,9 @@ class ResilientSession:
     def _record_failure(
         self, status_code: int, response_text: str = "", was_authenticated: bool = False
     ) -> None:
-        """Evaluates upstream network and WAF challenge failures. Trips the circuit breaker
-        immediately upon genuine account checkpoints, challenge tripwires, or action blocks.
+        """Evaluates upstream network and WAF challenge failures. Quarantines expired credentials
+
+        without tripping the circuit breaker, preserving public unauthenticated traffic routes.
         """
         if 200 <= status_code < 300:
             return
@@ -240,12 +241,12 @@ class ResilientSession:
             lowered_text = response_text.lower()
             is_rate_limit = status_code == 429
 
-            # Immediate hard blocks that require account checkpoint or re-authentication
+            # 1. Hard Checkpoint Signals (Account checkpoints or CAPTCHA challenges)
             is_hard_action_block = any(
                 sig in lowered_text for sig in self.HARD_ACTION_BLOCK_SIGNALS
             )
 
-            # Soft pushbacks indicating velocity or scraping flags
+            # 2. Soft Action Blocks (IP velocity / spam / feedback_required)
             is_soft_action_block = any(
                 sig in lowered_text for sig in self.TRANSIENT_RATE_LIMIT_SIGNALS
             )
@@ -254,6 +255,7 @@ class ResilientSession:
                 "logged-in" in lowered_text and "not-logged-in" not in lowered_text
             )
 
+            # 3. Session Expiration / Invalidation (login_required, logout_reason)
             is_auth_expired = not is_explicitly_logged_in and (
                 any(sig in lowered_text for sig in self.AUTH_EXPIRED_SIGNALS)
                 or (
@@ -266,22 +268,35 @@ class ResilientSession:
                 )
             )
 
-            # Strict tripwire: Hard checkpoints and expired sessions trip the breaker and quarantine credentials
-            if is_hard_action_block or (was_authenticated and is_auth_expired):
+            # Credential Quarantining: Expired cookies must NOT trip the network circuit breaker
+            if was_authenticated and is_auth_expired:
+                logger.warning(
+                    "Instagram session invalidated by server (HTTP %d). "
+                    "Quarantining cookies and downgrading to public mode without locking circuit: %s",
+                    status_code,
+                    response_text[:120],
+                )
+                self.cookies_quarantined = True
+                self.cookies.clear()
+                self._initialize_headers()
+                return
+
+            # Hard Checkpoint Tripwire: Challenge or CAPTCHA required trips breaker immediately
+            if is_hard_action_block:
                 self.trip_circuit_breaker(
-                    f"Hard Action Block / Checkpoint (HTTP {status_code}): {response_text[:100]}"
+                    f"Hard Action Block / Account Checkpoint (HTTP {status_code}): {response_text[:120]}"
                 )
                 self.cookies_quarantined = True
                 return
 
-            # Soft action blocks (feedback_required, is_spam) must trip the breaker to halt velocity storms
+            # Rate Limit & WAF Velocity Tripwire
             if is_soft_action_block:
                 self.trip_circuit_breaker(
-                    f"WAF Action Block Triggered (HTTP {status_code}): {response_text[:100]}"
+                    f"WAF Action Block Triggered (HTTP {status_code}): {response_text[:120]}"
                 )
                 return
 
-            # Pure HTTP 429 rate limits increment failure count and trip on consecutive encounters
+            # HTTP 429 Velocity Accumulator
             if is_rate_limit:
                 self.failure_counter += 1
                 if self.failure_counter >= self.circuit_config.failure_threshold:
@@ -290,14 +305,10 @@ class ResilientSession:
                     )
                 return
 
-            # Allow benign GraphQL schema mismatches or 404s to pass without tripping the breaker
-            if (status_code in (400, 404)) and (
+            # Benign GraphQL execution errors or missing items do not trip the breaker
+            if status_code in (400, 404) and (
                 "execution error" in lowered_text or "page not found" in lowered_text
             ):
-                logger.debug(
-                    "GraphQL query rejected or not found (HTTP %d). Skipping tripwire.",
-                    status_code,
-                )
                 return
 
             if not (
@@ -384,8 +395,9 @@ class ResilientSession:
         timeout: float = 15.0,
         require_auth: bool = True,
     ) -> tuple[int, str, dict[str, str], str]:
-        """Unified HTTP dispatcher executing requests via curl_cffi Chrome impersonation.
-        Enforces fail-fast boundaries on hard checkpoints and soft action blocks.
+        """Unified HTTP dispatcher executing requests via curl_cffi Chrome impersonation
+
+        or hardened OpenSSL fallback. Enforces fail-fast boundaries on WAF tripwires.
         """
         self._check_circuit()
 
@@ -461,7 +473,7 @@ class ResilientSession:
             self._record_success()
             return status_code, final_url, resp_headers, text
 
-        # Fallback Branch: Standard Library urllib.request (Firefox User-Agent to match OpenSSL TLS)
+        # Fallback Branch: Standard Library urllib.request (JA3/JA4 Consistent Firefox Profile)
         fallback_headers = {
             k: v
             for k, v in merged_headers.items()
@@ -581,8 +593,9 @@ class ResilientSession:
         friendly_name: str,
         query_hash: str | None = None,
     ) -> dict[str, Any]:
-        """Executes an Instagram GraphQL query over HTTP/2. Routes doc_id execution via RelayModern POST,
-        and automatically handles query_hash dispatch via query-string GET execution.
+        """Executes an Instagram GraphQL persisted query over HTTP/2 with schema-resilient
+
+        RelayModern POST routing and automatic GET dispatch fallback.
         """
         self._check_circuit()
         self.pace_request()
@@ -627,7 +640,7 @@ class ResilientSession:
                 require_auth=is_auth,
             )
 
-        # Strategy B: Modern Relay Persisted Document ID (POST Dispatch)
+        # Strategy B: Modern Relay Persisted Document ID (URL-Encoded POST Dispatch)
         else:
             post_headers = dict(headers)
             post_headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -641,19 +654,21 @@ class ResilientSession:
             if not is_auth and self.lsd_token:
                 payload["lsd"] = self.lsd_token
 
+            encoded_payload = urllib.parse.urlencode(payload)
+
             status_code, _, _, text = self.request(
                 method="POST",
                 url="https://www.instagram.com/graphql/query",
                 headers=post_headers,
-                data=payload,
+                data=encoded_payload,
                 timeout=15.0,
                 require_auth=is_auth,
             )
 
-            # Strategy C: GET Fallback for doc_id if POST execution is rejected
+            # Strategy C: GET Fallback for doc_id if POST execution encounters a method/schema pushback
             if status_code in (400, 404, 405):
                 logger.debug(
-                    "[%s] POST doc_id %s rejected (HTTP %d). Attempting GET dispatch...",
+                    "[%s] POST doc_id %s rejected (HTTP %d). Attempting GET dispatch fallback...",
                     friendly_name,
                     doc_id,
                     status_code,
@@ -679,7 +694,7 @@ class ResilientSession:
         try:
             res_json = json.loads(text)
             if not isinstance(res_json, dict):
-                raise ValueError("Malformed JSON payload returned")
+                raise ValueError("Malformed JSON payload returned by GraphQL endpoint")
 
             errors = res_json.get("errors")
             if isinstance(errors, list) and len(errors) > 0:

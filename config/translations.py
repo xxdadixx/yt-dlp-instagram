@@ -4,7 +4,7 @@ config/translations.py - Dual-language dictionary (EN / TH) for Instagram Pro St
 
 TRANSLATIONS = {
     "en": {
-        "app_title": "✨ Instagram Pro Studio",
+        "app_title": "Instagram Pro Studio",
         "btn_cookie": "Cookie",
         "cookie_connected": "Connected ({user})",
         "cookie_disconnected": "No Cookies (Public Mode)",
@@ -45,7 +45,7 @@ TRANSLATIONS = {
         "dialog_select_folder": "Select Download Folder",
     },
     "th": {
-        "app_title": "✨ Instagram Pro Studio",
+        "app_title": "Instagram Pro Studio",
         "btn_cookie": "คุกกี้",
         "cookie_connected": "เชื่อมต่อแล้ว ({user})",
         "cookie_disconnected": "ไม่มีคุกกี้ (โหมดสาธารณะ)",

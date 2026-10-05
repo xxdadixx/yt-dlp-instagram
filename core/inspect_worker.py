@@ -460,7 +460,7 @@ class InspectWorker(QThread):
             deep_rest = random.uniform(40.0, 60.0)
             self._sleep_interruptible(
                 deep_rest,
-                status_msg=f"🛡️ Deep crawl velocity cooldown (page {page_number})",
+                status_msg=f"[DEEP CRAWL] Velocity cooldown (page {page_number})",
             )
             return
 
@@ -470,7 +470,7 @@ class InspectWorker(QThread):
             )
             self._sleep_interruptible(
                 rest_seconds,
-                status_msg=f"☕ Natural dwell rest (page {page_number})",
+                status_msg=f"[DWELL REST] Natural pacing interval (page {page_number})",
             )
 
     def _apply_direct_item_pacing(self, item_index: int) -> None:
@@ -481,7 +481,7 @@ class InspectWorker(QThread):
             rest_duration = random.uniform(DIRECT_MICRO_REST_MIN, DIRECT_MICRO_REST_MAX)
             self._sleep_interruptible(
                 rest_duration,
-                status_msg=f"⏳ Direct lookup micro-rest (item {item_index})",
+                status_msg=f"[PACING] Direct lookup micro-rest (item {item_index})",
             )
             return
 
@@ -511,9 +511,9 @@ class InspectWorker(QThread):
         delay = max(effective_base, calculated_delay + jitter)
 
         msg = (
-            "⏳ Rate limit cooldown before fallback"
+            "[RATE LIMIT] Cooldown before fallback"
             if is_throttled
-            else "🛡️ Pacing tier fallback transition"
+            else "[PACING] Tier fallback transition"
         )
         self._sleep_interruptible(delay, status_msg=msg)
 
@@ -608,9 +608,7 @@ class InspectWorker(QThread):
             self.resilient_session.trip_circuit_breaker(
                 f"Checkpoint redirect: {final_url}"
             )
-            self.status_message.emit(
-                "🛑 Account checkpoint triggered. Halting to protect account."
-            )
+            self.status_message.emit("[SECURITY] Account checkpoint triggered. Halting.")
             self.cancel()
             return False
 
@@ -650,9 +648,7 @@ class InspectWorker(QThread):
             logger.warning("HTTP 429 Rate Limit encountered on %s", response_url)
             if fatal_429:
                 self.resilient_session.trip_circuit_breaker("HTTP 429 Rate Limit")
-                self.status_message.emit(
-                    "🛑 Rate limit encountered (HTTP 429). Halting."
-                )
+                self.status_message.emit("[RATE LIMIT] Action limit encountered (HTTP 429). Halting.")
                 self.cancel()
             return False
 
@@ -672,13 +668,15 @@ class InspectWorker(QThread):
         require_auth: bool = False,
         fatal_429: bool = True,
     ) -> Optional[dict[str, Any]]:
-        """Executes paced network requests through ResilientSession, enforcing fail-fast circuit-breaker
-        boundaries and returning parsed JSON structures.
+        """Executes paced network requests through ResilientSession with automatic
+
+        session degradation recovery if authenticated cookies are revoked mid-crawl.
         """
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return None
 
-        req_headers = self._build_headers(require_auth=require_auth)
+        effective_auth = require_auth and not self.resilient_session.cookies_quarantined
+        req_headers = self._build_headers(require_auth=effective_auth)
         if headers:
             req_headers.update(headers)
 
@@ -691,8 +689,22 @@ class InspectWorker(QThread):
                 headers=req_headers,
                 data=data,
                 timeout=float(timeout),
-                require_auth=require_auth,
+                require_auth=effective_auth,
             )
+
+            # Auto-detect credential revocation and sync local worker state
+            if self.resilient_session.cookies_quarantined and (
+                self.cookie_str or self.cookie_file
+            ):
+                logger.warning(
+                    "[%s] Session invalidated. Stripping worker cookies.",
+                    caller_tag or "API",
+                )
+                self.cookie_str = ""
+                self.cookie_file = ""
+                self.status_message.emit(
+                    "⚠️ Instagram session expired. Switched to public mode."
+                )
 
             if "csrftoken" in self.resilient_session.cookies and not self._csrf_token:
                 self._csrf_token = self.resilient_session.cookies["csrftoken"]
@@ -865,7 +877,7 @@ class InspectWorker(QThread):
             return None
 
         clean_user = username.lower().strip().lstrip("@")
-        self.status_message.emit(f"🔍 [Resolver] Fetching User ID for @{clean_user}...")
+        self.status_message.emit("[RESOLVER] Resolving canonical URL token...")
 
         # 1. HTML Profile Scraper
         try:
@@ -1137,7 +1149,10 @@ class InspectWorker(QThread):
     def _fetch_user_clips_graphql(
         self, username: str, user_id: str, max_items: int = 24
     ) -> int:
-        """Paginates user Reels archive using PolarisClipsTimelineProfileQuery with defensive fallbacks."""
+        """Paginates user Reels archive using PolarisClipsTimelineProfileQuery with dual-schema
+
+        resilience (nested data container primary, flat fallback).
+        """
         if (
             self.is_cancelled
             or self.resilient_session.is_circuit_open
@@ -1164,28 +1179,41 @@ class InspectWorker(QThread):
                 ):
                     break
 
-            variables: dict[str, Any] = {
+            # Relay Modern nested schema primary
+            variables_nested: dict[str, Any] = {
+                "data": {
+                    "include_feed_video": True,
+                    "page_size": max_items,
+                    "target_user_id": str(numeric_uid),
+                }
+            }
+            if end_cursor:
+                variables_nested["data"]["max_id"] = str(end_cursor)
+
+            # Flat variable schema fallback
+            variables_flat: dict[str, Any] = {
                 "target_user_id": str(numeric_uid),
                 "page_size": max_items,
                 "include_feed_video": True,
             }
             if end_cursor:
-                variables["max_id"] = end_cursor
+                variables_flat["max_id"] = str(end_cursor)
 
             res: Optional[dict[str, Any]] = None
-            for attempt, doc_id in enumerate(DOC_ID_USER_CLIPS_FALLBACKS[:2], start=1):
+            for attempt, doc_id in enumerate(DOC_ID_USER_CLIPS_FALLBACKS[:3], start=1):
                 if self.is_cancelled or self.resilient_session.is_circuit_open:
                     return found_count
 
                 if attempt > 1:
                     self._apply_tier_backoff(
-                        tier_attempt=attempt, base=1.5, max_delay=3.0
+                        tier_attempt=attempt, base=2.0, max_delay=5.0
                     )
 
+                # Attempt 1: Nested Relay Modern format
                 try:
                     res = self.resilient_session.execute_persisted_query(
                         doc_id=doc_id,
-                        variables=variables,
+                        variables=variables_nested,
                         friendly_name=FRIENDLY_NAME_CLIPS,
                     )
                     if isinstance(res, dict) and res.get("data"):
@@ -1194,8 +1222,32 @@ class InspectWorker(QThread):
                     self.status_message.emit(f"🛑 [Security Alert] {pe}")
                     self.cancel()
                     return found_count
-                except Exception as exc:
-                    logger.debug("[GraphQLClips] doc_id=%s failed: %s", doc_id, exc)
+                except Exception as exc_nested:
+                    logger.debug(
+                        "[GraphQLClips] doc_id=%s nested schema rejected: %s",
+                        doc_id,
+                        exc_nested,
+                    )
+
+                # Attempt 2: Flat variable schema format
+                try:
+                    res = self.resilient_session.execute_persisted_query(
+                        doc_id=doc_id,
+                        variables=variables_flat,
+                        friendly_name=FRIENDLY_NAME_CLIPS,
+                    )
+                    if isinstance(res, dict) and res.get("data"):
+                        break
+                except PermissionError as pe:
+                    self.status_message.emit(f"🛑 [Security Alert] {pe}")
+                    self.cancel()
+                    return found_count
+                except Exception as exc_flat:
+                    logger.debug(
+                        "[GraphQLClips] doc_id=%s flat schema rejected: %s",
+                        doc_id,
+                        exc_flat,
+                    )
 
             if not isinstance(res, dict):
                 break
@@ -1264,7 +1316,7 @@ class InspectWorker(QThread):
     def _fetch_timeline_graphql(
         self, username: str, user_id: str, filter_mode: str = "all"
     ) -> int:
-        """Paginates user timeline media using GraphQL queries with query_hash fallback."""
+        """Paginates user timeline media using PolarisProfilePostsTimelineQuery with query_hash fallback."""
         if (
             self.is_cancelled
             or self.resilient_session.is_circuit_open
@@ -1293,7 +1345,7 @@ class InspectWorker(QThread):
                 "first": 24,
             }
             if end_cursor:
-                variables["after"] = end_cursor
+                variables["after"] = str(end_cursor)
 
             res: dict[str, Any] | None = None
             for attempt, doc_id in enumerate(DOC_ID_TIMELINE_FALLBACKS, start=1):
@@ -1302,7 +1354,7 @@ class InspectWorker(QThread):
 
                 if attempt > 1:
                     self._apply_tier_backoff(
-                        tier_attempt=attempt, base=1.5, max_delay=3.0
+                        tier_attempt=attempt, base=2.0, max_delay=4.5
                     )
 
                 try:
@@ -1502,9 +1554,7 @@ class InspectWorker(QThread):
             if is_reels_only
             else ("Photos Archive" if is_photos_only else "Complete Media Feed")
         )
-        self.status_message.emit(
-            f"🚀 [Stream Engine] Initiating {tier_label} ingestion for @{username}..."
-        )
+        self.status_message.emit(f"[STREAM ENGINE] Ingesting {tier_label} for @{username}...")
 
         def _is_budget_exhausted() -> bool:
             if self.is_cancelled or self.resilient_session.is_circuit_open:
@@ -2199,6 +2249,7 @@ class InspectWorker(QThread):
         filter_mode: str | None = None,
         fallback_username: str = "",
     ) -> list[dict[str, Any]]:
+        """Inspects direct post with resilient unauthenticated fallback if cookies expire."""
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return []
 
@@ -2210,11 +2261,12 @@ class InspectWorker(QThread):
         target_url = raw_target or f"{IG_BASE_URL}/p/{shortcode}/"
         has_auth = self.resilient_session.has_session_cookies()
 
-        # 1. Mobile Media Info API (Clean TLS)
+        # -------------------------------------------------------------------------
+        # Tier 1: Mobile Media Info API (Authenticated Endpoint)
+        # -------------------------------------------------------------------------
         if has_auth:
             media_id = shortcode_to_id(shortcode)
             if media_id:
-                self._apply_tier_backoff(tier_attempt=1)
                 info_url = f"{IG_API_BASE_URL}/media/{media_id}/info/"
                 headers_mobile = self._build_headers(is_mobile=True, require_auth=True)
                 res_mobile = self._make_request(
@@ -2255,14 +2307,19 @@ class InspectWorker(QThread):
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return []
 
-        # 2. Captioned Embed Iframe
+        # Paced transition to Tier 2
+        self._apply_tier_backoff(tier_attempt=1, base=1.2, max_delay=2.5)
+
+        # -------------------------------------------------------------------------
+        # Tier 2: Captioned Embed Iframe (Public Fallback)
+        # -------------------------------------------------------------------------
         embed_url = f"{IG_BASE_URL}/p/{shortcode}/embed/captioned/"
         try:
             status_code, _, _, html_text = self.resilient_session.request(
                 "GET",
                 embed_url,
                 headers=self._build_headers(require_auth=False),
-                timeout=10.0,
+                timeout=12.0,
                 require_auth=False,
             )
             if 200 <= status_code < 300 and html_text:
@@ -2286,14 +2343,20 @@ class InspectWorker(QThread):
                             self.item_found.emit(card)
                             self.media_found.emit(card)
                     return [card]
+        except PermissionError:
+            raise
         except Exception as exc:
             logger.debug("Embed fallback failed for %s: %s", shortcode, exc)
 
         if self.is_cancelled or self.resilient_session.is_circuit_open:
             return []
 
-        # 3. Dedicated yt-dlp Extractor
-        self._apply_tier_backoff(tier_attempt=2)
+        # Paced transition to Tier 3
+        self._apply_tier_backoff(tier_attempt=2, base=2.0, max_delay=4.0)
+
+        # -------------------------------------------------------------------------
+        # Tier 3: Dedicated yt-dlp Extractor
+        # -------------------------------------------------------------------------
         ytdlp_cards = self._inspect_single_post_ytdlp(
             target_url,
             shortcode=shortcode,
@@ -2322,6 +2385,10 @@ class InspectWorker(QThread):
         fallback_username: str = "",
         filter_mode: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Executes isolated yt-dlp extraction with quiet logging and specific
+
+        telemetry for age-restricted and audience-gated Instagram media.
+        """
         if (
             yt_dlp is None
             or self.is_cancelled
@@ -2335,8 +2402,10 @@ class InspectWorker(QThread):
         ydl_opts: Dict[str, Any] = {
             "extract_flat": "in_playlist",
             "noplaylist": False,
+            "quiet": True,
             "no_warnings": True,
-            "ignoreerrors": True,
+            "no_color": True,
+            "ignoreerrors": False,  # Allow ExtractorError propagation to catch audience gating
             "skip_download": True,
             "logger": YTDLPQuietLogger(),
             "socket_timeout": DEFAULT_REQUEST_TIMEOUT,
@@ -2488,7 +2557,20 @@ class InspectWorker(QThread):
                     }
                 ]
         except Exception as exc:
-            logger.debug("yt-dlp single post extraction error for %s: %s", url, exc)
+            err_msg = str(exc)
+            if (
+                "This content isn't available to everyone" in err_msg
+                or "can't be seen by certain audiences" in err_msg
+            ):
+                user_alert = (
+                    f"⚠️ Reel #{shortcode} is age-restricted (18+) or login-gated. "
+                    "Valid cookies.txt required."
+                )
+                logger.warning(user_alert)
+                self.status_message.emit(user_alert)
+                self.error.emit(user_alert)
+            else:
+                logger.debug("yt-dlp single post extraction error for %s: %s", url, exc)
             return []
 
     def _inspect_via_ytdlp(

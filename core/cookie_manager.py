@@ -16,6 +16,7 @@ import re
 import sys
 import tempfile
 import time
+import http.cookiejar
 from typing import TypeGuard, final
 
 from utils.file_utils import get_app_dir, get_user_data_dir
@@ -139,7 +140,10 @@ def _is_list_obj(val: object) -> TypeGuard[list[object]]:
 
 @final
 class CookieManager:
-    """Manages parsing, volatile caching, optional DPAPI persistence, and secure token lifecycle."""
+    """Manages parsing, volatile caching, Windows DPAPI encryption at rest,
+
+    automatic startup shredding of plaintext artifacts, and in-memory yt-dlp cookie jars.
+    """
 
     cookies: dict[str, str]
     _cookie_string: str
@@ -162,12 +166,79 @@ class CookieManager:
             get_user_data_dir(), "instagram_cookies.txt"
         )
 
-        # Register process termination hook to purge ephemeral descriptors
+        # 1. Sweep and shred any orphaned plaintext bridge files left by prior crashes
+        self.sweep_orphaned_plaintext_files()
+
+        # 2. Register process termination hook to purge active ephemeral descriptors
         _ = atexit.register(self._cleanup_ephemeral_bridge)
 
-        # Only attempt to load persistent cookies if disk storage is enabled
+        # 3. Load active persistent cookies if disk storage is enabled
         if self.allow_disk_storage:
             self._auto_load_from_candidates(cookie_file)
+
+    def sweep_orphaned_plaintext_files(self) -> None:
+        """Cryptographically shreds any leaked .session_bridge_*.tmp files or raw
+
+        unencrypted cookies.txt sitting in the AppData directory.
+        """
+        target_dir = get_user_data_dir()
+        if not os.path.isdir(target_dir):
+            return
+
+        try:
+            for fname in os.listdir(target_dir):
+                full_path = os.path.join(target_dir, fname)
+                if not os.path.isfile(full_path):
+                    continue
+
+                is_bridge = fname.startswith(".session_bridge_") and fname.endswith(
+                    ".tmp"
+                )
+                is_raw_txt = fname.lower() == "cookies.txt"
+
+                if is_bridge or is_raw_txt:
+                    logger.warning(
+                        "Shredding unencrypted credential artifact: %s", fname
+                    )
+                    self._shred_file(full_path)
+        except Exception as exc:
+            logger.debug("Error during plaintext artifact sweep: %s", exc)
+
+    def get_cookiejar(self) -> http.cookiejar.CookieJar:
+        """Constructs an in-memory CookieJar for yt-dlp, eliminating the need
+
+        for plaintext temporary bridge files on disk.
+        """
+        jar = http.cookiejar.CookieJar()
+        if not self.has_cookies():
+            return jar
+
+        now = int(time.time())
+        expires = now + (365 * 24 * 3600)
+
+        for name, value in self.cookies.items():
+            cookie = http.cookiejar.Cookie(
+                version=0,
+                name=name,
+                value=value,
+                port=None,
+                port_specified=False,
+                domain=".instagram.com",
+                domain_specified=True,
+                domain_initial_dot=True,
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=expires if name != "rur" else None,
+                discard=name == "rur",
+                comment=None,
+                comment_url=None,
+                rest={"HttpOnly": None},
+                rfc2109=False,
+            )
+            jar.set_cookie(cookie)
+
+        return jar
 
     def _cleanup_ephemeral_bridge(self) -> None:
         """Process cleanup hook to ensure temporary plaintext files are shredded."""
@@ -277,7 +348,7 @@ class CookieManager:
             trimmed.startswith("{") and trimmed.endswith("}")
         ):
             try:
-                raw_json: object = json.loads(trimmed)  # pyright: ignore[reportAny]
+                raw_json: object = json.loads(trimmed)
 
                 def _extract_cookie_obj(
                     item_dict: dict[str, object],
@@ -502,7 +573,6 @@ class CookieManager:
         try:
             length = os.path.getsize(target_path)
             if length > 0:
-                # Mode must begin with 'r', 'w', or 'a'. 'r+b' enables in-place byte overwriting.
                 with open(target_path, "r+b", buffering=0) as f:
                     # Pass 1: Cryptographic pseudo-random bytes
                     f.seek(0)
@@ -543,10 +613,16 @@ class CookieManager:
                     self.cookie_file_path, self._generate_netscape_content()
                 )
             else:
-                # Defense B: Ensure persistent on-disk copy is shredded if present
                 self._shred_file(self.cookie_file_path)
 
-            # Re-generate active ephemeral bridge
+            # Shred plaintext source file if it was placed inside AppData
+            app_data_dir = get_user_data_dir()
+            abs_source = os.path.abspath(file_path)
+            if abs_source.startswith(os.path.abspath(app_data_dir)):
+                if abs_source != os.path.abspath(self.cookie_file_path):
+                    self._shred_file(abs_source)
+
+            # Re-generate active ephemeral bridge if legacy consumers request path
             self._generate_ephemeral_bridge()
             return True
         except Exception as e:
@@ -586,11 +662,11 @@ class CookieManager:
         return "; ".join([f"{k}={v}" for k, v in self.cookies.items()])
 
     def get_cookie_file_path(self) -> str | None:
+        """Returns a valid plaintext Netscape file path for yt-dlp.
+
+        Returns None if cookies are missing or have been invalidated.
         """
-        Returns a valid, plaintext Netscape file path for yt-dlp.
-        Serves an ephemeral session bridge to ensure encrypted files on disk are not exposed.
-        """
-        if not self.has_cookies():
+        if not self.has_cookies() or not self.cookies.get("sessionid"):
             return None
 
         if not self._ephemeral_file_path or not os.path.exists(
@@ -646,8 +722,32 @@ class CookieManager:
         return m.group(1) if m else None
 
     def clear_cookies(self) -> None:
-        """Defense C: Overwrites persistent storage with multi-pass noise, unlinks bridges, and clears memory."""
+        """Overwrites persistent storage with multi-pass noise, unlinks bridges, and clears memory."""
         self._shred_file(self.cookie_file_path)
+        self.sweep_orphaned_plaintext_files()
         self._cleanup_ephemeral_bridge()
         self.cookies.clear()
         self._cookie_string = ""
+
+    def invalidate_session(self, reason: str = "") -> None:
+        """Purges in-memory session tokens, cleans up ephemeral bridges, and renames
+
+        stale on-disk cookie stores to prevent re-importing expired credentials.
+        """
+        logger.warning(
+            "Invalidating Instagram cookie session. Reason: %s",
+            reason or "Session Revoked / Expired",
+        )
+        self.cookies.clear()
+        self._cookie_string = ""
+        self._cleanup_ephemeral_bridge()
+
+        if os.path.isfile(self.cookie_file_path):
+            try:
+                backup_path = f"{self.cookie_file_path}.invalid.bak"
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                os.replace(self.cookie_file_path, backup_path)
+                logger.info("Quarantined stale cookie file to %s", backup_path)
+            except OSError as exc:
+                logger.debug("Could not rename stale cookie file: %s", exc)
